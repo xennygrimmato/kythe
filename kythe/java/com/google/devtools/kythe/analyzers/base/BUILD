@@ -1,10 +1,35 @@
-package(default_visibility = ["//kythe:default_visibility"])
+load("@rules_java//java:defs.bzl", "java_library")
+
+package(default_visibility = ["//visibility:public"])
+
+java_library(
+    name = "stream_fact_emitter",
+    srcs = ["StreamFactEmitter.java"],
+    deps = [
+        ":entryset",
+        "//kythe/proto:storage_java_proto",
+        "@com_google_protobuf//:protobuf_java",
+    ],
+)
+
+java_library(
+    name = "config",
+    srcs = ["IndexerConfig.java"],
+    deps = ["@maven//:com_beust_jcommander"],
+)
 
 java_library(
     name = "schema",
     srcs = [
         "EdgeKind.java",
         "NodeKind.java",
+    ],
+    deps = [
+        "//kythe/java/com/google/devtools/kythe/util/schema",
+        "//kythe/proto:schema_java_proto",
+        "//third_party/guava",
+        "@maven//:com_google_code_findbugs_jsr305",
+        "@maven//:org_checkerframework_checker_qual",
     ],
 )
 
@@ -18,47 +43,33 @@ java_library(
     ],
     deps = [
         ":schema",
-        "//external:guava",
-        "//external:proto/protobuf_java",
-        "//kythe/java/com/google/devtools/kythe/common",
+        "//kythe/java/com/google/devtools/kythe/common:flogger",
         "//kythe/java/com/google/devtools/kythe/platform/shared:statistics",
-        "//kythe/java/com/google/devtools/kythe/util",
-        "//kythe/proto:analysis_proto_java",
-        "//kythe/proto:storage_proto_java",
+        "//kythe/java/com/google/devtools/kythe/util:kythe_uri",
+        "//kythe/java/com/google/devtools/kythe/util:span",
+        "//kythe/proto:analysis_java_proto",
+        "//kythe/proto:common_java_proto",
+        "//kythe/proto:storage_java_proto",
+        "//third_party/guava",
+        "@com_google_protobuf//:protobuf_java",
+        "@maven//:com_google_code_findbugs_jsr305",
+        "@maven//:org_checkerframework_checker_qual",
     ],
 )
 
 java_library(
     name = "compilation_analyzer",
-    srcs = [
-        "AbstractCompilationAnalyzer.java",
-    ],
+    srcs = ["AbstractCompilationAnalyzer.java"],
     deps = [
         ":entryset",
-        "//external:guava",
-        "//external:proto/protobuf_java",
-        "//kythe/java/com/google/devtools/kythe/common",
+        "//kythe/java/com/google/devtools/kythe/common:flogger",
         "//kythe/java/com/google/devtools/kythe/platform/shared:analysis_exception",
         "//kythe/java/com/google/devtools/kythe/platform/shared:file_data",
         "//kythe/java/com/google/devtools/kythe/platform/shared:statistics",
-        "//kythe/proto:analysis_proto_java",
-        "//kythe/proto:storage_proto_java",
-    ],
-)
-
-java_library(
-    name = "grpc_compilation_analyzer",
-    srcs = [
-        "GRPCCompilationAnalyzer.java",
-    ],
-    deps = [
-        ":compilation_analyzer",
-        ":entryset",
-        "//external:grpc-java",
-        "//kythe/java/com/google/devtools/kythe/platform/shared:file_data",
-        "//kythe/java/com/google/devtools/kythe/platform/shared:remote_file_data",
-        "//kythe/java/com/google/devtools/kythe/platform/shared:statistics",
-        "//kythe/proto:analysis_proto_java",
+        "//kythe/proto:analysis_java_proto",
+        "//kythe/proto:storage_java_proto",
+        "//third_party/guava",
+        "@com_google_protobuf//:protobuf_java",
     ],
 )
 

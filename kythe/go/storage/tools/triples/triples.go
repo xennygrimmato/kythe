@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +26,8 @@
 package main
 
 import (
+	"context"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"io"
@@ -39,13 +41,11 @@ import (
 	"kythe.io/kythe/go/util/encoding/rdf"
 	"kythe.io/kythe/go/util/flagutil"
 	"kythe.io/kythe/go/util/kytheuri"
-	"kythe.io/kythe/go/util/schema"
+	"kythe.io/kythe/go/util/schema/edges"
+	"kythe.io/kythe/go/util/schema/facts"
 
-	"golang.org/x/net/context"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 
-	spb "kythe.io/kythe/proto/storage_proto"
-
-	_ "kythe.io/kythe/go/services/graphstore/grpc"
 	_ "kythe.io/kythe/go/services/graphstore/proxy"
 	_ "kythe.io/kythe/go/storage/leveldb"
 )
@@ -124,7 +124,7 @@ func main() {
 	}
 
 	for entry := range entries {
-		if schema.EdgeDirection(entry.EdgeKind) == schema.Reverse && !*keepReverseEdges {
+		if edges.IsReverse(entry.EdgeKind) && !*keepReverseEdges {
 			reverseEdges++
 			continue
 		}
@@ -158,6 +158,9 @@ func toTriple(entry *spb.Entry) (*rdf.Triple, error) {
 	if graphstore.IsEdge(entry) {
 		t.Predicate = entry.EdgeKind
 		t.Object = kytheuri.FromVName(entry.Target).String()
+	} else if entry.FactName == facts.Code {
+		t.Predicate = entry.FactName
+		t.Object = base64.StdEncoding.EncodeToString(entry.FactValue)
 	} else {
 		t.Predicate = entry.FactName
 		t.Object = string(entry.FactValue)

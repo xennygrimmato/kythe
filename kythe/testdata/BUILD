@@ -5,11 +5,11 @@ exports_files(glob(["*"]))
 genrule(
     name = "entries",
     srcs = [
-        "test.kindex",
+        "test.kzip",
         "//kythe/java/com/google/devtools/kythe/analyzers/java:indexer_deploy.jar",
         "@bazel_tools//tools/jdk",
     ],
     outs = ["test.entries"],
-    # TODO(https://kythe.io/phabricator/T70)
-    cmd = "CWD=\"$$PWD\"; cd /tmp && \"$$CWD\"/$(JAVA) -jar \"$$CWD\"/$(location //kythe/java/com/google/devtools/kythe/analyzers/java:indexer_deploy.jar) \"$$CWD\"/$(location test.kindex) > \"$$CWD\"/$@",
+    cmd = "$(JAVA) -jar $(location //kythe/java/com/google/devtools/kythe/analyzers/java:indexer_deploy.jar) $(location test.kzip) > $@",
+    toolchains = ["@bazel_tools//tools/jdk:current_java_runtime"],
 )

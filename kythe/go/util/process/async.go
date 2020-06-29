@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 // Package process contains an implementation of a callback-based asynchronous
 // process.
-package process
+package process // import "kythe.io/kythe/go/util/process"
 
 import (
 	"os"

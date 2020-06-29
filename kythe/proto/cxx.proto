@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 syntax = "proto3";
 
 package kythe.proto;
+
+option go_package = "cxx_go_proto";
 option java_package = "com.google.devtools.kythe.proto";
 
 // C++-specific details used in a CompilationUnit.
@@ -59,4 +61,13 @@ message CxxCompilationUnitDetails {
   }
 
   repeated SystemHeaderPrefix system_header_prefix = 2;
+
+  // Adds an additional path to the indexer's virtual file system that
+  // has no content (or has zero-length content).
+  message StatPath {
+    // The path to add. Assumed to be a directory.
+    string path = 1;
+  }
+
+  repeated StatPath stat_path = 3;
 }

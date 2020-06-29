@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,10 @@
 
 // Package filetree defines the filetree Service interface and a simple
 // in-memory implementation.
-package filetree
+package filetree // import "kythe.io/kythe/go/services/filetree"
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -29,17 +30,16 @@ import (
 
 	"kythe.io/kythe/go/services/graphstore"
 	"kythe.io/kythe/go/services/web"
-	"kythe.io/kythe/go/util/kytheuri"
-	"kythe.io/kythe/go/util/schema"
+	"kythe.io/kythe/go/util/schema/facts"
+	"kythe.io/kythe/go/util/schema/nodes"
 
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
-	ftpb "kythe.io/kythe/proto/filetree_proto"
-	spb "kythe.io/kythe/proto/storage_proto"
+	ftpb "kythe.io/kythe/proto/filetree_go_proto"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
 // Service provides an interface to explore a tree of VName files.
-// TODO(schroederc): add Context argument to interface methods
 type Service interface {
 	// Directory returns the contents of the directory at the given corpus/root/path.
 	Directory(context.Context, *ftpb.DirectoryRequest) (*ftpb.DirectoryReply, error)
@@ -53,21 +53,6 @@ func CleanDirPath(path string) string {
 	const sep = string(filepath.Separator)
 	return strings.TrimPrefix(filepath.Join(sep, path), sep)
 }
-
-type grpcClient struct{ ftpb.FileTreeServiceClient }
-
-// CorpusRoots implements part of Service interface.
-func (c *grpcClient) CorpusRoots(ctx context.Context, req *ftpb.CorpusRootsRequest) (*ftpb.CorpusRootsReply, error) {
-	return c.FileTreeServiceClient.CorpusRoots(ctx, req)
-}
-
-// Directory implements part of Service interface.
-func (c *grpcClient) Directory(ctx context.Context, req *ftpb.DirectoryRequest) (*ftpb.DirectoryReply, error) {
-	return c.FileTreeServiceClient.Directory(ctx, req)
-}
-
-// GRPC returns a filetree Service backed by a FileTreeServiceClient.
-func GRPC(c ftpb.FileTreeServiceClient) Service { return &grpcClient{c} }
 
 // Map is a FileTree backed by an in-memory map.
 type Map struct {
@@ -85,9 +70,9 @@ func (m *Map) Populate(ctx context.Context, gs graphstore.Service) error {
 	start := time.Now()
 	log.Println("Populating in-memory file tree")
 	var total int
-	if err := gs.Scan(ctx, &spb.ScanRequest{FactPrefix: schema.NodeKindFact},
+	if err := gs.Scan(ctx, &spb.ScanRequest{FactPrefix: facts.NodeKind},
 		func(entry *spb.Entry) error {
-			if entry.FactName == schema.NodeKindFact && string(entry.FactValue) == schema.FileKind {
+			if entry.FactName == facts.NodeKind && string(entry.FactValue) == nodes.File {
 				m.AddFile(entry.Source)
 				total++
 			}
@@ -101,10 +86,12 @@ func (m *Map) Populate(ctx context.Context, gs graphstore.Service) error {
 
 // AddFile adds the given file VName to m.
 func (m *Map) AddFile(file *spb.VName) {
-	ticket := kytheuri.ToString(file)
 	dirPath := CleanDirPath(path.Dir(file.Path))
 	dir := m.ensureDir(file.Corpus, file.Root, dirPath)
-	dir.File = addToSet(dir.File, ticket)
+	dir.Entry = addEntry(dir.Entry, &ftpb.DirectoryReply_Entry{
+		Kind: ftpb.DirectoryReply_FILE,
+		Name: filepath.Base(file.Path),
+	})
 }
 
 // CorpusRoots implements part of the filetree.Service interface.
@@ -162,29 +149,31 @@ func (m *Map) ensureDir(corpus, root, path string) *ftpb.DirectoryReply {
 	dirs := m.ensureCorpusRoot(corpus, root)
 	dir := dirs[path]
 	if dir == nil {
-		dir = &ftpb.DirectoryReply{}
+		dir = &ftpb.DirectoryReply{
+			Corpus: corpus,
+			Root:   root,
+			Path:   path,
+		}
 		dirs[path] = dir
 
 		if path != "" {
 			parent := m.ensureDir(corpus, root, filepath.Dir(path))
-			uri := kytheuri.URI{
-				Corpus: corpus,
-				Root:   root,
-				Path:   path,
-			}
-			parent.Subdirectory = addToSet(parent.Subdirectory, uri.String())
+			parent.Entry = addEntry(parent.Entry, &ftpb.DirectoryReply_Entry{
+				Kind: ftpb.DirectoryReply_DIRECTORY,
+				Name: filepath.Base(path),
+			})
 		}
 	}
 	return dir
 }
 
-func addToSet(strs []string, str string) []string {
-	for _, s := range strs {
-		if s == str {
-			return strs
+func addEntry(entries []*ftpb.DirectoryReply_Entry, e *ftpb.DirectoryReply_Entry) []*ftpb.DirectoryReply_Entry {
+	for _, x := range entries {
+		if proto.Equal(x, e) {
+			return entries
 		}
 	}
-	return append(strs, str)
+	return append(entries, e)
 }
 
 type webClient struct{ addr string }

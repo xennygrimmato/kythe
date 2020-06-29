@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,96 +16,136 @@
 
 // Package driver contains a Driver implementation that sends analyses to a
 // CompilationAnalyzer based on a Queue of compilations.
-package driver
+package driver // import "kythe.io/kythe/go/platform/analysis/driver"
 
 import (
-	"errors"
-	"fmt"
-	"io"
+	"context"
+	goerrors "errors"
 	"log"
 
 	"kythe.io/kythe/go/platform/analysis"
 
-	"golang.org/x/net/context"
+	"github.com/pkg/errors"
 
-	apb "kythe.io/kythe/proto/analysis_proto"
+	apb "kythe.io/kythe/proto/analysis_go_proto"
 )
 
+// A Compilation represents a compilation and other metadata needed to analyze it.
+type Compilation struct {
+	Unit       *apb.CompilationUnit // the compilation to analyze
+	Revision   string               // revision marker to attribute to the compilation
+	UnitDigest string               // unit digest identifying the compilation in a KCD
+	BuildID    string               // id of the build executing the compilation
+}
+
 // CompilationFunc handles a single CompilationUnit.
-type CompilationFunc func(context.Context, *apb.CompilationUnit) error
+type CompilationFunc func(context.Context, Compilation) error
 
 // A Queue represents an ordered sequence of compilation units.
 type Queue interface {
 	// Next invokes f with the next available compilation in the queue.  If no
-	// further values are available, Next must return io.EOF; otherwise, the
-	// return value from f is propagated to the caller of Next.
+	// further values are available, Next must return ErrEndOfQueue; otherwise,
+	// the return value from f is propagated to the caller of Next.
 	Next(_ context.Context, f CompilationFunc) error
 }
+
+// A Context packages callbacks invoked during analysis.
+type Context interface {
+	// Setup is invoked after a compilation has been fetched from a Queue but
+	// before it is sent to the analyzer.  If Setup reports an error, analysis
+	// is aborted.
+	Setup(context.Context, Compilation) error
+
+	// Teardown is invoked after a analysis has completed for the compilation.
+	// If Teardown reports an error after analysis succeeds, it is logged but
+	// does not cause the analysis to fail.
+	Teardown(context.Context, Compilation) error
+
+	// AnalysisError is invoked for each non-nil error reported by the analyzer
+	// prior to calling Teardown. The error returned from AnalysisError replaces
+	// the error returned by the analyzer itself.
+	//
+	// If AnalysisError returns the special value ErrRetry, the analysis is
+	// retried immediately.
+	AnalysisError(context.Context, Compilation, error) error
+}
+
+var (
+	// ErrRetry can be returned from a Driver's AnalysisError function to signal
+	// that the driver should retry the analysis immediately.
+	ErrRetry = goerrors.New("retry analysis")
+
+	// ErrEndOfQueue can be returned from a Queue to signal there are no
+	// compilations left to analyze.
+	ErrEndOfQueue = goerrors.New("end of queue")
+)
 
 // Driver sends compilations sequentially from a queue to an analyzer.
 type Driver struct {
 	Analyzer        analysis.CompilationAnalyzer
 	FileDataService string
-
-	// AnalysisError is called for each non-nil err returned from the Analyzer
-	// (before Teardown is called).  The error returned from AnalysisError
-	// replaces the analysis error that would normally be returned from Run.
-	AnalysisError func(context.Context, *apb.CompilationUnit, error) error
-
-	// Compilations is a queue of compilations to be sent for analysis.
-	Compilations Queue
-
-	// Setup is called after a compilation has been pulled from the Queue and
-	// before it is sent to the Analyzer (or Output is called).
-	Setup CompilationFunc
-	// Output is called for each analysis output returned from the Analyzer
-	Output analysis.OutputFunc
-	// Teardown is called after a compilation has been analyzed and there will be no further calls to Output.
-	Teardown CompilationFunc
+	Context         Context             // if nil, callbacks are no-ops
+	WriteOutput     analysis.OutputFunc // if nil, output is discarded
 }
 
-func (d *Driver) validate() error {
-	if d.Analyzer == nil {
-		return errors.New("missing Analyzer")
-	} else if d.Compilations == nil {
-		return errors.New("missing Compilations Queue")
-	} else if d.Output == nil {
-		return errors.New("missing Output function")
+func (d *Driver) writeOutput(ctx context.Context, out *apb.AnalysisOutput) error {
+	if write := d.WriteOutput; write != nil {
+		return write(ctx, out)
 	}
 	return nil
+}
+
+func (d *Driver) setup(ctx context.Context, unit Compilation) error {
+	if c := d.Context; c != nil {
+		return c.Setup(ctx, unit)
+	}
+	return nil
+}
+
+func (d *Driver) teardown(ctx context.Context, unit Compilation) error {
+	if c := d.Context; c != nil {
+		return c.Teardown(ctx, unit)
+	}
+	return nil
+}
+
+func (d *Driver) analysisError(ctx context.Context, unit Compilation, err error) error {
+	if c := d.Context; c != nil && err != nil {
+		return c.AnalysisError(ctx, unit, err)
+	}
+	return err
 }
 
 // Run sends each compilation received from the driver's Queue to the driver's
 // Analyzer.  All outputs are passed to Output in turn.  An error is immediately
 // returned if the Analyzer, Output, or Compilations fields are unset.
-func (d *Driver) Run(ctx context.Context) error {
-	if err := d.validate(); err != nil {
-		return err
+func (d *Driver) Run(ctx context.Context, queue Queue) error {
+	if d.Analyzer == nil {
+		return errors.New("no analyzer has been specified")
 	}
+
 	for {
-		if err := d.Compilations.Next(ctx, func(ctx context.Context, cu *apb.CompilationUnit) error {
-			if d.Setup != nil {
-				if err := d.Setup(ctx, cu); err != nil {
-					return fmt.Errorf("analysis setup error: %v", err)
-				}
+		if err := queue.Next(ctx, func(ctx context.Context, cu Compilation) error {
+			if err := d.setup(ctx, cu); err != nil {
+				return errors.WithMessage(err, "driver: analysis setup")
 			}
-			err := d.Analyzer.Analyze(ctx, &apb.AnalysisRequest{
-				Compilation:     cu,
-				FileDataService: d.FileDataService,
-			}, d.Output)
-			if d.AnalysisError != nil && err != nil {
-				err = d.AnalysisError(ctx, cu, err)
+			err := ErrRetry
+			for err == ErrRetry {
+				err = d.analysisError(ctx, cu, d.Analyzer.Analyze(ctx, &apb.AnalysisRequest{
+					Compilation:     cu.Unit,
+					FileDataService: d.FileDataService,
+					Revision:        cu.Revision,
+					BuildId:         cu.BuildID,
+				}, d.writeOutput))
 			}
-			if d.Teardown != nil {
-				if tErr := d.Teardown(ctx, cu); tErr != nil {
-					if err == nil {
-						return fmt.Errorf("analysis teardown error: %v", err)
-					}
-					log.Printf("WARNING: analysis teardown error after analysis error: %v (analysis error: %v)", tErr, err)
+			if terr := d.teardown(ctx, cu); terr != nil {
+				if err == nil {
+					return errors.WithMessage(terr, "driver: analysis teardown")
 				}
+				log.Printf("WARNING: analysis teardown failed: %v (analysis error: %v)", terr, err)
 			}
 			return err
-		}); err == io.EOF {
+		}); err == ErrEndOfQueue {
 			return nil
 		} else if err != nil {
 			return err

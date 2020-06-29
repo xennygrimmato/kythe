@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,11 @@
 
 package com.google.devtools.kythe.analyzers.java;
 
-import com.google.common.base.Joiner;
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import com.google.common.collect.HashMultiset;
 import com.google.common.collect.Multiset;
+import com.google.common.flogger.FluentLogger;
 import com.google.devtools.kythe.analyzers.base.CorpusPath;
 import com.google.devtools.kythe.analyzers.base.EdgeKind;
 import com.google.devtools.kythe.analyzers.base.EntrySet;
@@ -26,180 +28,238 @@ import com.google.devtools.kythe.analyzers.base.FactEmitter;
 import com.google.devtools.kythe.analyzers.base.KytheEntrySets;
 import com.google.devtools.kythe.analyzers.base.NodeKind;
 import com.google.devtools.kythe.analyzers.java.SourceText.Positions;
+import com.google.devtools.kythe.platform.java.helpers.SignatureGenerator;
 import com.google.devtools.kythe.platform.shared.StatisticsCollector;
 import com.google.devtools.kythe.proto.Analysis.CompilationUnit.FileInput;
+import com.google.devtools.kythe.proto.Diagnostic;
+import com.google.devtools.kythe.proto.MarkedSource;
 import com.google.devtools.kythe.proto.Storage.VName;
 import com.google.devtools.kythe.util.Span;
+import com.sun.tools.javac.code.Flags;
 import com.sun.tools.javac.code.Symbol;
 import com.sun.tools.javac.code.Symbol.ClassSymbol;
 import com.sun.tools.javac.code.Symbol.MethodSymbol;
 import com.sun.tools.javac.code.Symbol.PackageSymbol;
 import com.sun.tools.javac.tree.JCTree;
-import java.io.UnsupportedEncodingException;
-import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import javax.lang.model.element.ElementKind;
-import javax.lang.model.element.Modifier;
 import javax.lang.model.element.Name;
 import javax.tools.JavaFileObject;
+import org.checkerframework.checker.nullness.qual.Nullable;
 
 /** Specialization of {@link KytheEntrySets} for Java. */
 public class JavaEntrySets extends KytheEntrySets {
-  private final Map<Symbol, EntrySet> symbolNodes = new HashMap<>();
+  private static final FluentLogger logger = FluentLogger.forEnclosingClass();
+
+  private final Map<Symbol, VName> symbolNodes = new HashMap<>();
+  private final Set<Symbol> symbolsDocumented = new HashSet<>();
   private final Map<Symbol, Integer> symbolHashes = new HashMap<>();
-  private final Map<Symbol, Set<String>> symbolSigs = new HashMap<Symbol, Set<String>>();
-  private final boolean ignoreVNamePaths;
+  private final JavaIndexerConfig config;
+  private final Map<String, Integer> sourceToWildcardCounter = new HashMap<>();
 
   public JavaEntrySets(
       StatisticsCollector statistics,
       FactEmitter emitter,
       VName compilationVName,
       List<FileInput> requiredInputs,
-      boolean ignoreVNamePaths) {
+      JavaIndexerConfig config) {
     super(statistics, emitter, compilationVName, requiredInputs);
-    this.ignoreVNamePaths = ignoreVNamePaths;
+    this.config = config;
+  }
+
+  /**
+   * Returns a node for the given {@link Symbol} and its signature. A new node is created and
+   * emitted if necessary. If non-null, msBuilder will be used to generate a signature.
+   */
+  @Deprecated
+  public VName getNode(
+      final SignatureGenerator signatureGenerator,
+      Symbol sym,
+      String signature,
+      // TODO(schroederc): separate MarkedSource generation from JavaEntrySets
+      MarkedSource.@Nullable Builder msBuilder,
+      @Nullable Iterable<MarkedSource> postChildren) {
+    return getNode(
+        signatureGenerator,
+        sym,
+        signature,
+        MarkedSources.construct(
+            signatureGenerator,
+            sym,
+            msBuilder,
+            postChildren,
+            // TODO(schroederc): do not construct entire node to just determine its VName
+            s ->
+                signatureGenerator
+                    .getSignature(s)
+                    .map(sig -> getNode(signatureGenerator, s, sig, null, null))));
+  }
+
+  Map<Symbol, VName> getSymbolNodes() {
+    return Collections.unmodifiableMap(symbolNodes);
   }
 
   /**
    * Returns a node for the given {@link Symbol} and its signature. A new node is created and
    * emitted if necessary.
    */
-  public EntrySet getNode(Symbol sym, String signature) {
-    checkSignature(sym, signature);
-
+  public VName getNode(
+      SignatureGenerator signatureGenerator,
+      Symbol sym,
+      String signature,
+      MarkedSource markedSource) {
     EntrySet node;
-    if ((node = symbolNodes.get(sym)) != null) {
-      return node;
+    if (symbolNodes.containsKey(sym) && (markedSource == null || symbolsDocumented.contains(sym))) {
+      return symbolNodes.get(sym);
     }
 
     ClassSymbol enclClass = sym.enclClass();
     VName v = lookupVName(enclClass);
-    if (v == null && fromJDK(sym)) {
-      v = VName.newBuilder().setCorpus("jdk").build();
+    if ((v == null || config.getOverrideJdkCorpus() != null) && fromJDK(sym)) {
+      v =
+          VName.newBuilder()
+              .setCorpus(
+                  config.getOverrideJdkCorpus() != null ? config.getOverrideJdkCorpus() : "jdk")
+              .build();
     }
 
     if (v == null) {
-      node = getName(signature);
-      // NAME node was already be emitted
+      getStatisticsCollector().incrementCounter("unextracted-input-file");
+      String msg =
+          String.format(
+              "Couldn't generate vname for symbol %s.  Input file for enclosing class %s not seen"
+                  + " during extraction.",
+              sym, enclClass);
+      if (config.getVerboseLogging()) {
+        logger.atWarning().log(msg);
+      }
+      Diagnostic.Builder d = Diagnostic.newBuilder().setMessage(msg);
+      return emitDiagnostic(d.build()).getVName();
     } else {
-      if (ignoreVNamePaths) {
+      if (config.getIgnoreVNamePaths()) {
         v = v.toBuilder().setPath(enclClass != null ? enclClass.toString() : "").build();
       }
-
-      String format;
-      switch (sym.getKind()) {
-        case CONSTRUCTOR:
-          format =
-              String.format(
-                  "%%^.%s", enclClass != null ? enclClass.getSimpleName() : sym.getSimpleName());
-          break;
-        case TYPE_PARAMETER:
-          format = String.format("%%^.<%s>", sym.getSimpleName());
-          break;
-        case METHOD:
-          int numParams = ((MethodSymbol) sym).params().size();
-          List<String> params = new ArrayList<>(numParams);
-          for (int i = 1; i <= numParams; i++) {
-            params.add("%" + (i + 1) + "`");
-          }
-          format =
-              String.format("%%1` %%^.%s(%s)", sym.getSimpleName(), Joiner.on(",").join(params));
-          break;
-        default:
-          format = String.format("%%^.%s", sym.getSimpleName());
-          break;
+      if (config.getIgnoreVNameRoots()) {
+        v = v.toBuilder().clearRoot().build();
       }
 
       NodeKind kind = elementNodeKind(sym.getKind());
       NodeBuilder builder = kind != null ? newNode(kind) : newNode(sym.getKind().toString());
-      node =
-          builder
-              .setCorpusPath(CorpusPath.fromVName(v))
-              .addSignatureSalt(signature)
-              .addSignatureSalt("" + hashSymbol(sym))
-              .setProperty("format", format)
-              .build();
-      emitName(node, signature);
+      builder.setCorpusPath(CorpusPath.fromVName(v));
+      if (markedSource != null) {
+        builder.setProperty("code", markedSource);
+        symbolsDocumented.add(sym);
+      }
+
+      if (signatureGenerator.getUseJvmSignatures()) {
+        builder.setSignature(signature);
+      } else {
+        builder.addSignatureSalt(signature).addSignatureSalt("" + hashSymbol(sym));
+      }
+      node = builder.build();
       node.emit(getEmitter());
     }
 
-    symbolNodes.put(sym, node);
+    symbolNodes.put(sym, node.getVName());
+    return node.getVName();
+  }
+
+  /** Emits and returns a new {@link EntrySet} representing a lambda object. */
+  public EntrySet newLambdaAndEmit(Positions filePositions, JCTree.JCLambda lambda) {
+    VName fileVName = getFileVName(getDigest(filePositions.getSourceFile()));
+    return emitAndReturn(
+        newNode(NodeKind.FUNCTION)
+            .setCorpusPath(CorpusPath.fromVName(fileVName))
+            .addSignatureSalt("" + filePositions.getSpan(lambda)));
+  }
+
+  /**
+   * Emits and returns a new {@link EntrySet} representing a Java comment with an optional subkind.
+   */
+  public EntrySet newDocAndEmit(
+      Optional<String> subkind, Positions filePositions, String text, Iterable<VName> params) {
+    VName fileVName = getFileVName(getDigest(filePositions.getSourceFile()));
+    NodeBuilder builder =
+        newNode(NodeKind.DOC.getKind(), subkind)
+            .setCorpusPath(CorpusPath.fromVName(fileVName))
+            .setProperty("text", text.getBytes(UTF_8))
+            .addSignatureSalt(text);
+    params.forEach(builder::addSignatureSalt);
+    EntrySet node = emitAndReturn(builder);
+    emitOrdinalEdges(node.getVName(), EdgeKind.PARAM, params);
     return node;
   }
 
-  public EntrySet getDoc(Positions filePositions, String text, Iterable<EntrySet> params) {
-    VName fileVName = getFileVName(getDigest(filePositions.getSourceFile()));
-    byte[] encodedText;
-    try {
-      encodedText = text.getBytes("UTF-8");
-    } catch (UnsupportedEncodingException ex) {
-      encodedText = new byte[0];
-    }
-    NodeBuilder builder =
-        newNode(NodeKind.DOC)
-            .setCorpusPath(CorpusPath.fromVName(fileVName))
-            .setProperty("text", encodedText)
-            .addSignatureSalt(text);
-    for (EntrySet param : params) {
-      builder.addSignatureSalt(param.getVName());
-    }
-    EntrySet node = emitAndReturn(builder);
-    emitOrdinalEdges(node, EdgeKind.PARAM, params);
-    return node;
+  /** Returns the {@link VName} for the given file. */
+  public VName getFileVName(JavaFileObject sourceFile) {
+    return getFileVName(getDigest(sourceFile));
   }
 
   /** Emits and returns a new {@link EntrySet} representing the Java file. */
-  public EntrySet getFileNode(Positions file) {
-    return getFileNode(getDigest(file.getSourceFile()), file.getData(), file.getEncoding());
+  public EntrySet newFileNodeAndEmit(Positions file) {
+    return newFileNodeAndEmit(getDigest(file.getSourceFile()), file.getData(), file.getEncoding());
   }
 
   /** Emits and returns a new {@link EntrySet} representing a Java package. */
-  public EntrySet getPackageNode(PackageSymbol sym) {
-    return getPackageNode(sym.getQualifiedName().toString());
+  public EntrySet newPackageNodeAndEmit(PackageSymbol sym) {
+    return newPackageNodeAndEmit(sym.getQualifiedName().toString());
   }
 
   /** Emits and returns a new {@link EntrySet} representing a Java package. */
-  public EntrySet getPackageNode(String name) {
+  public EntrySet newPackageNodeAndEmit(String name) {
     EntrySet node =
-        emitAndReturn(newNode(NodeKind.PACKAGE).addSignatureSalt(name).setProperty("format", name));
-    emitName(node, name);
+        emitAndReturn(
+            newNode(NodeKind.PACKAGE)
+                .addSignatureSalt(name)
+                .setProperty(
+                    "code",
+                    MarkedSource.newBuilder()
+                        .setPreText(name)
+                        .setKind(MarkedSource.Kind.IDENTIFIER)
+                        .build()));
     return node;
   }
 
   /** Emits and returns a new {@link EntrySet} for the given wildcard. */
-  public EntrySet getWildcardNode(JCTree.JCWildcard wild) {
-    return emitAndReturn(newNode(NodeKind.ABS_VAR).addSignatureSalt("" + wild.hashCode()));
-  }
-
-  /** Returns and emits a Java anchor for the given {@link JCTree}. */
-  public EntrySet getAnchor(Positions filePositions, JCTree tree) {
-    return getAnchor(filePositions, filePositions.getSpan(tree));
+  public EntrySet newWildcardNodeAndEmit(JCTree.JCWildcard wild, String sourcePath) {
+    int counter = sourceToWildcardCounter.getOrDefault(sourcePath, 0);
+    sourceToWildcardCounter.put(sourcePath, counter + 1);
+    return emitAndReturn(newNode(NodeKind.ABS_VAR).addSignatureSalt(sourcePath + counter));
   }
 
   /** Returns and emits a Java anchor for the given offset span. */
-  public EntrySet getAnchor(Positions filePositions, Span loc) {
-    return getAnchor(filePositions, loc, null);
+  public EntrySet newAnchorAndEmit(Positions filePositions, Span loc) {
+    return newAnchorAndEmit(filePositions, loc, null);
   }
 
   /** Returns and emits a Java anchor for the given offset span. */
-  public EntrySet getAnchor(Positions filePositions, Span loc, Span snippet) {
-    return getAnchor(getFileVName(getDigest(filePositions.getSourceFile())), loc, snippet);
+  public EntrySet newAnchorAndEmit(Positions filePositions, Span loc, Span snippet) {
+    return newAnchorAndEmit(getFileVName(getDigest(filePositions.getSourceFile())), loc, snippet);
   }
 
   /** Returns and emits a Java anchor for the given identifier. */
-  public EntrySet getAnchor(Positions filePositions, Name name, int startOffset, Span snippet) {
+  public EntrySet newAnchorAndEmit(
+      Positions filePositions, Name name, int startOffset, Span snippet) {
     Span span = filePositions.findIdentifier(name, startOffset);
     return span == null
         ? null
-        : getAnchor(getFileVName(getDigest(filePositions.getSourceFile())), span, snippet);
+        : newAnchorAndEmit(getFileVName(getDigest(filePositions.getSourceFile())), span, snippet);
+  }
+
+  /** Emits and returns a DIAGNOSTIC node attached to the given file. */
+  public EntrySet emitDiagnostic(Positions filePositions, Diagnostic d) {
+    return emitDiagnostic(getFileVName(getDigest(filePositions.getSourceFile())), d);
   }
 
   /** Returns the equivalent {@link NodeKind} for the given {@link ElementKind}. */
-  public static NodeKind elementNodeKind(ElementKind kind) {
+  @Nullable
+  private static NodeKind elementNodeKind(ElementKind kind) {
     switch (kind) {
       case CLASS:
         return NodeKind.RECORD_CLASS;
@@ -229,7 +289,7 @@ public class JavaEntrySets extends KytheEntrySets {
       case TYPE_PARAMETER:
         return NodeKind.ABS_VAR;
       default:
-        // TODO(schroederc): handle all cases, make this exceptional, and remove all null checks
+        // TODO(#1845): handle all cases, make this exceptional, and remove all null checks
         return null;
     }
   }
@@ -250,10 +310,11 @@ public class JavaEntrySets extends KytheEntrySets {
     if (sym.members() != null) {
       for (Symbol member : sym.members().getSymbols()) {
         if (member.isPrivate()
-            || member instanceof MethodSymbol && ((MethodSymbol) member).isStaticOrInstanceInit()) {
-          // Ignore initializers and private members.  It's possible these do not appear in the
-          // symbol's scope outside of its .java source compilation (i.e. they do not appear in
-          // dependent compilations for Bazel's java rules).
+            || (member instanceof MethodSymbol && ((MethodSymbol) member).isStaticOrInstanceInit())
+            || ((member.flags_field & (Flags.BRIDGE | Flags.SYNTHETIC)) != 0)) {
+          // Ignore initializers, private members, and synthetic members.  It's possible these do
+          // not appear in the symbol's scope outside of its .java source compilation (i.e. they do
+          // not appear in dependent compilations for Bazel's java rules).
           continue;
         }
         // We can't recursively get the result of hashSymbol(member) since the extractor removes all
@@ -265,16 +326,21 @@ public class JavaEntrySets extends KytheEntrySets {
 
     hashes.add(sym.getQualifiedName().toString().hashCode());
     hashes.add(sym.getKind().ordinal());
-    for (Modifier mod : sym.getModifiers()) {
-      hashes.add(mod.ordinal());
-    }
+    // XXX: ignore Symbol modifiers since they can be inconsistent between definitions/references.
 
     int h = hashes.hashCode();
     symbolHashes.put(sym, h);
     return h;
   }
 
-  private VName lookupVName(ClassSymbol cls) {
+  /** Returns the JVM {@link CorpusPath} for the given {@link Symbol}. */
+  public CorpusPath jvmCorpusPath(Symbol sym) {
+    return new CorpusPath(
+        Optional.ofNullable(lookupVName(sym.enclClass())).map(VName::getCorpus).orElse(""), "", "");
+  }
+
+  @Nullable
+  private VName lookupVName(@Nullable ClassSymbol cls) {
     if (cls == null) {
       return null;
     }
@@ -282,7 +348,8 @@ public class JavaEntrySets extends KytheEntrySets {
     return clsVName != null ? clsVName : lookupVName(getDigest(cls.sourcefile));
   }
 
-  private static String getDigest(JavaFileObject sourceFile) {
+  @Nullable
+  private static String getDigest(@Nullable JavaFileObject sourceFile) {
     if (sourceFile == null) {
       return null;
     }
@@ -290,45 +357,42 @@ public class JavaEntrySets extends KytheEntrySets {
     return sourceFile.toUri().getHost();
   }
 
-  /** Ensures that a particular {@link Symbol} is only associated with a single signature. */
-  private void checkSignature(Symbol sym, String signature) {
-    // TODO(schroederc): remove this check in production releases
-    if (!symbolSigs.containsKey(sym)) {
-      symbolSigs.put(sym, new HashSet<String>());
-    }
-    Set<String> signatures = symbolSigs.get(sym);
-    signatures.add(signature);
-    if (signatures.size() > 1) {
-      throw new IllegalStateException("Multiple signatures found for " + sym + ": " + signatures);
-    }
-  }
-
-  private static boolean fromJDK(Symbol sym) {
-    if (sym == null || sym.enclClass() == null) {
+  static boolean fromJDK(@Nullable Symbol sym) {
+    if (sym == null) {
       return false;
     }
-    String cls = sym.enclClass().className();
-    return cls.startsWith("java.")
+    ClassSymbol enclClass = sym.enclClass();
+    if (enclClass == null
+        || enclClass.classfile == null
+        || enclClass.classfile.getKind() == JavaFileObject.Kind.SOURCE) {
+      return false;
+    }
+    String cls = enclClass.className();
+    // For performance, first check common package prefixes, then delegate
+    // to the slower loadedByJDKClassLoader() method.
+    return SignatureGenerator.isArrayHelperClass(enclClass)
+        || cls.startsWith("java.")
         || cls.startsWith("javax.")
         || cls.startsWith("com.sun.")
-        || cls.startsWith("sun.");
+        || cls.startsWith("sun.")
+        || loadedByJDKClassLoader(cls);
   }
 
   /**
-   * Returns and emits a placeholder node meant to be <b>soon</b> replaced by a Kythe
-   * schema-compliant node.
+   * Detects whether the class with the given name was loaded by the ClassLoader used to load JDK
+   * classes.
+   *
+   * <p>Although this is not required by the JVM spec, standard JVM implementations use separate
+   * classloaders for loading JDK classes vs. user classes.
+   *
+   * <p>Therefore, although not completely bulletproof, this is a good heuristic in practice for
+   * detecting whether a class is supplied by the JDK.
    */
-  @Deprecated
-  EntrySet todoNode(String sourceName, JCTree tree, String message) {
-    return emitAndReturn(
-        newNode("TODO")
-            .addSignatureSalt("" + System.nanoTime()) // Ensure unique TODOs
-            .setProperty("todo", message)
-            .setProperty("sourcename", sourceName)
-            .setProperty("jctree/class", tree.getClass().toString())
-            .setProperty("jctree/tag", "" + tree.getTag())
-            .setProperty("jctree/type", "" + tree.type)
-            .setProperty("jctree/pos", "" + tree.pos)
-            .setProperty("jctree/start", "" + tree.getStartPosition()));
+  private static boolean loadedByJDKClassLoader(String cls) {
+    try {
+      return Class.forName(cls).getClassLoader() == String.class.getClassLoader();
+    } catch (ClassNotFoundException | SecurityException e) {
+      return false;
+    }
   }
 }

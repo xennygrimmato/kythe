@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,14 +21,15 @@ import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Ordering;
 import com.google.common.hash.Hashing;
 import com.google.devtools.kythe.extractors.java.JavaCompilationUnitExtractor;
 import com.google.devtools.kythe.extractors.shared.CompilationDescription;
 import com.google.devtools.kythe.extractors.shared.FileVNames;
 import com.google.devtools.kythe.extractors.shared.IndexInfoUtils;
-import com.google.devtools.kythe.platform.indexpack.Archive;
 import com.google.devtools.kythe.proto.Analysis.CompilationUnit;
 import com.google.devtools.kythe.proto.Analysis.FileData;
+import com.google.devtools.kythe.util.JsonUtil;
 import com.sun.tools.javac.main.CommandLine;
 import java.io.File;
 import java.io.IOException;
@@ -40,23 +41,22 @@ import java.util.List;
 /**
  * General logic for a javac-based {@link CompilationUnit} extractor.
  *
- * Environment Variables Used (note that these can also be set as JVM system properties):
- *   KYTHE_VNAMES: optional path to a JSON configuration file for {@link FileVNames} to populate
- *                 the {@link CompilationUnit}'s required input {@link VName}s
+ * <p>Environment Variables Used (note that these can also be set as JVM system properties):
  *
- *   KYTHE_CORPUS: if KYTHE_VNAMES is not given, all {@link VName}s will be populated with this
- *                 corpus (default {@link DEFAULT_CORPUS})
+ * <p>KYTHE_VNAMES: optional path to a JSON configuration file for {@link FileVNames} to populate
+ * the {@link CompilationUnit}'s required input {@link VName}s
  *
- *   KYTHE_ROOT_DIRECTORY: required root path for file inputs; the {@link FileData} paths stored in
- *                         the {@link CompilationUnit} will be made to be relative to this directory
+ * <p>KYTHE_CORPUS: if KYTHE_VNAMES is not given, all {@link VName}s will be populated with this
+ * corpus (default {@link DEFAULT_CORPUS})
  *
- *   KYTHE_OUTPUT_FILE: if set to a non-empty value, write the resulting .kindex file to this path
- *                      instead of using KYTHE_OUTPUT_DIRECTORY
+ * <p>KYTHE_ROOT_DIRECTORY: required root path for file inputs; the {@link FileData} paths stored in
+ * the {@link CompilationUnit} will be made to be relative to this directory
  *
- *   KYTHE_OUTPUT_DIRECTORY: required directory path to store the resulting .kindex file
+ * <p>KYTHE_OUTPUT_FILE: if set to a non-empty value, write the resulting .kzip file to this path
+ * instead of using KYTHE_OUTPUT_DIRECTORY
  *
- *   KYTHE_INDEX_PACK: if set to a non-empty value, interpret KYTHE_OUTPUT_DIRECTORY as the root of
- *                     an indexpack instead of a collection of .kindex files
+ * <p>KYTHE_OUTPUT_DIRECTORY: directory path to store the resulting .kzip file, if KYTHE_OUTPUT_FILE
+ * is not set
  */
 public abstract class AbstractJavacWrapper {
   public static final String DEFAULT_CORPUS = "kythe";
@@ -69,10 +69,11 @@ public abstract class AbstractJavacWrapper {
 
   /**
    * Given the command-line arguments to javac, construct a {@link CompilationUnit} and write it to
-   * a .kindex file or indexpack. Parameters to the extraction logic are passed by environment
-   * variables (see class comment).
+   * a .kindex file. Parameters to the extraction logic are passed by environment variables (see
+   * class comment).
    */
   public void process(String[] args) {
+    JsonUtil.usingTypeRegistry(JsonUtil.JSON_TYPE_REGISTRY);
     try {
       if (!passThroughIfAnalysisOnly(args)) {
         String vnamesConfig = System.getenv("KYTHE_VNAMES");
@@ -91,18 +92,7 @@ public abstract class AbstractJavacWrapper {
 
         CompilationDescription indexInfo =
             processCompilation(getCleanedUpArguments(args), extractor);
-
-        String outputFile = System.getenv("KYTHE_OUTPUT_FILE");
-        if (!Strings.isNullOrEmpty(outputFile)) {
-          IndexInfoUtils.writeIndexInfoToFile(indexInfo, outputFile);
-        } else {
-          String outputDir = readEnvironmentVariable("KYTHE_OUTPUT_DIRECTORY");
-          if (Strings.isNullOrEmpty(System.getenv("KYTHE_INDEX_PACK"))) {
-            writeIndexInfoToFile(outputDir, indexInfo);
-          } else {
-            new Archive(outputDir).writeDescription(indexInfo);
-          }
-        }
+        outputIndexInfo(indexInfo);
 
         CompilationUnit compilationUnit = indexInfo.getCompilationUnit();
         if (compilationUnit.getHasCompileErrors()) {
@@ -111,18 +101,43 @@ public abstract class AbstractJavacWrapper {
         }
       }
     } catch (IOException e) {
-      System.err.println(
-          String.format(
-              "Unexpected IO error (probably while writing to index file): %s", e.toString()));
+      System.err.printf(
+          "Unexpected IO error (probably while writing to index file): %s%n", e.toString());
       System.err.println(Throwables.getStackTraceAsString(e));
       System.exit(2);
     } catch (Exception e) {
-      System.err.println(
-          String.format(
-              "Unexpected error compiling and indexing java compilation: %s", e.toString()));
+      System.err.printf(
+          "Unexpected error compiling and indexing java compilation: %s%n", e.toString());
       System.err.println(Throwables.getStackTraceAsString(e));
       System.exit(2);
     }
+  }
+
+  private static void outputIndexInfo(CompilationDescription indexInfo) throws IOException {
+    String outputFile = System.getenv("KYTHE_OUTPUT_FILE");
+    if (!Strings.isNullOrEmpty(outputFile)) {
+      if (outputFile.endsWith(IndexInfoUtils.KZIP_FILE_EXT)) {
+        IndexInfoUtils.writeKzipToFile(indexInfo, outputFile);
+      } else {
+        System.err.printf("Unsupported output file: %s%n", outputFile);
+        System.exit(2);
+      }
+      return;
+    }
+
+    String outputDir = readEnvironmentVariable("KYTHE_OUTPUT_DIRECTORY");
+    // Just rely on the underlying compilation unit's signature to get the filename, if we're not
+    // writing to a single kzip file.
+    String name =
+        indexInfo
+            .getCompilationUnit()
+            .getVName()
+            .getSignature()
+            .trim()
+            .replaceAll("^/+|/+$", "")
+            .replace('/', '_');
+    String path = IndexInfoUtils.getKzipPath(outputDir, name).toString();
+    IndexInfoUtils.writeKzipToFile(indexInfo, path);
   }
 
   private static String[] getCleanedUpArguments(String[] args) throws IOException {
@@ -144,27 +159,17 @@ public abstract class AbstractJavacWrapper {
       } else if (!(skipArg
           || arg.startsWith("-J")
           || arg.startsWith("-XD")
-          || arg.startsWith("-Werror"))) {
+          || arg.startsWith("-Werror")
+          // The errorprone plugin complicates the build due to certain other
+          // flags it requires (such as -XDcompilePolicy=byfile) and is not
+          // necessary for extraction.
+          || arg.startsWith("-Xplugin:ErrorProne"))) {
         cleanedUpArgs.add(arg);
       }
       skipArg = false;
     }
     String[] cleanedUpArgsArray = new String[cleanedUpArgs.size()];
     return cleanedUpArgs.toArray(cleanedUpArgsArray);
-  }
-
-  private static void writeIndexInfoToFile(String rootDirectory, CompilationDescription indexInfo)
-      throws IOException {
-    String name =
-        indexInfo
-            .getCompilationUnit()
-            .getVName()
-            .getSignature()
-            .trim()
-            .replaceAll("^/+|/+$", "")
-            .replace('/', '_');
-    String path = IndexInfoUtils.getIndexPath(rootDirectory, name).toString();
-    IndexInfoUtils.writeIndexInfoToFile(indexInfo, path);
   }
 
   private boolean passThroughIfAnalysisOnly(String[] args) throws Exception {
@@ -185,18 +190,17 @@ public abstract class AbstractJavacWrapper {
   }
 
   protected static String createTargetFromSourceFiles(List<String> sourceFiles) {
-    List<String> sortedSourceFiles = Lists.newArrayList(sourceFiles);
-    Collections.sort(sortedSourceFiles);
+    List<String> sortedSourceFiles = Ordering.natural().sortedCopy(sourceFiles);
     String joinedSourceFiles = Joiner.on(":").join(sortedSourceFiles);
-    return "#" + Hashing.sha256().hashUnencodedChars(joinedSourceFiles).toString();
+    return "#" + Hashing.sha256().hashUnencodedChars(joinedSourceFiles);
   }
 
   protected static List<String> splitPaths(String path) {
-    return path == null ? Collections.<String>emptyList() : Splitter.on(":").splitToList(path);
+    return path == null ? Collections.<String>emptyList() : Splitter.on(':').splitToList(path);
   }
 
   protected static List<String> splitCSV(String lst) {
-    return lst == null ? Collections.<String>emptyList() : Splitter.on(",").splitToList(lst);
+    return lst == null ? Collections.<String>emptyList() : Splitter.on(',').splitToList(lst);
   }
 
   static String readEnvironmentVariable(String variableName) {
@@ -212,7 +216,7 @@ public abstract class AbstractJavacWrapper {
     }
     if (Strings.isNullOrEmpty(result)) {
       if (Strings.isNullOrEmpty(defaultValue)) {
-        System.err.println(String.format("Missing environment variable: %s", variableName));
+        System.err.printf("Missing environment variable: %s%n", variableName);
         System.exit(1);
       }
       result = defaultValue;

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,17 +14,25 @@
  * limitations under the License.
  */
 
-#include "gflags/gflags.h"
-#include "glog/logging.h"
-#include "kythe/cxx/common/json_proto.h"
 #include "kythe/cxx/common/net_client.h"
 
-DEFINE_string(xrefs, "http://localhost:8080", "Base URI for xrefs service");
+#include <string>
+
+#include "absl/flags/flag.h"
+#include "absl/flags/parse.h"
+#include "absl/memory/memory.h"
+#include "glog/logging.h"
+#include "kythe/cxx/common/json_proto.h"
+#include "kythe/proto/common.pb.h"
+#include "kythe/proto/graph.pb.h"
+
+ABSL_FLAG(std::string, xrefs, "http://localhost:8080",
+          "Base URI for xrefs service");
 
 namespace {
 void TestNodeRequest() {
-  kythe::XrefsJsonClient client(
-      std::unique_ptr<kythe::JsonClient>(new kythe::JsonClient()), FLAGS_xrefs);
+  kythe::XrefsJsonClient client(absl::make_unique<kythe::JsonClient>(),
+                                absl::GetFlag(FLAGS_xrefs));
   kythe::proto::NodesRequest request;
   kythe::proto::NodesReply response;
   // TODO(zarko): Use kythe::URI once it's merged in.
@@ -35,18 +43,18 @@ void TestNodeRequest() {
 
   CHECK_EQ(request.ticket(0), response.nodes().begin()->first)
       << response.DebugString();
-  kythe::proto::NodeInfo node = response.nodes().begin()->second;
+  kythe::proto::common::NodeInfo node = response.nodes().begin()->second;
   CHECK_EQ(1, node.facts().size()) << response.DebugString();
 
   CHECK_EQ("/kythe/node/kind", node.facts().begin()->first);
   CHECK_EQ("file", node.facts().begin()->second);
 }
-}
+}  // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
   google::InitGoogleLogging(argv[0]);
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  absl::ParseCommandLine(argc, argv);
   kythe::JsonClient::InitNetwork();
   TestNodeRequest();
   return 0;

@@ -1,0 +1,189 @@
+// Copyright 2018 The Kythe Authors. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+Kythe Compilation ZIP Format (.kzip)
+====================================
+Michael J. Fromberger <fromberger@google.com>
+v.0.1.0, 18-May-2018: Draft
+:toc:
+:toclevels: 3
+:priority: 500
+
+== Summary
+
+This document specifies a compact persistent storage representation for
+compilation records, suitable for use by Kythe to generate cross-reference data
+and to apply other static analysis tools to source files.
+
+== Background
+
+To generate cross-references, Kythe captures a record of each compilation that
+is to be indexed (_e.g.,_ a library or binary) with enough information to
+enable us to replay the compilation to the front-end of the compiler.  This
+record consists of a
+`CompilationUnit` link:https://developers.google.com/protocol-buffers[protobuf]
+message, together with the content of all the source files and other inputs the
+compiler needs to process the compilation (_e.g.,_ header files or type
+snapshots from dependencies).
+
+== Kythe ZIP Format (.kzip)
+
+To store compilation records compactly, we use a specially formatted ZIP
+archive that we call a *kzip* file, conventionally given the file extension
+`.kzip`. A kzip file consists of the following directory structure:
+
+[literal]
+root/           # Any valid non-empty directory name
+   units/
+     abcd1234   # Compilation unit (JSON format, see below for details)
+     ...        # (name is hex-coded SHA256 of record content)
+   files/
+     1a2b3c4e   # File contents, uncompressed
+     ...        # (name is hex-coded SHA256 of uncompressed file content)
+
+This organization separates the compilation unit descriptions from their file
+data, which are shared among multiple compilations.
+
+`.kzip` can offer alternate structures, in which compilation units are formatted in other encodings. Currently the only other encoding defined and supported is "proto". In this case, the directory structure will look like
+
+[literal]
+root/           # Any valid non-empty directory name
+   pbunits/
+     abcd1234   # Compilation unit (proto format, see below for details)
+     ...        # (name is hex-coded SHA256 of record content)
+   files/
+     1a2b3c4e   # File contents, uncompressed
+     ...        # (name is hex-coded SHA256 of uncompressed file content)
+
+=== Directory and File Layout
+
+A kzip is a ZIP file containing a top-level root directory that contains two
+subdirectories, one named `units` and one named `files`.
+
+ * The `units` (or `pbunits`) subdirectory may contain only unit files.
+
+ * The `files` subdirectory may contain only data files.
+
+ * Other files or directories inside the `units` or `files` subdirectories
+   should cause a tool to consider the kzip file invalid.
+
+ * Other files or subdirectories in the root or other subdirectories should be
+   ignored by a tool processing the kzip file.
+
+A *unit file* is a file containing a compilation unit description.
+The name of a unit file is computed by digesting the compilation unit
+with SHA256, and encoding the resulting hash as a string of lowercase
+ASCII hexadecimal digits. This string becomes the filename of the unit
+file. Note that the digest should only process the CompilationUnit
+itself, and should not include the other contents of the wrapper
+message. Details on the digesting algorithm are described below.
+
+A *data file* is a file containing an unstructured blob of raw (uncompressed)
+file data.  The name name of a data file is computed by hashing the file
+contents with SHA256, and encoding the resulting hash as a string of lowercase
+ASCII hexadecimal digits. This string becomes the filename of the data file.
+
+The *root directory* must be the first entry in the ZIP file, and its name must
+not be empty.
+
+=== Compilation Unit Description Format
+
+The content of a unit file is the canonical JSON encoding of a
+`kythe.proto.IndexedCompilation` protobuf message.
+
+[source,javascript]
+{
+   "unit": <encoded kythe.proto.CompilationUnit>,
+   "index": {
+      "revision": ["123", "456", "789"]
+   }
+}
+
+The `"unit"` key is required, and must contain the canonical JSON encoding of a
+`kythe.proto.CompilationUnit` protobuf message.  The `"index"` key is optional,
+but if set must contain the canonical JSON encoding of an `Index` message.
+
+For the `proto` encoding of compilation units, the content of the unit
+is the standard wire-encoding of the `kythe.proto.IndexedCompilation`
+protobuf message.
+
+=== Computing the digest for a Compilation Unit
+
+The representative implementation can be found in
+`kythe/go/platform/kcd/kythe/units.go`.
+
+==== Definitions
+
+`NULL`::
+the one-byte value corresponding to ASCII NULL (`\0x00`)
+`NL`::
+the one-byte value corresponding to ASCII newline (`\x0a`)
+
+All strings are emitted in UTF-8 encoding.
+
+==== Canonical form
+For the purposes of computing the digest, a compilation unit should
+be in *_canonical form_*. This is defined as:
+
+- the field `required_input` is deduplicated and sorted according to
+  `cu.required_input.path`
+- the field `environment` is sorted by `environment.name`
+- the field `source_file` is sorted
+- the field `details` is sorted by `details.type_url`
+
+==== Digest computation
+Let `v` be a `kythe.proto.VName`. Then a digest of `v` is
+
+....
+   v.signature NULL v.corpus NULL v.root NULL v.path NULL v.language NULL
+....
+
+Let `cu` be an instance of `kythe.proto.CompilationUnit`. Then a
+digest of `cu` is computed as the sequence
+
+....
+   "CU" NL cu.vname NULL
+....
+
+followed by, for each required input:
+
+....
+   "RI" NL cu.required_input[i].vname NULL
+   "IN" NL cu.required_input[i].info.path NULL cu.required_input[i].info.digest NULL
+....
+
+followed by:
+
+....
+   "ARG" NL cu.argument[0] NULL cu.argument[1] NULL ...
+   "OUT" NL cu.output_key NULL
+   "SRC" NL cu.source_file[0] NULL cu.source_file[1] NULL ...
+   "CWD" NL cu.working_directory NULL
+   "CTX" NL cu.entry_context NULL
+....
+
+followed by, for each `cu.environment`:
+
+....
+   "ENV" NL cu.environment[i].name NULL cu.environment[i].value NULL
+....
+
+finally followed by, for each `cu.details`:
+
+....
+   "DET" NL cu.details[i].type_url NULL cu.details[i].value NULL
+....
+
+For the `cu.details.value`, this is the sequence of bytes of the
+wire-encoding proto representation of the value.

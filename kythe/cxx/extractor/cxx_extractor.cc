@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,41 +16,69 @@
 
 #include "cxx_extractor.h"
 
-#include <type_traits>
-#include <unordered_map>
-
 #include <fcntl.h>
 #include <openssl/sha.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
+#include <tuple>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+
+#include "absl/container/flat_hash_map.h"
+#include "absl/memory/memory.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/optional.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Lex/MacroArgs.h"
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Tooling/Tooling.h"
-
-#include "gflags/gflags.h"
 #include "glog/logging.h"
-#include "kythe/cxx/common/CommandLineUtils.h"
+#include "kythe/cxx/common/file_utils.h"
 #include "kythe/cxx/common/json_proto.h"
+#include "kythe/cxx/common/kzip_writer.h"
 #include "kythe/cxx/common/path_utils.h"
-#include "kythe/cxx/common/proto_conversions.h"
+#include "kythe/cxx/extractor/CommandLineUtils.h"
+#include "kythe/cxx/extractor/language.h"
+#include "kythe/cxx/extractor/path_utils.h"
+#include "kythe/cxx/indexer/cxx/proto_conversions.h"
 #include "kythe/proto/analysis.pb.h"
+#include "kythe/proto/buildinfo.pb.h"
 #include "kythe/proto/cxx.pb.h"
+#include "kythe/proto/filecontext.pb.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include "third_party/llvm/src/clang_builtin_headers.h"
 #include "third_party/llvm/src/cxx_extractor_preprocessor_utils.h"
 
 namespace kythe {
 namespace {
+llvm::StringRef ToStringRef(absl::string_view sv) {
+  return {sv.data(), sv.size()};
+}
+
+using cxx_extractor::LookupFileForIncludePragma;
 
 // We need "the lowercase ascii hex SHA-256 digest of the file contents."
-static constexpr char kHexDigits[] = "0123456789abcdef";
+constexpr char kHexDigits[] = "0123456789abcdef";
+
+// The message type URI for the build details message.
+constexpr char kBuildDetailsURI[] = "kythe.io/proto/kythe.proto.BuildDetails";
+
+/// When a -resource-dir is not specified, map builtin versions of compiler
+/// headers to this directory.
+constexpr char kBuiltinResourceDirectory[] = "/kythe_builtins";
 
 /// \brief Lowercase-string-hex-encodes the array sha_buf.
 /// \param sha_buf The bytes of the hash.
-static std::string LowercaseStringHexEncodeSha(
+std::string LowercaseStringHexEncodeSha(
     const unsigned char (&sha_buf)[SHA256_DIGEST_LENGTH]) {
   std::string sha_text(SHA256_DIGEST_LENGTH * 2, '\0');
   for (unsigned i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
@@ -59,6 +87,84 @@ static std::string LowercaseStringHexEncodeSha(
   }
   return sha_text;
 }
+
+google::protobuf::Any* FindMutableContext(
+    kythe::proto::CompilationUnit::FileInput* file_input,
+    kythe::proto::ContextDependentVersion* context) {
+  for (auto& detail : *file_input->mutable_details()) {
+    if (detail.UnpackTo(context)) {
+      return &detail;
+    }
+  }
+  return file_input->add_details();
+}
+
+class MutableFileContext {
+ public:
+  explicit MutableFileContext(
+      kythe::proto::CompilationUnit::FileInput* file_input)
+      : any_(FindMutableContext(file_input, &context_)) {}
+
+  kythe::proto::ContextDependentVersion* operator->() { return &context_; }
+
+  ~MutableFileContext() { any_->PackFrom(context_); }
+
+ private:
+  kythe::proto::ContextDependentVersion context_;
+  google::protobuf::Any* any_;
+};
+
+void AddFileContext(const SourceFile& source_file,
+                    kythe::proto::CompilationUnit::FileInput* file_input) {
+  if (source_file.include_history.empty()) {
+    return;
+  }
+
+  MutableFileContext context(file_input);
+  for (const auto& row : source_file.include_history) {
+    auto* row_pb = context->add_row();
+    row_pb->set_source_context(row.first);
+    if (row.second.default_claim == ClaimDirective::AlwaysClaim) {
+      row_pb->set_always_process(true);
+    }
+    for (const auto& col : row.second.out_edges) {
+      auto* col_pb = row_pb->add_column();
+      col_pb->set_offset(col.first);
+      col_pb->set_linked_context(col.second);
+    }
+  }
+}
+
+/// \brief Comparator for CompilationUnit::FileInput, ordering by VName.
+class OrderFileInputByVName {
+ public:
+  explicit OrderFileInputByVName(absl::string_view main_source_file)
+      : main_source_file_(main_source_file) {}
+
+  bool operator()(const kythe::proto::CompilationUnit::FileInput& lhs,
+                  const kythe::proto::CompilationUnit::FileInput& rhs) const {
+    return AsTuple(lhs) < AsTuple(rhs);
+  }
+
+ private:
+  using FileInputTuple =
+      std::tuple<int, absl::string_view, absl::string_view, absl::string_view,
+                 absl::string_view, absl::string_view>;
+  FileInputTuple AsTuple(
+      const kythe::proto::CompilationUnit::FileInput& file_input) const {
+    const auto& vname = file_input.v_name();
+    // The main source file should come before dependents, but otherwise
+    // delegate entirely to the vname.
+    return FileInputTuple((main_source_file_ == vname.path() ||
+                           main_source_file_ == file_input.info().path())
+                              ? 0
+                              : 1,
+                          vname.signature(), vname.corpus(), vname.root(),
+                          vname.path(), vname.language());
+  }
+
+  absl::string_view main_source_file_;
+};
 
 /// \brief A SHA-256 hash accumulator.
 class RunningHash {
@@ -94,7 +200,7 @@ class RunningHash {
     Update(options.Freestanding ? "freestanding" : "not_freestanding");
     Update(options.GNUMode ? "GNUmode" : "not_GNUMode");
     Update(options.MicrosoftExt ? "MSMode" : "not_MSMode");
-    Update(options.ObjC1 ? "ObjC1" : "not_ObjC1");
+    Update(options.ObjC ? "ObjC" : "not_ObjC");
   }
   /// \brief Update the hash with some unsigned integer.
   /// \param u The unsigned integer to include in the hash.
@@ -119,11 +225,18 @@ static std::string Sha256(const void* bytes, size_t length) {
   return LowercaseStringHexEncodeSha(sha_buf);
 }
 
+/// \brief Returns a kzip-based IndexWriter or dies.
+IndexWriter OpenKzipWriterOrDie(const std::string& path) {
+  auto writer = KzipWriter::Create(path);
+  CHECK(writer.ok()) << "Failed to open KzipWriter: " << writer.status();
+  return std::move(*writer);
+}
+
 /// \brief The state shared among the extractor's various moving parts.
 ///
 /// None of the fields in this struct are owned by the struct.
 struct ExtractorState {
-  IndexWriter* index_writer;
+  CompilationWriter* index_writer;
   clang::SourceManager* source_manager;
   clang::Preprocessor* preprocessor;
   std::string* main_source_file;
@@ -215,7 +328,8 @@ class ExtractorPPCallbacks : public clang::PPCallbacks {
                     const clang::MacroDirective* macro_directive) override;
 
   void MacroUndefined(const clang::Token& macro_name,
-                      const clang::MacroDefinition& macro_definition) override;
+                      const clang::MacroDefinition& macro_definition,
+                      const clang::MacroDirective* undef) override;
 
   void Defined(const clang::Token& macro_name,
                const clang::MacroDefinition& macro_definition,
@@ -238,7 +352,8 @@ class ExtractorPPCallbacks : public clang::PPCallbacks {
       clang::SourceLocation HashLoc, const clang::Token& IncludeTok,
       llvm::StringRef FileName, bool IsAngled, clang::CharSourceRange Range,
       const clang::FileEntry* File, llvm::StringRef SearchPath,
-      llvm::StringRef RelativePath, const clang::Module* Imported) override;
+      llvm::StringRef RelativePath, const clang::Module* Imported,
+      clang::SrcMgr::CharacteristicKind FileType) override;
 
   /// \brief Run by a `clang::PragmaHandler` to handle the `kythe_claim` pragma.
   ///
@@ -300,8 +415,8 @@ class ExtractorPPCallbacks : public clang::PPCallbacks {
   std::string* main_source_file_transcript_;
   /// Contents of the files we've used, indexed by normalized path.
   std::unordered_map<std::string, SourceFile>* const source_files_;
-  /// The active IndexWriter.
-  IndexWriter* index_writer_;
+  /// The active CompilationWriter.
+  CompilationWriter* index_writer_;
   /// Non-empty if the main source file was stdin ("-") and we have chosen
   /// a new name for it.
   std::string* main_source_file_stdin_alternate_;
@@ -320,9 +435,10 @@ ExtractorPPCallbacks::ExtractorPPCallbacks(ExtractorState state)
     ClaimPragmaHandlerWrapper(ExtractorPPCallbacks* context)
         : PragmaHandler("kythe_claim"), context_(context) {}
     void HandlePragma(clang::Preprocessor& preprocessor,
-                      clang::PragmaIntroducerKind introducer,
+                      clang::PragmaIntroducer introducer,
                       clang::Token& first_token) override {
-      context_->HandleKytheClaimPragma(preprocessor, introducer, first_token);
+      context_->HandleKytheClaimPragma(preprocessor, introducer.Kind,
+                                       first_token);
     }
 
    private:
@@ -336,9 +452,9 @@ ExtractorPPCallbacks::ExtractorPPCallbacks(ExtractorState state)
     MetadataPragmaHandlerWrapper(ExtractorPPCallbacks* context)
         : PragmaHandler("kythe_metadata"), context_(context) {}
     void HandlePragma(clang::Preprocessor& preprocessor,
-                      clang::PragmaIntroducerKind introducer,
+                      clang::PragmaIntroducer introducer,
                       clang::Token& first_token) override {
-      context_->HandleKytheMetadataPragma(preprocessor, introducer,
+      context_->HandleKytheMetadataPragma(preprocessor, introducer.Kind,
                                           first_token);
     }
 
@@ -354,7 +470,7 @@ void ExtractorPPCallbacks::FileChanged(
     clang::SrcMgr::CharacteristicKind /*FileType*/, clang::FileID /*PrevFID*/) {
   if (Reason == EnterFile) {
     if (last_inclusion_directive_path_.empty()) {
-      current_files_.push(FileState{GetMainFile()->getName(),
+      current_files_.push(FileState{std::string(GetMainFile()->getName()),
                                     ClaimDirective::NoDirectivesFound});
     } else {
       CHECK(!current_files_.empty());
@@ -403,7 +519,7 @@ PreprocessorTranscript ExtractorPPCallbacks::PopFile() {
 }
 
 void ExtractorPPCallbacks::EndOfMainFile() {
-  AddFile(GetMainFile(), GetMainFile()->getName());
+  AddFile(GetMainFile(), std::string(GetMainFile()->getName()));
   *main_source_file_transcript_ = PopFile();
 }
 
@@ -426,17 +542,16 @@ std::string ExtractorPPCallbacks::FixStdinPath(const clang::FileEntry* file,
 void ExtractorPPCallbacks::AddFile(const clang::FileEntry* file,
                                    const std::string& in_path) {
   std::string path = FixStdinPath(file, in_path);
-  auto contents =
-      source_files_->insert(std::make_pair(in_path, SourceFile{std::string()}));
+  auto contents = source_files_->insert({in_path, SourceFile{""}});
   if (contents.second) {
     const llvm::MemoryBuffer* buffer =
         source_manager_->getMemoryBufferForFile(file);
     contents.first->second.file_content.assign(buffer->getBufferStart(),
                                                buffer->getBufferEnd());
-    contents.first->second.vname.CopyFrom(index_writer_->VNameForPath(
-        RelativizePath(path, index_writer_->root_directory())));
-    LOG(INFO) << "added content for " << path << ": mapped to "
-              << contents.first->second.vname.DebugString() << "\n";
+    contents.first->second.vname.CopyFrom(
+        index_writer_->VNameForPath(index_writer_->RelativizePath(path)));
+    VLOG(1) << "added content for " << path << ": mapped to "
+            << contents.first->second.vname.DebugString() << "\n";
   }
 }
 
@@ -468,7 +583,7 @@ void ExtractorPPCallbacks::MacroExpands(
   }
   if (macro_name.getLocation().isFileID()) {
     llvm::StringRef macro_name_string =
-        macro_name.getIdentifierInfo()->getName().str();
+        macro_name.getIdentifierInfo()->getName();
     RecordMacroExpansion(
         macro_name.getLocation(),
         getMacroUnexpandedString(range, *preprocessor_, macro_name_string,
@@ -497,9 +612,8 @@ void ExtractorPPCallbacks::RecordSpecificLocation(clang::SourceLocation loc) {
     const auto* file_ref =
         source_manager_->getFileEntryForID(source_manager_->getFileID(loc));
     if (file_ref) {
-      auto vname = index_writer_->VNameForPath(
-          RelativizePath(FixStdinPath(file_ref, filename_ref),
-                         index_writer_->root_directory()));
+      auto vname = index_writer_->VNameForPath(index_writer_->RelativizePath(
+          FixStdinPath(file_ref, std::string(filename_ref))));
       history()->Update(ToStringRef(vname.signature()));
       history()->Update(ToStringRef(vname.corpus()));
       history()->Update(ToStringRef(vname.root()));
@@ -519,21 +633,20 @@ void ExtractorPPCallbacks::MacroDefined(
   if (!macro_location.isFileID()) {
     return;
   }
-  llvm::StringRef macro_name_string =
-      macro_name.getIdentifierInfo()->getName().str();
+  llvm::StringRef macro_name_string = macro_name.getIdentifierInfo()->getName();
   history()->Update(source_manager_->getFileOffset(macro_location));
   history()->Update(macro_name_string);
 }
 
 void ExtractorPPCallbacks::MacroUndefined(
     const clang::Token& macro_name,
-    const clang::MacroDefinition& macro_definition) {
+    const clang::MacroDefinition& macro_definition,
+    const clang::MacroDirective* undef) {
   clang::SourceLocation macro_location = macro_name.getLocation();
   if (!macro_location.isFileID()) {
     return;
   }
-  llvm::StringRef macro_name_string =
-      macro_name.getIdentifierInfo()->getName().str();
+  llvm::StringRef macro_name_string = macro_name.getIdentifierInfo()->getName();
   history()->Update(source_manager_->getFileOffset(macro_location));
   if (macro_definition) {
     // We don't just care that a macro was undefined; we care that
@@ -589,26 +702,68 @@ void ExtractorPPCallbacks::Ifndef(
                   macro_name.getIdentifierInfo()->getName().str());
 }
 
+std::string IncludeDirGroupToString(const clang::frontend::IncludeDirGroup& G) {
+  switch (G) {
+    ///< '\#include ""' paths, added by 'gcc -iquote'.
+    case clang::frontend::Quoted:
+      return "Quoted";
+    ///< Paths for '\#include <>' added by '-I'.
+    case clang::frontend::Angled:
+      return "Angled";
+    ///< Like Angled, but marks header maps used when building frameworks.
+    case clang::frontend::IndexHeaderMap:
+      return "IndexHeaderMap";
+    ///< Like Angled, but marks system directories.
+    case clang::frontend::System:
+      return "System";
+    ///< Like System, but headers are implicitly wrapped in extern "C".
+    case clang::frontend::ExternCSystem:
+      return "ExternCSystem";
+    ///< Like System, but only used for C.
+    case clang::frontend::CSystem:
+      return "CSystem";
+    ///< Like System, but only used for C++.
+    case clang::frontend::CXXSystem:
+      return "CXXSystem";
+    ///< Like System, but only used for ObjC.
+    case clang::frontend::ObjCSystem:
+      return "ObjCSystem";
+    ///< Like System, but only used for ObjC++.
+    case clang::frontend::ObjCXXSystem:
+      return "ObjCXXSystem";
+    ///< Like System, but searched after the system directories.
+    case clang::frontend::After:
+      return "After";
+  }
+}
+
 void ExtractorPPCallbacks::InclusionDirective(
     clang::SourceLocation HashLoc, const clang::Token& IncludeTok,
     llvm::StringRef FileName, bool IsAngled, clang::CharSourceRange Range,
     const clang::FileEntry* File, llvm::StringRef SearchPath,
-    llvm::StringRef RelativePath, const clang::Module* Imported) {
+    llvm::StringRef RelativePath, const clang::Module* Imported,
+    clang::SrcMgr::CharacteristicKind FileType) {
   if (File == nullptr) {
     LOG(WARNING) << "Found null file: " << FileName.str();
     LOG(WARNING) << "Search path was " << SearchPath.str();
     LOG(WARNING) << "Relative path was " << RelativePath.str();
     LOG(WARNING) << "Imported was set to " << Imported;
-    const auto* options =
-        &preprocessor_->getHeaderSearchInfo().getHeaderSearchOpts();
-    LOG(WARNING) << "Resource directory is " << options->ResourceDir;
-    for (const auto& entry : options->UserEntries) {
-      LOG(WARNING) << "User entry: " << entry.Path;
-    }
-    for (const auto& prefix : options->SystemHeaderPrefixes) {
-      LOG(WARNING) << "System entry: " << prefix.Prefix;
-    }
-    LOG(WARNING) << "Sysroot set to " << options->Sysroot;
+    static bool logged = [&] {
+      const auto* options =
+          &preprocessor_->getHeaderSearchInfo().getHeaderSearchOpts();
+      LOG(WARNING) << "Resource directory is " << options->ResourceDir;
+      for (const auto& entry : options->UserEntries) {
+        LOG(WARNING) << "User entry (" << IncludeDirGroupToString(entry.Group)
+                     << "): " << entry.Path;
+      }
+      for (const auto& prefix : options->SystemHeaderPrefixes) {
+        // This is not a search path. If an include path starts with this
+        // prefix, it is considered a system header.
+        LOG(WARNING) << "System header prefix: " << prefix.Prefix;
+      }
+      LOG(WARNING) << "Sysroot set to " << options->Sysroot;
+      return true;
+    }();
     return;
   }
   last_inclusion_directive_path_ =
@@ -621,11 +776,11 @@ std::string ExtractorPPCallbacks::AddFile(const clang::FileEntry* file,
                                           llvm::StringRef search_path,
                                           llvm::StringRef relative_path) {
   CHECK(!current_files_.top().file_path.empty());
-  const auto* search_path_entry =
+  const auto search_path_entry =
       source_manager_->getFileManager().getDirectory(search_path);
-  const auto* current_file_parent_entry =
-      source_manager_->getFileManager()
-          .getFile(current_files_.top().file_path.c_str())
+  const auto current_file_parent_entry =
+      (*source_manager_->getFileManager().getFile(
+           current_files_.top().file_path.c_str()))
           ->getDir();
   // If the include file was found relatively to the current file's parent
   // directory or a search path, we need to normalize it. This is necessary
@@ -634,7 +789,7 @@ std::string ExtractorPPCallbacks::AddFile(const clang::FileEntry* file,
   // we will get an error when we replay the compilation, as the virtual
   // file system is not aware of inodes.
   llvm::SmallString<1024> out_name;
-  if (search_path_entry == current_file_parent_entry) {
+  if (*search_path_entry == current_file_parent_entry) {
     auto parent =
         llvm::sys::path::parent_path(current_files_.top().file_path.c_str())
             .str();
@@ -656,7 +811,7 @@ std::string ExtractorPPCallbacks::AddFile(const clang::FileEntry* file,
     CHECK(llvm::sys::path::is_absolute(file_name)) << file_name.str();
     out_name = file_name;
   }
-  std::string out_name_string = out_name.str();
+  std::string out_name_string(out_name.str());
   AddFile(file, out_name_string);
   return out_name_string;
 }
@@ -692,21 +847,22 @@ void ExtractorPPCallbacks::HandleKytheMetadataPragma(
 
 class ExtractorAction : public clang::PreprocessorFrontendAction {
  public:
-  explicit ExtractorAction(IndexWriter* index_writer,
+  explicit ExtractorAction(CompilationWriter* index_writer,
                            ExtractorCallback callback)
-      : callback_(callback), index_writer_(index_writer) {}
+      : callback_(std::move(callback)), index_writer_(index_writer) {}
 
   void ExecuteAction() override {
     const auto inputs = getCompilerInstance().getFrontendOpts().Inputs;
-    CHECK_EQ(1, inputs.size()) << "Expected to see only one TU; instead saw "
-                               << inputs.size() << ".";
-    main_source_file_ = inputs[0].getFile();
+    CHECK_EQ(1, inputs.size())
+        << "Expected to see only one TU; instead saw " << inputs.size() << ".";
+    main_source_file_ = std::string(inputs[0].getFile());
     auto* preprocessor = &getCompilerInstance().getPreprocessor();
     preprocessor->addPPCallbacks(
-        llvm::make_unique<ExtractorPPCallbacks>(ExtractorState{
+        absl::make_unique<ExtractorPPCallbacks>(ExtractorState{
             index_writer_, &getCompilerInstance().getSourceManager(),
             preprocessor, &main_source_file_, &main_source_file_transcript_,
             &source_files_, &main_source_file_stdin_alternate_}));
+    index_writer_->CancelPreviouslyOpenedFiles();
     preprocessor->EnterMainSourceFile();
     clang::Token token;
     do {
@@ -723,54 +879,19 @@ class ExtractorAction : public clang::PreprocessorFrontendAction {
         getCompilerInstance().getHeaderSearchOpts();
     const auto& header_search_info =
         getCompilerInstance().getPreprocessor().getHeaderSearchInfo();
+    // Record the target triple during extraction so we can set it explicitly
+    // during indexing. This is important when extraction and indexing are done
+    // on machines that are not identical.
+    index_writer_->set_triple(getCompilerInstance().getTargetOpts().Triple);
     HeaderSearchInfo info;
     bool info_valid = info.CopyFrom(header_search_options, header_search_info);
-    RecordModuleInfo(&header_search_info.getModuleMap());
+    index_writer_->ScrubIntermediateFiles(header_search_options);
     callback_(main_source_file_, main_source_file_transcript_, source_files_,
               info_valid ? &info : nullptr,
               getCompilerInstance().getDiagnostics().hasErrorOccurred());
   }
 
  private:
-  void RecordModuleInfo(const clang::ModuleMap* module_map) {
-    // TODO(zarko): Record module flags (::DisableModuleHash, ::ModuleMaps)
-    // from HeaderSearchOptions; support "apple-style headermaps" (see
-    // Clang's InitHeaderSearch.cpp.)
-    auto* source_manager = &getCompilerInstance().getSourceManager();
-    for (auto modules = module_map->module_begin(),
-              modules_end = module_map->module_end();
-         modules != modules_end; ++modules) {
-      auto* module = modules->second;
-      if (module->DefinitionLoc.isInvalid() ||
-          !module->DefinitionLoc.isFileID()) {
-        LOG(WARNING) << "Module " << module->Name
-                     << " has an invalid or non-file definition location.";
-        continue;
-      }
-      auto file_id = source_manager->getFileID(module->DefinitionLoc);
-      if (file_id.isInvalid()) {
-        LOG(WARNING) << "Module " << module->Name << " has an invalid file ID.";
-        continue;
-      }
-      if (const auto* file = source_manager->getFileEntryForID(file_id)) {
-        auto contents = source_files_.insert(
-            std::make_pair(file->getName(), SourceFile{std::string()}));
-        if (contents.second) {
-          const llvm::MemoryBuffer* buffer =
-              source_manager->getMemoryBufferForFile(file);
-          contents.first->second.file_content.assign(buffer->getBufferStart(),
-                                                     buffer->getBufferEnd());
-          contents.first->second.vname.CopyFrom(
-              index_writer_->VNameForPath(RelativizePath(
-                  file->getName(), index_writer_->root_directory())));
-          LOG(INFO) << "added module map content for " << file->getName();
-        }
-      } else {
-        LOG(WARNING) << "Module " << module->Name << " is missing a FileEntry.";
-      }
-    }
-  }
-
   ExtractorCallback callback_;
   /// The main source file for the compilation (assuming only one).
   std::string main_source_file_;
@@ -778,8 +899,8 @@ class ExtractorAction : public clang::PreprocessorFrontendAction {
   std::string main_source_file_transcript_;
   /// Contents of the files we've used, indexed by normalized path.
   std::unordered_map<std::string, SourceFile> source_files_;
-  /// The active IndexWriter.
-  IndexWriter* index_writer_;
+  /// The active CompilationWriter.
+  CompilationWriter* index_writer_;
   /// Nonempty if the main source file was stdin ("-") and we have chosen
   /// an alternate name for it.
   std::string main_source_file_stdin_alternate_;
@@ -787,74 +908,48 @@ class ExtractorAction : public clang::PreprocessorFrontendAction {
 
 }  // anonymous namespace
 
-void IndexPackWriterSink::OpenIndex(const std::string& path,
-                                    const std::string& hash) {
-  CHECK(!pack_) << "Opening multiple index packs.";
-  std::string error_text;
-  auto filesystem = IndexPackPosixFilesystem::Open(
-      path, IndexPackFilesystem::OpenMode::kReadWrite, &error_text);
-  CHECK(filesystem) << "Couldn't open index pack in " << path << ": "
-                    << error_text;
-  pack_.reset(new IndexPack(std::move(filesystem)));
+KzipWriterSink::KzipWriterSink(const std::string& path,
+                               OutputPathType path_type)
+    : path_(path), path_type_(path_type) {}
+
+void KzipWriterSink::OpenIndex(const std::string& unit_hash) {
+  CHECK(!writer_.has_value()) << "OpenIndex() called twice";
+  std::string path = path_type_ == OutputPathType::SingleFile
+                         ? path_
+                         : JoinPath(path_, unit_hash + ".kzip");
+  writer_ = IndexWriter(OpenKzipWriterOrDie(path));
 }
 
-void IndexPackWriterSink::WriteHeader(
-    const kythe::proto::CompilationUnit& header) {
-  CHECK(pack_) << "Index pack not opened.";
-  std::string error_text;
-  CHECK(pack_->AddCompilationUnit(header, &error_text)) << error_text;
+void KzipWriterSink::WriteHeader(const kythe::proto::CompilationUnit& header) {
+  kythe::proto::IndexedCompilation compilation;
+  *compilation.mutable_unit() = header;
+  auto digest = writer_->WriteUnit(compilation);
+  if (!digest.ok()) {
+    LOG(ERROR) << "Error adding compilation: " << digest.status();
+  }
 }
 
-void IndexPackWriterSink::WriteFileContent(
-    const kythe::proto::FileData& content) {
-  CHECK(pack_) << "Index pack not opened.";
-  std::string error_text;
-  CHECK(pack_->AddFileData(content, &error_text)) << error_text;
+void KzipWriterSink::WriteFileContent(const kythe::proto::FileData& file) {
+  if (auto digest = writer_->WriteFile(file.content())) {
+    if (!file.info().digest().empty() && file.info().digest() != *digest) {
+      LOG(WARNING) << "Wrote FileData with mismatched digests: "
+                   << file.info().ShortDebugString() << " != " << *digest;
+    }
+  } else {
+    LOG(ERROR) << "Error writing filedata: " << digest.status();
+  }
 }
 
-void KindexWriterSink::OpenIndex(const std::string& directory,
-                                 const std::string& hash) {
-  using namespace google::protobuf::io;
-  CHECK(open_path_.empty() && fd_ < 0)
-      << "Reopening a KindexWriterSink (old fd:" << fd_
-      << " old path: " << open_path_ << ")";
-  std::string file_path =
-      force_path_.empty() ? directory + "/" + hash + ".kindex" : force_path_;
-  fd_ =
-      open(file_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IREAD | S_IWRITE);
-  CHECK_GE(fd_, 0) << "Couldn't open output file " << file_path;
-  open_path_ = file_path;
-  file_stream_.reset(new FileOutputStream(fd_));
-  GzipOutputStream::Options options;
-  // Accept the default compression level and compression strategy.
-  options.format = GzipOutputStream::GZIP;
-  gzip_stream_.reset(new GzipOutputStream(file_stream_.get(), options));
-  coded_stream_.reset(new CodedOutputStream(gzip_stream_.get()));
+KzipWriterSink::~KzipWriterSink() {
+  if (writer_) {
+    auto status = writer_->Close();
+    if (!status.ok()) {
+      LOG(ERROR) << "Error closing kzip output: " << status;
+    }
+  }
 }
 
-KindexWriterSink::~KindexWriterSink() {
-  CHECK(!coded_stream_->HadError()) << "Errors encountered writing to "
-                                    << open_path_;
-  coded_stream_.reset(nullptr);
-  gzip_stream_.reset(nullptr);
-  file_stream_.reset(nullptr);
-  close(fd_);
-}
-
-void KindexWriterSink::WriteHeader(
-    const kythe::proto::CompilationUnit& header) {
-  coded_stream_->WriteVarint32(header.ByteSize());
-  CHECK(header.SerializeToCodedStream(coded_stream_.get()))
-      << "Couldn't write header to " << open_path_;
-}
-
-void KindexWriterSink::WriteFileContent(const kythe::proto::FileData& content) {
-  coded_stream_->WriteVarint32(content.ByteSize());
-  CHECK(content.SerializeToCodedStream(coded_stream_.get()))
-      << "Couldn't write content to " << open_path_;
-}
-
-bool IndexWriter::SetVNameConfiguration(const std::string& json) {
+bool CompilationWriter::SetVNameConfiguration(const std::string& json) {
   std::string error_text;
   if (!vname_generator_.LoadJsonString(json, &error_text)) {
     LOG(ERROR) << "Could not parse vname generator configuration: "
@@ -864,7 +959,7 @@ bool IndexWriter::SetVNameConfiguration(const std::string& json) {
   return true;
 }
 
-kythe::proto::VName IndexWriter::VNameForPath(const std::string& path) {
+kythe::proto::VName CompilationWriter::VNameForPath(const std::string& path) {
   kythe::proto::VName out = vname_generator_.LookupVName(path);
   if (out.corpus().empty()) {
     out.set_corpus(corpus_);
@@ -872,11 +967,36 @@ kythe::proto::VName IndexWriter::VNameForPath(const std::string& path) {
   return out;
 }
 
-void IndexWriter::FillFileInput(
+std::string CompilationWriter::RelativizePath(absl::string_view path) {
+  // Don't attempt to relativize builtin resource paths.
+  if (absl::StartsWith(path, kBuiltinResourceDirectory)) {
+    return std::string(path);
+  }
+
+  if (!canonicalizer_.has_value()) {
+    if (StatusOr<PathCanonicalizer> canonicalizer =
+            PathCanonicalizer::Create(root_directory_, path_policy_)) {
+      canonicalizer_ = *std::move(canonicalizer);
+    } else {
+      LOG(INFO) << "Error making relative path: " << canonicalizer.status();
+      return std::string(path);
+    }
+  }
+  if (StatusOr<std::string> relative = canonicalizer_->Relativize(path)) {
+    return *std::move(relative);
+  } else {
+    LOG(INFO) << "Error making relative path: " << relative.status();
+    return std::string(path);
+  }
+}
+
+void CompilationWriter::FillFileInput(
     const std::string& clang_path, const SourceFile& source_file,
-    kythe::proto::CompilationUnit_FileInput* file_input) {
+    kythe::proto::CompilationUnit::FileInput* file_input) {
+  extra_includes_.erase(clang_path);
+  status_checked_paths_.erase(clang_path);
   CHECK(source_file.vname.language().empty());
-  file_input->mutable_v_name()->CopyFrom(source_file.vname);
+  *file_input->mutable_v_name() = source_file.vname;
   // This path is distinct from the VName path. It is used by analysis tools
   // to configure Clang's virtual filesystem.
   auto* file_info = file_input->mutable_info();
@@ -886,30 +1006,134 @@ void IndexWriter::FillFileInput(
   file_info->set_path(clang_path == "-" ? "<stdin>" : clang_path);
   file_info->set_digest(Sha256(source_file.file_content.c_str(),
                                source_file.file_content.size()));
-  for (const auto& row : source_file.include_history) {
-    auto* row_pb = file_input->add_context();
-    row_pb->set_source_context(row.first);
-    if (row.second.default_claim == ClaimDirective::AlwaysClaim) {
-      row_pb->set_always_process(true);
+  AddFileContext(source_file, file_input);
+}
+
+void CompilationWriter::InsertExtraIncludes(
+    kythe::proto::CompilationUnit* unit,
+    kythe::proto::CxxCompilationUnitDetails* details) {
+  auto fs = llvm::vfs::getRealFileSystem();
+  std::set<std::string> normalized_clang_paths;
+  for (const auto& input : unit->required_input()) {
+    normalized_clang_paths.insert(RelativizePath(input.info().path()));
+  }
+  for (const auto& path : extra_includes_) {
+    status_checked_paths_.erase(path);
+    auto normalized = RelativizePath(path);
+    status_checked_paths_.erase(normalized);
+    if (normalized_clang_paths.count(normalized) != 0) {
+      // This file is redundant with a required input after normalization.
+      continue;
     }
-    for (const auto& col : row.second.out_edges) {
-      auto* col_pb = row_pb->add_column();
-      col_pb->set_offset(col.first);
-      col_pb->set_linked_context(col.second);
+    auto buffer = fs->getBufferForFile(path);
+    if (!buffer) {
+      LOG(WARNING) << "Couldn't reopen " << path;
+      continue;
+    }
+    extra_data_.emplace_back();
+    auto* file_content = &extra_data_.back();
+    auto* required_input = unit->add_required_input();
+    required_input->mutable_v_name()->CopyFrom(VNameForPath(normalized));
+    required_input->mutable_info()->set_path(path);
+    required_input->mutable_info()->set_digest(
+        Sha256((*buffer)->getBufferStart(), (*buffer)->getBufferSize()));
+    file_content->mutable_info()->CopyFrom(required_input->info());
+    file_content->mutable_content()->assign((*buffer)->getBufferStart(),
+                                            (*buffer)->getBufferEnd());
+  }
+  if (exclude_empty_dirs_) {
+    return;
+  }
+  auto find_child = [](const std::set<std::string>& paths,
+                       const std::string& path) -> std::string {
+    auto maybe_prefix = paths.upper_bound(path);
+    if (maybe_prefix == paths.end()) {
+      return std::string();
+    }
+    return *maybe_prefix;
+  };
+  for (const auto& path : status_checked_paths_) {
+    if (path == "/") {
+      continue;
+    }
+    std::string child_file = find_child(normalized_clang_paths, path);
+    std::string child_dir = find_child(status_checked_paths_, path);
+    std::string path_slash = absl::StrCat(path, "/");
+    if ((!child_file.empty() || !child_dir.empty()) &&
+        !llvm::StringRef(child_file).startswith(path_slash) &&
+        !llvm::StringRef(child_dir).startswith(path_slash)) {
+      details->add_stat_path()->set_path(path);
     }
   }
 }
 
-void IndexWriter::WriteIndex(
-    std::unique_ptr<IndexWriterSink> sink, const std::string& main_source_file,
-    const std::string& entry_context,
+void CompilationWriter::CancelPreviouslyOpenedFiles() {
+  // Don't clear status_checked_paths_, because we *need* information about
+  // which files get Status()d before the compiler proper starts.
+  if (exclude_autoconfiguration_files_) {
+    extra_includes_.clear();
+  }
+}
+
+void CompilationWriter::OpenedForRead(const std::string& path) {
+  if (!llvm::StringRef(path).startswith(kBuiltinResourceDirectory)) {
+    extra_includes_.insert(path);
+  }
+}
+
+void CompilationWriter::DirectoryOpenedForStatus(const std::string& path) {
+  if (!llvm::StringRef(path).startswith(kBuiltinResourceDirectory)) {
+    status_checked_paths_.insert(RelativizePath(path));
+  }
+}
+
+void CompilationWriter::ScrubIntermediateFiles(
+    const clang::HeaderSearchOptions& options) {
+  if (options.ModuleCachePath.empty()) {
+    return;
+  }
+  for (auto set : {&extra_includes_, &status_checked_paths_}) {
+    for (auto it = set->begin(); it != set->end();) {
+      if (llvm::StringRef(*it).startswith(options.ModuleCachePath)) {
+        it = set->erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+}
+
+void CompilationWriter::WriteIndex(
+    supported_language::Language lang,
+    std::unique_ptr<CompilationWriterSink> sink,
+    const std::string& main_source_file, const std::string& entry_context,
     const std::unordered_map<std::string, SourceFile>& source_files,
     const HeaderSearchInfo* header_search_info, bool had_errors,
     const std::string& clang_working_dir) {
   kythe::proto::CompilationUnit unit;
   std::string identifying_blob;
   identifying_blob.append(corpus_);
-  for (const auto& arg : args_) {
+
+  // Try to find the name of the output file. It's okay if this doesn't succeed.
+  // TODO(fromberger): Consider maybe recognizing "-ofoo" too.
+  std::string output_file = output_path_;
+  if (output_file.empty()) {
+    for (int i = 0; i < args_.size(); i++) {
+      if (args_[i] == "-o" && (i + 1) < args_.size()) {
+        output_file = args_[i + 1];
+        break;
+      }
+    }
+  }
+
+  std::vector<std::string> final_args(args_);
+  // Record the target triple in the list of arguments. Put it at the front
+  // (after the tool) in the unlikely event that a different triple was
+  // supplied in the arguments.
+  final_args.insert(final_args.begin() + 1, triple_);
+  final_args.insert(final_args.begin() + 1, "-target");
+
+  for (const auto& arg : final_args) {
     identifying_blob.append(arg);
     unit.add_argument(arg);
   }
@@ -919,23 +1143,43 @@ void IndexWriter::WriteIndex(
   auto* unit_vname = unit.mutable_v_name();
 
   kythe::proto::VName main_vname = VNameForPath(main_source_file);
-  unit_vname->CopyFrom(main_vname);
-  unit_vname->set_language("c++");
-  unit_vname->set_signature("cu#" + identifying_blob_digest);
+  *unit_vname = main_vname;
+  if (!corpus_.empty()) {
+    // Use the explicit build corpus as the unit corpus in preference to that of
+    // the primary file.
+    unit_vname->set_corpus(corpus_);
+  }
+  unit_vname->set_language(supported_language::ToString(lang));
   unit_vname->clear_path();
 
-  if (header_search_info != nullptr) {
-    kythe::proto::CxxCompilationUnitDetails cxx_details;
-    header_search_info->CopyTo(&cxx_details);
-    PackAny(cxx_details, kCxxCompilationUnitDetailsURI, unit.add_details());
+  {
+    kythe::proto::BuildDetails build_details;
+    build_details.set_build_target(target_name_);
+    build_details.set_rule_type(rule_type_);
+    build_details.set_build_config(build_config_);
+    // Include the details, but only if any of the fields are meaningfully set.
+    if (build_details.ByteSizeLong() > 0) {
+      PackAny(build_details, kBuildDetailsURI, unit.add_details());
+    }
   }
 
   for (const auto& file : source_files) {
     FillFileInput(file.first, file.second, unit.add_required_input());
   }
+  std::sort(unit.mutable_required_input()->begin(),
+            unit.mutable_required_input()->end(),
+            OrderFileInputByVName(main_source_file));
+
+  kythe::proto::CxxCompilationUnitDetails cxx_details;
+  if (header_search_info != nullptr) {
+    header_search_info->CopyTo(&cxx_details);
+  }
+  InsertExtraIncludes(&unit, &cxx_details);
+  PackAny(cxx_details, kCxxCompilationUnitDetailsURI, unit.add_details());
   unit.set_entry_context(entry_context);
   unit.set_has_compile_errors(had_errors);
   unit.add_source_file(main_source_file);
+  unit.set_output_key(output_file);  // may be empty; that's OK
   llvm::SmallString<256> absolute_working_directory(
       llvm::StringRef(clang_working_dir.data(), clang_working_dir.size()));
   std::error_code err =
@@ -945,22 +1189,25 @@ void IndexWriter::WriteIndex(
   } else {
     unit.set_working_directory(absolute_working_directory.c_str());
   }
-  sink->OpenIndex(output_directory_, identifying_blob_digest);
+  sink->OpenIndex(identifying_blob_digest);
   sink->WriteHeader(unit);
-  unsigned info_index = 0;
-  for (const auto& file : source_files) {
-    kythe::proto::FileData file_content;
-    file_content.set_content(file.second.file_content);
-    file_content.mutable_info()->CopyFrom(
-        unit.required_input(info_index++).info());
-    sink->WriteFileContent(file_content);
+  for (const auto& file_input : unit.required_input()) {
+    auto iter = source_files.find(file_input.info().path());
+    if (iter != source_files.end()) {
+      kythe::proto::FileData file_content;
+      file_content.set_content(iter->second.file_content);
+      *file_content.mutable_info() = file_input.info();
+      sink->WriteFileContent(file_content);
+    }
+  }
+  for (const auto& data : extra_data_) {
+    sink->WriteFileContent(data);
   }
 }
 
 std::unique_ptr<clang::FrontendAction> NewExtractor(
-    IndexWriter* index_writer, ExtractorCallback callback) {
-  return std::unique_ptr<clang::FrontendAction>(
-      new ExtractorAction(index_writer, callback));
+    CompilationWriter* index_writer, ExtractorCallback callback) {
+  return absl::make_unique<ExtractorAction>(index_writer, std::move(callback));
 }
 
 void MapCompilerResources(clang::tooling::ToolInvocation* invocation,
@@ -974,38 +1221,39 @@ void MapCompilerResources(clang::tooling::ToolInvocation* invocation,
   }
 }
 
-/// \brief Loads all data from a file or terminates the process.
-static std::string LoadFileOrDie(const std::string& file) {
-  FILE* handle = fopen(file.c_str(), "rb");
-  CHECK(handle != nullptr) << "Couldn't open input file " << file;
-  CHECK_EQ(fseek(handle, 0, SEEK_END), 0) << "Couldn't seek " << file;
-  long size = ftell(handle);
-  CHECK_GE(size, 0) << "Bad size for " << file;
-  CHECK_EQ(fseek(handle, 0, SEEK_SET), 0) << "Couldn't seek " << file;
-  std::string content;
-  content.resize(size);
-  CHECK_EQ(fread(&content[0], size, 1, handle), 1) << "Couldn't read " << file;
-  CHECK_NE(fclose(handle), EOF) << "Couldn't close " << file;
-  return content;
-}
-
-/// When a -resource-dir is not specified, map builtin versions of compiler
-/// headers to this directory.
-constexpr char kBuiltinResourceDirectory[] = "/kythe_builtins";
-
 void ExtractorConfiguration::SetVNameConfig(const std::string& path) {
   if (!index_writer_.SetVNameConfiguration(LoadFileOrDie(path))) {
-    fprintf(stderr, "Couldn't configure vnames from %s\n", path.c_str());
+    absl::FPrintF(stderr, "Couldn't configure vnames from %s\n", path);
     exit(1);
   }
 }
 
+bool IsCuda(const std::vector<std::string>& args) {
+  for (int i = 0; i < args.size() - 1; i++) {
+    if (args[i] == "-x" && args[i + 1] == "cuda") {
+      return true;
+    }
+  }
+  return false;
+}
+
 void ExtractorConfiguration::SetArgs(const std::vector<std::string>& args) {
   final_args_ = args;
-  std::string executable = final_args_.size() ? final_args_[0] : "";
+  // Only compile CUDA for the host. Otherwise we end up getting more than a
+  // single clang invocation.
+  if (IsCuda(final_args_)) {
+    final_args_.push_back("--cuda-host-only");
+  }
+  std::string executable = !final_args_.empty() ? final_args_[0] : "";
   if (final_args_.size() >= 3 && final_args_[1] == "--with_executable") {
     executable = final_args_[2];
     final_args_.erase(final_args_.begin() + 1, final_args_.begin() + 3);
+    // Clang tooling infrastructure expects that CommandLine[0] is a tool path
+    // relative to which the builtin headers can be found, so ensure these
+    // two paths are consistent.
+    // We also need to ensure that the executable path seen here is the one
+    // provided to the indexer.
+    final_args_[0] = executable;
   }
   // TODO(zarko): Does this really need to be InitializeAllTargets()?
   // We may have made the precondition too strict.
@@ -1040,42 +1288,114 @@ void ExtractorConfiguration::InitializeFromEnvironment() {
   if (const char* env_root_directory = getenv("KYTHE_ROOT_DIRECTORY")) {
     index_writer_.set_root_directory(env_root_directory);
   }
-  if (const char* env_index_pack = getenv("KYTHE_INDEX_PACK")) {
-    using_index_packs_ = (strlen(env_index_pack) != 0);
-  }
   if (const char* env_output_directory = getenv("KYTHE_OUTPUT_DIRECTORY")) {
-    index_writer_.set_output_directory(env_output_directory);
+    output_directory_ = env_output_directory;
   }
   if (const char* env_output_file = getenv("KYTHE_OUTPUT_FILE")) {
-    SetKindexOutputFile(env_output_file);
+    SetOutputFile(env_output_file);
+  }
+  if (const char* env_exclude_empty_dirs = getenv("KYTHE_EXCLUDE_EMPTY_DIRS")) {
+    index_writer_.set_exclude_empty_dirs(true);
+  }
+  if (const char* env_exclude_autoconfiguration_files =
+          getenv("KYTHE_EXCLUDE_AUTOCONFIGURATION_FILES")) {
+    index_writer_.set_exclude_autoconfiguration_files(true);
+  }
+  if (const char* env_kythe_build_config = getenv("KYTHE_BUILD_CONFIG")) {
+    SetBuildConfig(env_kythe_build_config);
+  }
+  if (const char* env_path_policy = getenv("KYTHE_CANONICALIZE_VNAME_PATHS")) {
+    index_writer_.set_path_canonicalization_policy(
+        ParseCanonicalizationPolicy(env_path_policy)
+            .value_or(PathCanonicalizer::Policy::kCleanOnly));
   }
 }
 
-void ExtractorConfiguration::Extract() {
+/// Shims Clang's file system. We need to do this because other parts of the
+/// frontend (like the parts that autodetect the standard library and support
+/// for extensions like CUDA) request files separately from the preprocessor.
+/// We still want to keep track of file requests in the preprocessor so we can
+/// record information about transcripts, as these are important for claiming.
+class RecordingFS : public llvm::vfs::FileSystem {
+ public:
+  RecordingFS(llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> base_file_system,
+              CompilationWriter* index_writer)
+      : base_file_system_(base_file_system), index_writer_(index_writer) {}
+  llvm::ErrorOr<llvm::vfs::Status> status(const llvm::Twine& path) override {
+    auto nested_result = base_file_system_->status(path);
+    if (nested_result && nested_result->isDirectory()) {
+      index_writer_->DirectoryOpenedForStatus(path.str());
+    }
+    return nested_result;
+  }
+  llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>> openFileForRead(
+      const llvm::Twine& path) override {
+    auto nested_result = base_file_system_->openFileForRead(path);
+    if (nested_result) {
+      // We expect to be able to open this file at this path in the future.
+      index_writer_->OpenedForRead(path.str());
+    }
+    return nested_result;
+  }
+  llvm::vfs::directory_iterator dir_begin(
+      const llvm::Twine& dir, std::error_code& error_code) override {
+    return base_file_system_->dir_begin(dir, error_code);
+  }
+  llvm::ErrorOr<std::string> getCurrentWorkingDirectory() const override {
+    return base_file_system_->getCurrentWorkingDirectory();
+  }
+  std::error_code setCurrentWorkingDirectory(const llvm::Twine& Path) override {
+    return base_file_system_->setCurrentWorkingDirectory(Path);
+  }
+
+ private:
+  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> base_file_system_;
+  CompilationWriter* index_writer_;
+};
+
+bool ExtractorConfiguration::Extract(
+    supported_language::Language lang,
+    std::unique_ptr<CompilationWriterSink> sink) {
   llvm::IntrusiveRefCntPtr<clang::FileManager> file_manager(
-      new clang::FileManager(file_system_options_));
+      new clang::FileManager(
+          file_system_options_,
+          new RecordingFS(llvm::vfs::getRealFileSystem(), &index_writer_)));
+  index_writer_.set_target_name(target_name_);
+  index_writer_.set_rule_type(rule_type_);
+  index_writer_.set_build_config(build_config_);
+  index_writer_.set_output_path(compilation_output_path_);
   auto extractor = NewExtractor(
       &index_writer_,
-      [this](const std::string& main_source_file,
-             const PreprocessorTranscript& transcript,
-             const std::unordered_map<std::string, SourceFile>& source_files,
-             const HeaderSearchInfo* header_search_info, bool had_errors) {
-        std::unique_ptr<IndexWriterSink> sink;
-        if (using_index_packs_) {
-          sink.reset(new IndexPackWriterSink());
-        } else {
-          sink.reset(new KindexWriterSink(kindex_path_));
-        }
-        index_writer_.WriteIndex(std::move(sink), main_source_file, transcript,
-                                 source_files, header_search_info, had_errors,
-                                 file_system_options_.WorkingDir);
+      [this, &lang, &sink](
+          const std::string& main_source_file,
+          const PreprocessorTranscript& transcript,
+          const std::unordered_map<std::string, SourceFile>& source_files,
+          const HeaderSearchInfo* header_search_info, bool had_errors) {
+        index_writer_.WriteIndex(lang, std::move(sink), main_source_file,
+                                 transcript, source_files, header_search_info,
+                                 had_errors, file_system_options_.WorkingDir);
       });
-  clang::tooling::ToolInvocation invocation(final_args_, extractor.release(),
+  clang::tooling::ToolInvocation invocation(final_args_, std::move(extractor),
                                             file_manager.get());
   if (map_builtin_resources_) {
     MapCompilerResources(&invocation, kBuiltinResourceDirectory);
   }
-  invocation.run();
+  return invocation.run();
+}
+
+bool ExtractorConfiguration::Extract(supported_language::Language lang) {
+  std::unique_ptr<CompilationWriterSink> sink;
+  if (!output_file_.empty()) {
+    CHECK(absl::EndsWith(output_file_, ".kzip"))
+        << "Output file must have '.kzip' extension";
+    sink = absl::make_unique<KzipWriterSink>(
+        output_file_, KzipWriterSink::OutputPathType::SingleFile);
+  } else {
+    sink = absl::make_unique<KzipWriterSink>(
+        output_directory_, KzipWriterSink::OutputPathType::Directory);
+  }
+
+  return Extract(lang, std::move(sink));
 }
 
 }  // namespace kythe

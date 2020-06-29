@@ -1,6 +1,6 @@
 #!/bin/bash -e
 #
-# Copyright 2014 Google Inc. All rights reserved.
+# Copyright 2014 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,15 +19,36 @@
 #
 # Usage: ./sync_docs.sh
 
+# Make sure the user has installed the asciidoc gem, otherwise the website will
+# generate successfully but it will be missing tocs, titles, and other
+# attributes.
+if ! gem list -i asciidoctor &> /dev/null; then
+  echo "You don't have the asciidoctor gem installed."
+  echo "Please run 'gem install --user asciidoctor' before executing this script."
+  exit 1
+fi
+
 export SHELL=/bin/bash
 
 DIR="$(readlink -e "$(dirname "$0")")"
 cd "$DIR/../../.."
 
-bazel --bazelrc=/dev/null build //kythe/docs/... //kythe/docs/schema \
+# Use the project's bazelrc so we pick up the default options that Kythe needs
+# to build correctly.
+bazel --bazelrc=.bazelrc build //kythe/docs/... \
+    //kythe/docs:schema-overview \
+    //kythe/docs/schema \
     //kythe/docs/schema:callgraph \
-    //kythe/docs/schema:verifierstyle
+    //kythe/docs/schema:verifierstyle \
+    //kythe/docs/schema:writing-an-indexer \
+    //kythe/docs/schema:indexing-generated-code \
+    //kythe/docs/schema:marked-source
+# Copy the zipped asciidoc outputs into the staging directory, unpack the
+# archives, then remove them. We do this to ensure the output retains the
+# directory structure of the source tree.
 rsync -Lr --chmod=a+w --delete "bazel-bin/kythe/docs/" "$DIR"/_docs
+find "$DIR"/_docs -type f -name '*.zip' -execdir unzip -q {} ';' -delete
+
 DOCS=($(bazel query 'kind("source file", deps(//kythe/docs/..., 1))' | \
   grep -E '\.(txt|adoc|ad)$' | \
   parallel --gnu -L1 'x() { file="$(tr : / <<<"$1")"; echo ${file#//kythe/docs/}; }; x'))
@@ -58,6 +79,7 @@ trap 'rm -rf "$TMP"' EXIT ERR INT
 cd "$DIR"
 for doc in ${DOCS[@]}; do
   html=${doc%%.*}.html
+  echo "Processing $html"
   abs_path="../../../kythe/docs/$doc"
   cp "_docs/$html" "$TMP"
   { doc_header "$abs_path";

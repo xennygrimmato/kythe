@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,6 +47,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"flag"
@@ -58,12 +59,10 @@ import (
 
 	"kythe.io/kythe/go/platform/delimited"
 	"kythe.io/kythe/go/platform/vfs"
-	"kythe.io/kythe/go/storage/vnameutil"
 	"kythe.io/kythe/go/util/flagutil"
+	"kythe.io/kythe/go/util/vnameutil"
 
-	"golang.org/x/net/context"
-
-	spb "kythe.io/kythe/proto/storage_proto"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
 func init() {
@@ -97,6 +96,9 @@ var (
 )
 
 func emitPath(path string, info os.FileInfo, err error) error {
+	if err != nil {
+		return err
+	}
 	if info.IsDir() || !(*emitIrregular || info.Mode().IsRegular()) {
 		return nil
 	}
@@ -118,9 +120,6 @@ func emitPath(path string, info os.FileInfo, err error) error {
 	digest := sha256.Sum256(contents)
 	vName.Signature = hex.EncodeToString(digest[:])
 
-	if vName.Language == "" {
-		vName.Language = sourceLanguage(path)
-	}
 	if vName.Path == "" {
 		vName.Path = path
 	}
@@ -157,19 +156,5 @@ func main() {
 		if err := filepath.Walk(dir, emitPath); err != nil {
 			log.Fatalf("Error walking %s: %v", dir, err)
 		}
-	}
-}
-
-func sourceLanguage(path string) string {
-	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(path)), ".")
-	switch ext {
-	case "java", "go":
-		return ext
-	case "py":
-		return "python"
-	case "cc", "cpp", "h":
-		return "c++"
-	default:
-		return ""
 	}
 }

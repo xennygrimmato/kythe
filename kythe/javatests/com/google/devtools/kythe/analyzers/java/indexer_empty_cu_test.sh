@@ -1,6 +1,6 @@
-#!/bin/bash -e
-set -o pipefail
-# Copyright 2016 Google Inc. All rights reserved.
+#!/bin/bash
+set -eo pipefail
+# Copyright 2016 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@ set -o pipefail
 #
 # This script tests that the java indexer doesn't fall over on empty CUs.
 
-indexer="kythe/java/com/google/devtools/kythe/analyzers/java/indexer"
-entrystream="kythe/go/platform/tools/entrystream/entrystream"
+: ${indexer?:missing indexer}
+: ${entrystream?:missing entrystream}
 test_kindex="$PWD/kythe/testdata/java_empty.kindex"
 
 # Test indexing a .kindex file

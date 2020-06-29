@@ -1,6 +1,6 @@
 %{
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@
 static size_t loc_ofs;
 %}
 %option noyywrap nounput batch debug noinput bison-bridge
-id    [a-zA-Z/][a-zA-Z_0-9/]*
+id    [%#]?[_a-zA-Z/][a-zA-Z_0-9/]*
 int   [0-9]+
 blank [ \t]
 
@@ -48,15 +48,14 @@ blank [ \t]
 %}
 
 <INITIAL>{
-\n       yylloc->lines(yyleng); yylloc->step(); context.ResetLexCheck();
-.        {
-            int lex_check = context.NextLexCheck(yytext);
-            if (lex_check < 0) {
-              BEGIN(IGNORED);
-            } else if (lex_check > 0) {
-              BEGIN(NORMAL);
-            }
+\n       {
+           yylloc->lines(yyleng);
+           yylloc->end.column = 1;
+           yylloc->step();
+           context.ResetLine();
          }
+"-"      --loc_ofs; yylloc->columns(-1); BEGIN(NORMAL);
+"."      --loc_ofs; yylloc->columns(-1); BEGIN(IGNORED);
 }  /* INITIAL state */
 
 <IGNORED>{
@@ -66,6 +65,7 @@ blank [ \t]
               context.Error(*yylloc, "could not resolve all locations");
             }
             yylloc->lines(yyleng);
+            yylloc->end.column = 1;
             yylloc->step();
             BEGIN(INITIAL);
          }
@@ -76,29 +76,33 @@ blank [ \t]
 {blank}+ yylloc->step();
 \n       {
           yylloc->lines(yyleng);
+          yylloc->end.column = 1;
           yylloc->step();
-          context.ResetLexCheck();
+          context.ResetLine();
           BEGIN(INITIAL);
          }
-"("      return yy::AssertionParserImpl::token::LPAREN;
-")"      return yy::AssertionParserImpl::token::RPAREN;
-","      return yy::AssertionParserImpl::token::COMMA;
-"_"      return yy::AssertionParserImpl::token::DONTCARE;
-"'"      return yy::AssertionParserImpl::token::APOSTROPHE;
-"@^"     return yy::AssertionParserImpl::token::AT_HAT;
-"@$"     return yy::AssertionParserImpl::token::AT_CASH;
-"@"      return yy::AssertionParserImpl::token::AT;
-"."      return yy::AssertionParserImpl::token::DOT;
-"?"      return yy::AssertionParserImpl::token::WHAT;
-"="      return yy::AssertionParserImpl::token::EQUALS;
-"{"      return yy::AssertionParserImpl::token::LBRACE;
-"}"      return yy::AssertionParserImpl::token::RBRACE;
-"!"      return yy::AssertionParserImpl::token::BANG;
-":"      return yy::AssertionParserImpl::token::COLON;
-"+"      return yy::AssertionParserImpl::token::PLUS;
-"#"      return yy::AssertionParserImpl::token::HASH;
-{int}    yylval->string = yytext; return yy::AssertionParserImpl::token::NUMBER;
-{id}     yylval->string = yytext; return yy::AssertionParserImpl::token::IDENTIFIER;
+"//"[^\n]* yylloc->step();
+"("        return yy::AssertionParserImpl::token::LPAREN;
+")"        return yy::AssertionParserImpl::token::RPAREN;
+","        return yy::AssertionParserImpl::token::COMMA;
+"_"        return yy::AssertionParserImpl::token::DONTCARE;
+"'"        return yy::AssertionParserImpl::token::APOSTROPHE;
+"@^"       return yy::AssertionParserImpl::token::AT_HAT;
+"@$"       return yy::AssertionParserImpl::token::AT_CASH;
+"@"        return yy::AssertionParserImpl::token::AT;
+"."        return yy::AssertionParserImpl::token::DOT;
+"?"        return yy::AssertionParserImpl::token::WHAT;
+"="        return yy::AssertionParserImpl::token::EQUALS;
+"{"        return yy::AssertionParserImpl::token::LBRACE;
+"}"        return yy::AssertionParserImpl::token::RBRACE;
+"!"        return yy::AssertionParserImpl::token::BANG;
+":"        return yy::AssertionParserImpl::token::COLON;
+"+"        return yy::AssertionParserImpl::token::PLUS;
+"#"{blank}*{int} {
+    yylval->string = yytext; return yy::AssertionParserImpl::token::HASH_NUMBER;
+}
+{int}      yylval->string = yytext; return yy::AssertionParserImpl::token::NUMBER;
+{id}       yylval->string = yytext; return yy::AssertionParserImpl::token::IDENTIFIER;
 \"(\\.|[^\\"])*\" {
                    std::string out;
                    if (!context.Unescape(yytext, &out)) {
@@ -119,28 +123,16 @@ blank [ \t]
 namespace kythe {
 namespace verifier {
 
-static YY_BUFFER_STATE stringBufferState = nullptr;
-static std::string *kNoFile = new std::string("no-file");
+static YY_BUFFER_STATE string_buffer_state = nullptr;
 
-void AssertionParser::ScanBeginString(const std::string &data,
-                                      bool trace_scanning) {
+void AssertionParser::SetScanBuffer(const std::string& scan_buffer,
+                                    bool trace_scanning) {
   BEGIN(INITIAL);
   loc_ofs = 0;
   yy_flex_debug = trace_scanning;
-  assert(stringBufferState == nullptr);
-  stringBufferState = yy_scan_bytes(data.c_str(), data.size());
-}
-
-void AssertionParser::ScanBeginFile(bool trace_scanning) {
-  BEGIN(INITIAL);
-  loc_ofs = 0;
-  yy_flex_debug = trace_scanning;
-  if (file().empty() || file() == "-") {
-    yyin = stdin;
-  } else if (!(yyin = fopen(file().c_str(), "r"))) {
-    Error("cannot open " + file() + ": " + strerror(errno));
-    exit(EXIT_FAILURE);
-  }
+  CHECK(string_buffer_state == nullptr);
+  // yy_scan_bytes makes a copy of its buffer.
+  string_buffer_state = yy_scan_bytes(scan_buffer.c_str(), scan_buffer.size());
 }
 
 void AssertionParser::ScanEnd(const yy::location &eof_loc,
@@ -149,12 +141,8 @@ void AssertionParser::ScanEnd(const yy::location &eof_loc,
   if (!ResolveLocations(eof_loc, eof_loc_ofs + 1, true)) {
     Error(eof_loc, "could not resolve all locations at end of file");
   }
-  if (stringBufferState) {
-    yy_delete_buffer(stringBufferState);
-    stringBufferState = nullptr;
-  } else {
-    fclose(yyin);
-  }
+  yy_delete_buffer(string_buffer_state);
+  string_buffer_state = nullptr;
 }
 
 }

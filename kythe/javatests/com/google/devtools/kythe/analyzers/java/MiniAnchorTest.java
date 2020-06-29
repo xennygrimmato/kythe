@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Google Inc. All rights reserved.
+ * Copyright 2016 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ public class MiniAnchorTest extends TestCase {
       };
 
   private static MiniAnchor<String> makeAnchor(String anchoredTo, int begin, int end) {
-    return new MiniAnchor<String>(anchoredTo, begin, end);
+    return new MiniAnchor<>(anchoredTo, begin, end);
   }
 
   private void singleCase(
@@ -44,7 +44,7 @@ public class MiniAnchorTest extends TestCase {
       List<String> resultAnchors) {
     String output = MiniAnchor.bracket(text, identityTransform, anchors);
     assertThat(output).isEqualTo(resultText);
-    assertThat(anchors.size()).isEqualTo(resultAnchors.size());
+    assertThat(anchors).hasSize(resultAnchors.size());
     for (int i = 0; i < resultAnchors.size(); ++i) {
       assertThat(anchors.get(i).getAnchoredTo()).isEqualTo(resultAnchors.get(i));
     }
@@ -119,8 +119,8 @@ public class MiniAnchorTest extends TestCase {
     String second = anchors.get(1).getAnchoredTo();
     String third = anchors.get(2).getAnchoredTo();
     assertThat(
-            second.equals("bbb") && third.equals("ccc")
-                || second.equals("ccc") && third.equals("bbb"))
+            (second.equals("bbb") && third.equals("ccc"))
+                || (second.equals("ccc") && third.equals("bbb")))
         .isTrue();
   }
 }

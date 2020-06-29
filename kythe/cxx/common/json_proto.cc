@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,316 +16,144 @@
 
 #include "json_proto.h"
 
-#include <openssl/bio.h>
-#include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/sha.h>
-
+#include "absl/status/status.h"
+#include "absl/strings/escaping.h"
+#include "glog/logging.h"
+#include "google/protobuf/io/coded_stream.h"
+#include "google/protobuf/io/zero_copy_stream_impl.h"
+#include "google/protobuf/io/zero_copy_stream_impl_lite.h"
+#include "google/protobuf/message.h"
+#include "google/protobuf/util/json_util.h"
+#include "google/protobuf/util/type_resolver.h"
+#include "google/protobuf/util/type_resolver_util.h"
 #include "rapidjson/document.h"
 #include "rapidjson/filewritestream.h"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/writer.h"
-#include "glog/logging.h"
-#include "google/protobuf/io/coded_stream.h"
-#include "google/protobuf/io/zero_copy_stream_impl.h"
-#include "google/protobuf/message.h"
 
 namespace kythe {
+namespace {
+using ::google::protobuf::DescriptorPool;
+using ::google::protobuf::util::JsonParseOptions;
+using ::google::protobuf::util::TypeResolver;
 
-bool DecodeBase64(const google::protobuf::string &data,
-                  google::protobuf::string *decoded) {
-  // Defensively empty the OpenSSL error queue.
-  while (::ERR_get_error())
-    ;
+class PermissiveTypeResolver : public TypeResolver {
+ public:
+  explicit PermissiveTypeResolver(const DescriptorPool* pool)
+      : impl_(google::protobuf::util::NewTypeResolverForDescriptorPool("",
+                                                                       pool)) {}
 
-  // Estimate the decoded size of the data (round up the encoded length
-  // to the nearest multiple of 4, then divide by 4 and multiply by 3).
-  size_t expected_size = ((data.size() + 3) & ~(size_t)3) / 4 * 3;
-
-  if (expected_size == 0) {
-    decoded->clear();
-    return true;
+  google::protobuf::util::Status ResolveMessageType(
+      const std::string& type_url,
+      google::protobuf::Type* message_type) override {
+    absl::string_view adjusted = type_url;
+    adjusted.remove_prefix(type_url.rfind('/') + 1);
+    return impl_->ResolveMessageType(absl::StrCat("/", adjusted), message_type);
   }
 
-  ::BIO *base64 = ::BIO_new(BIO_f_base64());
-  ::BIO *stream =
-      ::BIO_new_mem_buf(const_cast<char *>(data.c_str()), data.size());
-  CHECK(base64 != nullptr && stream != nullptr);
-  stream = ::BIO_push(base64, stream);
-  CHECK(stream != nullptr);
-  ::BIO_set_flags(stream, BIO_FLAGS_BASE64_NO_NL);
-
-  decoded->resize(expected_size);
-  size_t accumulated = 0;
-  for (;;) {
-    long l =
-        ::BIO_read(stream, const_cast<char *>(decoded->c_str() + accumulated),
-                   decoded->size() - accumulated);
-    accumulated += l;
-    if (l < decoded->size() - accumulated - l) {
-      // We're sure there's no more data to read (otherwise, ::BIO_read would
-      // have filled all of the space available to it).
-      break;
-    }
-    decoded->resize(decoded->size() * 2);
+  google::protobuf::util::Status ResolveEnumType(
+      const std::string& type_url, google::protobuf::Enum* enum_type) override {
+    absl::string_view adjusted = type_url;
+    adjusted.remove_prefix(type_url.rfind('/') + 1);
+    return impl_->ResolveEnumType(absl::StrCat("/", adjusted), enum_type);
   }
-  decoded->resize(accumulated);
-  ::BIO_free_all(stream);
 
-  // Check for new errors.
-  return ::ERR_get_error() == 0;
+ private:
+  std::unique_ptr<TypeResolver> impl_;
+};
+
+TypeResolver* GetGeneratedTypeResolver() {
+  static TypeResolver* generated_resolver =
+      new PermissiveTypeResolver(DescriptorPool::generated_pool());
+  return generated_resolver;
 }
 
-google::protobuf::string EncodeBase64(const google::protobuf::string &data) {
-  std::string encoded;
-  ::BIO *base64 = BIO_new(BIO_f_base64());
-  ::BIO *stream = BIO_new(BIO_s_mem());
-  CHECK(base64 != nullptr && stream != nullptr);
-  stream = ::BIO_push(base64, stream);
-  CHECK(stream != nullptr);
-  ::BIO_set_flags(stream, BIO_FLAGS_BASE64_NO_NL);
-  ::BIO_write(stream, data.c_str(), data.size());
-  (void)BIO_flush(stream);
-  char *buffer = nullptr;
-  long size = ::BIO_get_mem_data(stream, &buffer);
-  if (buffer == nullptr) {
-    CHECK(size == 0);
-  } else {
-    CHECK(size > 0);
-    encoded.assign(buffer, size);
+struct MaybeDeleteResolver {
+  void operator()(TypeResolver* resolver) const {
+    if (resolver != GetGeneratedTypeResolver()) {
+      delete resolver;
+    }
   }
-  ::BIO_free_all(stream);
-  return encoded;
+};
+
+std::unique_ptr<TypeResolver, MaybeDeleteResolver> MakeTypeResolverForPool(
+    const DescriptorPool* pool) {
+  if (pool == DescriptorPool::generated_pool()) {
+    return std::unique_ptr<TypeResolver, MaybeDeleteResolver>(
+        GetGeneratedTypeResolver());
+  }
+  return std::unique_ptr<TypeResolver, MaybeDeleteResolver>(
+      new PermissiveTypeResolver(pool));
 }
 
-/// \tparam W A RapidJSON Writer.
-template <typename W>
-bool JsonOfMessage(const google::protobuf::Message &message, W *writer);
+absl::Status WriteMessageAsJsonToStringInternal(
+    const google::protobuf::Message& message, std::string* out) {
+  auto resolver =
+      MakeTypeResolverForPool(message.GetDescriptor()->file()->pool());
 
-/// \tparam W A RapidJSON Writer.
-template <typename W>
-bool JsonOfValue(const google::protobuf::FieldDescriptor *field,
-                 const google::protobuf::Message &message,
-                 const google::protobuf::Reflection *reflection, W *writer) {
-  using namespace google::protobuf;
-  int count = field->is_repeated() ? reflection->FieldSize(message, field) : 1;
-  if (field->is_repeated()) {
-    if (count == 0) {
-      return true;  // Do not emit anything for empty repeated fields.
-    }
-    writer->Key(field->name().c_str());
-    writer->StartArray();
-  } else {
-    writer->Key(field->name().c_str());
-  }
+  google::protobuf::util::JsonPrintOptions options;
+  options.preserve_proto_field_names = true;
 
-  for (int i = 0; i < count; ++i) {
-    switch (field->cpp_type()) {
-      case FieldDescriptor::CPPTYPE_STRING: {
-        google::protobuf::string scratch;
-        const auto &value =
-            field->is_repeated()
-                ? reflection->GetRepeatedStringReference(message, field, i,
-                                                         &scratch)
-                : reflection->GetStringReference(message, field, &scratch);
-        if (field->type() == FieldDescriptor::TYPE_BYTES) {
-          writer->String(EncodeBase64(value).c_str());
-        } else {
-          writer->String(value.c_str());
-        }
-      } break;
-      case FieldDescriptor::CPPTYPE_BOOL: {
-        writer->Bool(field->is_repeated()
-                         ? reflection->GetRepeatedBool(message, field, i)
-                         : reflection->GetBool(message, field));
-      } break;
-      case FieldDescriptor::CPPTYPE_MESSAGE: {
-        if (!JsonOfMessage(
-                field->is_repeated()
-                    ? reflection->GetRepeatedMessage(message, field, i)
-                    : reflection->GetMessage(message, field),
-                writer)) {
-          return false;
-        }
-      } break;
-      case FieldDescriptor::CPPTYPE_INT32: {
-        writer->Int(field->is_repeated()
-                        ? reflection->GetRepeatedInt32(message, field, i)
-                        : reflection->GetInt32(message, field));
-      } break;
-      default:
-        return false;
-    }
+  auto status = google::protobuf::util::BinaryToJsonString(
+      resolver.get(), message.GetDescriptor()->full_name(),
+      message.SerializeAsString(), out, options);
+  if (!status.ok()) {
+    return absl::Status(static_cast<absl::StatusCode>(status.error_code()),
+                        std::string(status.error_message()));
   }
-  if (field->is_repeated()) {
-    writer->EndArray();
-  }
-  return true;
+  return absl::OkStatus();
 }
 
-/// \tparam W A RapidJSON Writer.
-template <typename W>
-bool JsonOfMessage(const google::protobuf::Message &message, W *writer) {
-  using namespace google::protobuf;
-  writer->StartObject();
-  auto *descriptor = message.GetDescriptor();
-  auto *reflection = message.GetReflection();
-  std::vector<const FieldDescriptor *> fields;
-  reflection->ListFields(message, &fields);
-  for (int i = 0; i < descriptor->field_count(); ++i) {
-    auto *field = descriptor->field(i);
-    if (field->is_repeated() && reflection->FieldSize(message, field) == 0) {
-      fields.push_back(field);
-    }
-  }
-  for (auto *field : fields) {
-    if (!field->is_repeated() && !reflection->HasField(message, field)) {
-      continue;
-    }
-    if (!JsonOfValue(field, message, reflection, writer)) {
-      return false;
-    }
-  }
-  writer->EndObject();
-  return true;
+JsonParseOptions DefaultParseOptions() {
+  JsonParseOptions options;
+  options.case_insensitive_enum_parsing = false;
+  return options;
 }
 
-bool WriteMessageAsJsonToString(const google::protobuf::Message &message,
-                                std::string *out) {
-  rapidjson::StringBuffer buffer;
-  rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-  if (!JsonOfMessage(message, &writer)) {
-    return false;
+}  // namespace
+
+bool WriteMessageAsJsonToString(const google::protobuf::Message& message,
+                                std::string* out) {
+  auto status = WriteMessageAsJsonToStringInternal(message, out);
+  if (!status.ok()) {
+    LOG(ERROR) << status.ToString();
   }
-  *out = buffer.GetString();
-  return true;
+  return status.ok();
 }
 
-bool WriteMessageAsJsonToString(const google::protobuf::Message &message,
-                                const std::string &format_key,
-                                std::string *out) {
+StatusOr<std::string> WriteMessageAsJsonToString(
+    const google::protobuf::Message& message) {
+  std::string result;
+  auto status = WriteMessageAsJsonToStringInternal(message, &result);
+  if (!status.ok()) {
+    return status;
+  }
+  return result;
+}
+
+bool WriteMessageAsJsonToString(const google::protobuf::Message& message,
+                                const std::string& format_key,
+                                std::string* out) {
   rapidjson::StringBuffer buffer;
   rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
   writer.StartObject();
   writer.Key("format");
   writer.String(format_key.c_str());
   writer.Key("content");
-  if (!JsonOfMessage(message, &writer)) {
-    return false;
+  {
+    std::string content;
+    if (!WriteMessageAsJsonToString(message, &content)) {
+      return false;
+    }
+    writer.RawValue(content.data(), content.size(), rapidjson::kObjectType);
   }
   writer.EndObject();
   *out = buffer.GetString();
   return true;
 }
 
-bool MessageOfJson(const rapidjson::Value &value,
-                   google::protobuf::Message *message) {
-  using namespace rapidjson;
-  using namespace google::protobuf;
-  auto *descriptor = message->GetDescriptor();
-  auto *reflection = message->GetReflection();
-  if (!value.IsObject()) {
-    return false;
-  }
-  for (auto field = value.MemberBegin(); field != value.MemberEnd(); ++field) {
-    const Value &field_name = field->name;
-    if (!field_name.IsString()) {
-      return false;
-    }
-    const auto *proto_field =
-        descriptor->FindFieldByName(field_name.GetString());
-    if (!proto_field) {
-      // Ignore unknown fields.
-      continue;
-    }
-    if (proto_field->is_repeated()) {
-      if (!field->value.IsArray()) {
-        return false;
-      }
-      for (auto data = field->value.Begin(); data != field->value.End();
-           ++data) {
-        switch (proto_field->cpp_type()) {
-          case FieldDescriptor::CPPTYPE_INT32:
-            if (!data->IsInt()) {
-              return false;
-            }
-            reflection->AddInt32(message, proto_field, data->GetInt());
-            break;
-          case FieldDescriptor::CPPTYPE_STRING:
-            if (!data->IsString()) {
-              return false;
-            }
-            if (proto_field->type() == FieldDescriptor::TYPE_BYTES) {
-              google::protobuf::string buffer;
-              if (!DecodeBase64(data->GetString(), &buffer)) {
-                return false;
-              }
-              reflection->AddString(message, proto_field, buffer);
-            } else {
-              reflection->AddString(message, proto_field, data->GetString());
-            }
-            break;
-          case FieldDescriptor::CPPTYPE_BOOL:
-            if (!data->IsBool()) {
-              return false;
-            }
-            reflection->AddBool(message, proto_field, data->GetBool());
-            break;
-          case FieldDescriptor::CPPTYPE_MESSAGE:
-            if (!MessageOfJson(*data,
-                               reflection->AddMessage(message, proto_field))) {
-              return false;
-            }
-            break;
-          default:
-            return false;
-        }
-      }
-    } else {
-      switch (proto_field->cpp_type()) {
-        case FieldDescriptor::CPPTYPE_STRING:
-          if (!field->value.IsString()) {
-            return false;
-          }
-          if (proto_field->type() == FieldDescriptor::TYPE_BYTES) {
-            google::protobuf::string buffer;
-            if (!DecodeBase64(field->value.GetString(), &buffer)) {
-              return false;
-            }
-            reflection->SetString(message, proto_field, buffer);
-          } else {
-            reflection->SetString(message, proto_field,
-                                  field->value.GetString());
-          }
-          break;
-        case FieldDescriptor::CPPTYPE_BOOL:
-          if (!field->value.IsBool()) {
-            return false;
-          }
-          reflection->SetBool(message, proto_field, field->value.GetBool());
-          break;
-        case FieldDescriptor::CPPTYPE_INT32:
-          if (!field->value.IsInt()) {
-            return false;
-          }
-          reflection->SetInt32(message, proto_field, field->value.GetInt());
-          break;
-        case FieldDescriptor::CPPTYPE_MESSAGE:
-          if (!MessageOfJson(field->value, reflection->MutableMessage(
-                                               message, proto_field))) {
-            return false;
-          }
-          break;
-        default:
-          return false;
-      }
-    }
-  }
-  return true;
-}
-
-bool MergeJsonWithMessage(const std::string &in, std::string *format_key,
-                          google::protobuf::Message *message) {
+bool MergeJsonWithMessage(const std::string& in, std::string* format_key,
+                          google::protobuf::Message* message) {
   rapidjson::Document document;
   document.Parse(in.c_str());
   if (document.HasParseError()) {
@@ -341,24 +169,84 @@ bool MergeJsonWithMessage(const std::string &in, std::string *format_key,
     *format_key = in_format;
   }
   if (in_format == "kythe") {
-    return MessageOfJson(document["content"], message);
+    std::string content = [&] {
+      rapidjson::StringBuffer buffer;
+      rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+      CHECK(document["content"].Accept(writer));
+      return std::string(buffer.GetString());
+    }();
+    std::string binary;
+
+    auto resolver =
+        MakeTypeResolverForPool(message->GetDescriptor()->file()->pool());
+
+    auto status = google::protobuf::util::JsonToBinaryString(
+        resolver.get(), message->GetDescriptor()->full_name(), content, &binary,
+        DefaultParseOptions());
+
+    if (!status.ok()) {
+      LOG(ERROR) << status.ToString() << ": " << content;
+      return false;
+    }
+    return message->ParseFromString(binary);
   }
   return false;
 }
 
-void PackAny(const google::protobuf::Message &message, const char *type_uri,
-             google::protobuf::Any *out) {
+absl::Status ParseFromJsonStream(
+    google::protobuf::io::ZeroCopyInputStream* input,
+    const JsonParseOptions& options, google::protobuf::Message* message) {
+  auto resolver =
+      MakeTypeResolverForPool(message->GetDescriptor()->file()->pool());
+
+  std::string binary;
+  google::protobuf::io::StringOutputStream output(&binary);
+  auto status = google::protobuf::util::JsonToBinaryStream(
+      resolver.get(), message->GetDescriptor()->full_name(), input, &output,
+      options);
+
+  if (!status.ok()) {
+    return absl::Status(static_cast<absl::StatusCode>(status.error_code()),
+                        std::string(status.error_message()));
+  }
+  if (!message->ParseFromString(binary)) {
+    return absl::InvalidArgumentError(
+        "JSON transcoder produced invalid protobuf output.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ParseFromJsonStream(
+    google::protobuf::io::ZeroCopyInputStream* input,
+    google::protobuf::Message* message) {
+  return ParseFromJsonStream(input, DefaultParseOptions(), message);
+}
+
+absl::Status ParseFromJsonString(absl::string_view input,
+                                 const JsonParseOptions& options,
+                                 google::protobuf::Message* message) {
+  google::protobuf::io::ArrayInputStream stream(input.data(), input.size());
+  return ParseFromJsonStream(&stream, options, message);
+}
+
+absl::Status ParseFromJsonString(absl::string_view input,
+                                 google::protobuf::Message* message) {
+  return ParseFromJsonString(input, DefaultParseOptions(), message);
+}
+
+void PackAny(const google::protobuf::Message& message, const char* type_uri,
+             google::protobuf::Any* out) {
   out->set_type_url(type_uri);
   google::protobuf::io::StringOutputStream stream(out->mutable_value());
   google::protobuf::io::CodedOutputStream coded_output_stream(&stream);
   message.SerializeToCodedStream(&coded_output_stream);
 }
 
-bool UnpackAny(const google::protobuf::Any &any,
-               google::protobuf::Message *result) {
+bool UnpackAny(const google::protobuf::Any& any,
+               google::protobuf::Message* result) {
   google::protobuf::io::ArrayInputStream stream(any.value().data(),
                                                 any.value().size());
   google::protobuf::io::CodedInputStream coded_input_stream(&stream);
   return result->ParseFromCodedStream(&coded_input_stream);
 }
-}
+}  // namespace kythe

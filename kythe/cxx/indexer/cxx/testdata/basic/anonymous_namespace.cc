@@ -1,4 +1,5 @@
 // We index anonymous namespaces.
-//- @namespace defines/binding AnonymousNamespace
+//- @namespace ref AnonymousNamespace
+//- AnonymousNamespace.node/kind package
 namespace {
 }

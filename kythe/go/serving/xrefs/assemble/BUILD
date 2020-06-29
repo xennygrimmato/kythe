@@ -1,24 +1,39 @@
-load("//tools:build_rules/go.bzl", "go_package")
+load("//tools:build_rules/shims.bzl", "go_library", "go_test")
 
 package(default_visibility = ["//kythe:default_visibility"])
 
-go_package(
-    test_deps = ["//kythe/go/test/testutil"],
+go_library(
+    name = "assemble",
+    srcs = ["assemble.go"],
     deps = [
-        "@go_x_net//:context",
         "//kythe/go/services/graphstore",
-        "//kythe/go/services/graphstore/compare",
         "//kythe/go/services/xrefs",
         "//kythe/go/storage/stream",
+        "//kythe/go/util/compare",
         "//kythe/go/util/encoding/text",
         "//kythe/go/util/kytheuri",
         "//kythe/go/util/pager",
-        "//kythe/go/util/schema",
-        "//kythe/go/util/stringset",
-        "//kythe/proto:common_proto_go",
-        "//kythe/proto:internal_proto_go",
-        "//kythe/proto:serving_proto_go",
-        "//kythe/proto:storage_proto_go",
-        "//kythe/proto:xref_proto_go",
+        "//kythe/go/util/schema/edges",
+        "//kythe/go/util/schema/facts",
+        "//kythe/go/util/schema/nodes",
+        "//kythe/go/util/schema/tickets",
+        "//kythe/go/util/span",
+        "//kythe/proto:common_go_proto",
+        "//kythe/proto:internal_go_proto",
+        "//kythe/proto:serving_go_proto",
+        "//kythe/proto:storage_go_proto",
+        "@org_bitbucket_creachadair_stringset//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "assemble_test",
+    size = "small",
+    srcs = ["assemble_test.go"],
+    library = "assemble",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//kythe/go/test/testutil",
+        "@org_golang_google_protobuf//proto:go_default_library",
     ],
 )

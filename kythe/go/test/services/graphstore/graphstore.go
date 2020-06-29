@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,19 +16,18 @@
 
 // Package graphstore contains common utilities for testing GraphStore
 // implementations.
-package graphstore
+package graphstore // import "kythe.io/kythe/go/test/services/graphstore"
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"kythe.io/kythe/go/services/graphstore"
-	"kythe.io/kythe/go/services/graphstore/compare"
 	"kythe.io/kythe/go/test/testutil"
+	"kythe.io/kythe/go/util/compare"
 
-	"golang.org/x/net/context"
-
-	spb "kythe.io/kythe/proto/storage_proto"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
 // Service re-exports graphstore.Service for tests

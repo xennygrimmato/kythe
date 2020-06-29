@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-// This file uses the Clang style conventions.
 // Defines AST visitors and consumers used by the indexer tool.
 
 #ifndef KYTHE_CXX_INDEXER_CXX_INDEXER_AST_HOOKS_H_
@@ -22,238 +21,52 @@
 
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 
-#include "glog/logging.h"
+#include "GraphObserver.h"
+#include "IndexerLibrarySupport.h"
+#include "absl/memory/memory.h"
+#include "absl/types/optional.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/ASTTypeTraits.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Index/USRGeneration.h"
 #include "clang/Sema/SemaConsumer.h"
 #include "clang/Sema/Template.h"
-
-#include "GraphObserver.h"
-#include "IndexerLibrarySupport.h"
+#include "glog/logging.h"
+#include "indexed_parent_map.h"
+#include "indexer_worklist.h"
+#include "kythe/cxx/indexer/cxx/node_set.h"
+#include "kythe/cxx/indexer/cxx/recursive_type_visitor.h"
+#include "kythe/cxx/indexer/cxx/semantic_hash.h"
+#include "marked_source.h"
+#include "type_map.h"
 
 namespace kythe {
 
-/// \brief None() may be used to construct an empty `MaybeFew<T>`.
-struct None {};
-
-/// \brief A class containing zero or more instances of copyable `T`. When there
-/// are more than zero elements, the first is distinguished as the `primary`.
-///
-/// This class is primarily used to hold type NodeIds, as the process for
-/// deriving one may fail (if the type is unsupported) or may return more than
-/// one possible ID (if the type is noncanonical).
-template <typename T> class MaybeFew {
-public:
-  /// \brief Constructs a new `MaybeFew` holding zero or more elements.
-  /// If there are more than zero elements, the first one provided is primary.
-  template <typename... Ts>
-  MaybeFew(Ts &&... Init) : Content({std::forward<T>(Init)...}) {}
-
-  /// \brief Constructs an empty `MaybeFew`.
-  ///
-  /// This is meant to be used in contexts where you would like the compiler
-  /// to deduce the MaybeFew's template parameter; for example, in a function
-  /// returning `MaybeFew<S>`, you may `return None()` without repeating `S`.
-  MaybeFew(None) {}
-
-  /// \brief Returns true iff there are elements.
-  explicit operator bool() const { return !Content.empty(); }
-
-  /// \brief Returns the primary element (the first one provided during
-  /// construction).
-  const T &primary() const {
-    CHECK(!Content.empty());
-    return Content[0];
-  }
-
-  /// \brief Take all of the elements previously stored. The `MaybeFew` remains
-  /// in an indeterminate state afterward.
-  std::vector<T> &&takeAll() { return std::move(Content); }
-
-  /// \brief Returns a reference to the internal vector holding the elements.
-  /// If the vector is non-empty, the first element is primary.
-  const std::vector<T> &all() { return Content; }
-
-  /// \brief Creates a new `MaybeFew` by applying `Fn` to each element of this
-  /// one. Order is preserved (st `A.Map(Fn).all()[i] = Fn(A.all()[i])`); also,
-  /// `A.Map(Fn).all().size() == A.all().size()`.
-  template <typename S>
-  MaybeFew<S> Map(const std::function<S(const T &)> &Fn) const {
-    MaybeFew<S> Result;
-    Result.Content.reserve(Content.size());
-    for (const auto &E : Content) {
-      Result.Content.push_back(Fn(E));
-    }
-    return Result;
-  }
-
-  /// \brief Apply `Fn` to each stored element starting with the primary.
-  void Iter(const std::function<void(const T &)> &Fn) const {
-    for (const auto &E : Content) {
-      Fn(E);
-    }
-  }
-
-private:
-  /// The elements stored in this value, where `Content[0]` is the primary
-  /// element (if any elements exist at all).
-  std::vector<T> Content;
-};
-
-/// \brief Constructs a `MaybeFew<T>` given a single `T`.
-template <typename T> MaybeFew<T> Some(T &&t) {
-  return MaybeFew<T>(std::forward<T>(t));
-}
-
-/// For a given node in the AST, this class keeps track of the node's
-/// parent (along some path from the AST root) and an integer index for that
-/// node in some arbitrary but consistent order defined by the parent.
-struct IndexedParent {
-  /// \brief The parent DynTypedNode associated with some key.
-  clang::ast_type_traits::DynTypedNode Parent;
-  /// \brief The index at which some associated key appears in `Parent`.
-  size_t Index;
-};
-
-inline bool operator==(const IndexedParent &L, const IndexedParent &R) {
-  // We compare IndexedParents for deduplicating memoizable DynTypedNodes
-  // below; semantically, this means that we keep the first child index
-  // we saw when following every path through a particular memoizable
-  // IndexedParent.
-  return L.Parent == R.Parent;
-}
-
-inline bool operator!=(const IndexedParent &L, const IndexedParent &R) {
-  return !(L == R);
-}
-
-typedef llvm::SmallVector<IndexedParent, 2> IndexedParentVector;
-
-typedef llvm::DenseMap<
-    const void *, llvm::PointerUnion<IndexedParent *, IndexedParentVector *>>
-    IndexedParentMap;
-
-/// FIXME: Currently only builds up the map using \c Stmt and \c Decl nodes.
-/// TODO(zarko): Is this necessary to change for naming?
-class IndexedParentASTVisitor
-    : public clang::RecursiveASTVisitor<IndexedParentASTVisitor> {
-public:
-  /// \brief Builds and returns the translation unit's indexed parent map.
-  ///
-  /// The caller takes ownership of the returned `IndexedParentMap`.
-  static std::unique_ptr<IndexedParentMap>
-  buildMap(clang::TranslationUnitDecl &TU) {
-    std::unique_ptr<IndexedParentMap> ParentMap(new IndexedParentMap);
-    IndexedParentASTVisitor Visitor(ParentMap.get());
-    Visitor.TraverseDecl(&TU);
-    return ParentMap;
-  }
-
-private:
-  typedef RecursiveASTVisitor<IndexedParentASTVisitor> VisitorBase;
-
-  explicit IndexedParentASTVisitor(IndexedParentMap *Parents)
-      : Parents(Parents) {}
-
-  bool shouldVisitTemplateInstantiations() const { return true; }
-  bool shouldVisitImplicitCode() const { return true; }
-  // Disables data recursion. We intercept Traverse* methods in the RAV, which
-  // are not triggered during data recursion.
-  bool shouldUseDataRecursionFor(clang::Stmt *S) const { return false; }
-
-  // Traverse an arbitrary AST node type and record the node used to get to
-  // it as that node's parent. `T` is the type of the node and
-  // `BaseTraverseFn` is the type of a function (or other value with
-  // an operator()) that invokes the base RecursiveASTVisitor traversal logic
-  // on values of type `T*` and returns a boolean traversal result.
-  template <typename T, typename BaseTraverseFn>
-  bool TraverseNode(T *Node, BaseTraverseFn traverse) {
-    if (!Node)
-      return true;
-    if (!ParentStack.empty()) {
-      // FIXME: Currently we add the same parent multiple times, but only
-      // when no memoization data is available for the type.
-      // For example when we visit all subexpressions of template
-      // instantiations; this is suboptimal, but benign: the only way to
-      // visit those is with hasAncestor / hasParent, and those do not create
-      // new matches.
-      // The plan is to enable DynTypedNode to be storable in a map or hash
-      // map. The main problem there is to implement hash functions /
-      // comparison operators for all types that DynTypedNode supports that
-      // do not have pointer identity.
-      auto &NodeOrVector = (*Parents)[Node];
-      if (NodeOrVector.isNull()) {
-        NodeOrVector = new IndexedParent(ParentStack.back());
-      } else {
-        if (NodeOrVector.template is<IndexedParent *>()) {
-          auto *Node = NodeOrVector.template get<IndexedParent *>();
-          auto *Vector = new IndexedParentVector(1, *Node);
-          NodeOrVector = Vector;
-          delete Node;
-        }
-        CHECK(NodeOrVector.template is<IndexedParentVector *>());
-
-        auto *Vector = NodeOrVector.template get<IndexedParentVector *>();
-        // Skip duplicates for types that have memoization data.
-        // We must check that the type has memoization data before calling
-        // std::find() because DynTypedNode::operator== can't compare all
-        // types.
-        bool Found = ParentStack.back().Parent.getMemoizationData() &&
-                     std::find(Vector->begin(), Vector->end(),
-                               ParentStack.back()) != Vector->end();
-        if (!Found)
-          Vector->push_back(ParentStack.back());
-      }
-    }
-    ParentStack.push_back(
-        {clang::ast_type_traits::DynTypedNode::create(*Node), 0});
-    bool Result = traverse(Node);
-    ParentStack.pop_back();
-    if (!ParentStack.empty()) {
-      ParentStack.back().Index++;
-    }
-    return Result;
-  }
-
-  bool TraverseDecl(clang::Decl *DeclNode) {
-    return TraverseNode(DeclNode, [this](clang::Decl *Node) {
-      return VisitorBase::TraverseDecl(Node);
-    });
-  }
-
-  bool TraverseStmt(clang::Stmt *StmtNode) {
-    return TraverseNode(StmtNode, [this](clang::Stmt *Node) {
-      return VisitorBase::TraverseStmt(Node);
-    });
-  }
-
-  IndexedParentMap *Parents;
-  llvm::SmallVector<IndexedParent, 16> ParentStack;
-
-  friend class RecursiveASTVisitor<IndexedParentASTVisitor>;
-};
-
 /// \brief Specifies whether uncommonly-used data should be dropped.
 enum Verbosity : bool {
-  Classic = true, ///< Emit all data.
-  Lite = false    ///< Emit only common data.
+  Classic = true,  ///< Emit all data.
+  Lite = false     ///< Emit only common data.
 };
 
 /// \brief Specifies what the indexer should do if it encounters a case it
 /// doesn't understand.
 enum BehaviorOnUnimplemented : bool {
-  Abort = false,  ///< Stop indexing and exit with an error.
-  Continue = true ///< Continue indexing, possibly emitting less data.
+  Abort = false,   ///< Stop indexing and exit with an error.
+  Continue = true  ///< Continue indexing, possibly emitting less data.
 };
 
 /// \brief Specifies what the indexer should do with template instantiations.
 enum BehaviorOnTemplates : bool {
-  SkipInstantiations = false, ///< Don't visit template instantiations.
-  VisitInstantiations = true  ///< Visit template instantiations.
+  SkipInstantiations = false,  ///< Don't visit template instantiations.
+  VisitInstantiations = true   ///< Visit template instantiations.
 };
+
+/// \brief Specifies if the indexer should emit documentation nodes for comments
+/// associated with forward declarations.
+enum BehaviorOnFwdDeclComments : bool { Emit = true, Ignore = false };
 
 /// \brief A byte range that links to some node.
 struct MiniAnchor {
@@ -265,115 +78,308 @@ struct MiniAnchor {
 /// Adds brackets to Text to define anchor locations (escaping existing ones)
 /// and sorts Anchors such that the ith Anchor corresponds to the ith opening
 /// bracket. Drops empty or negative-length spans.
-void InsertAnchorMarks(std::string &Text, std::vector<MiniAnchor> &Anchors);
+void InsertAnchorMarks(std::string& Text, std::vector<MiniAnchor>& Anchors);
+
+/// \brief Used internally to check whether parts of the AST can be ignored.
+class PruneCheck;
 
 /// \brief An AST visitor that extracts information for a translation unit and
 /// writes it to a `GraphObserver`.
-class IndexerASTVisitor : public clang::RecursiveASTVisitor<IndexerASTVisitor> {
-public:
-  IndexerASTVisitor(clang::ASTContext &C, BehaviorOnUnimplemented B,
+class IndexerASTVisitor : public RecursiveTypeVisitor<IndexerASTVisitor> {
+  using Base = RecursiveTypeVisitor;
+
+ public:
+  IndexerASTVisitor(clang::ASTContext& C, BehaviorOnUnimplemented B,
                     BehaviorOnTemplates T, Verbosity V,
-                    const LibrarySupports &S, clang::Sema &Sema,
-                    GraphObserver *GO = nullptr)
-      : IgnoreUnimplemented(B), TemplateMode(T), Verbosity(V),
-        Observer(GO ? *GO : NullObserver), Context(C), Supports(S), Sema(Sema) {
-  }
+                    BehaviorOnFwdDeclComments ObjC,
+                    BehaviorOnFwdDeclComments Cpp, const LibrarySupports& S,
+                    clang::Sema& Sema, std::function<bool()> ShouldStopIndexing,
+                    GraphObserver* GO = nullptr, int UsrByteSize = 0)
+      : IgnoreUnimplemented(B),
+        TemplateMode(T),
+        Verbosity(V),
+        ObjCFwdDocs(ObjC),
+        CppFwdDocs(Cpp),
+        Observer(GO ? *GO : NullObserver),
+        Context(C),
+        Supports(S),
+        Sema(Sema),
+        MarkedSources(&Sema, &Observer),
+        ShouldStopIndexing(std::move(ShouldStopIndexing)),
+        UsrByteSize(UsrByteSize) {}
 
-  ~IndexerASTVisitor() { deleteAllParents(); }
+  bool VisitDecl(const clang::Decl* Decl);
+  bool VisitFieldDecl(const clang::FieldDecl* Decl);
+  bool VisitVarDecl(const clang::VarDecl* Decl);
+  bool VisitNamespaceDecl(const clang::NamespaceDecl* Decl);
+  bool VisitBindingDecl(const clang::BindingDecl* Decl);
+  bool VisitSizeOfPackExpr(const clang::SizeOfPackExpr* Expr);
+  bool VisitDeclRefExpr(const clang::DeclRefExpr* DRE);
 
-  bool VisitDecl(const clang::Decl *Decl);
-  bool VisitFieldDecl(const clang::FieldDecl *Decl);
-  bool VisitVarDecl(const clang::VarDecl *Decl);
-  bool VisitNamespaceDecl(const clang::NamespaceDecl *Decl);
-  bool VisitDeclRefExpr(const clang::DeclRefExpr *DRE);
-  bool VisitUnaryExprOrTypeTraitExpr(const clang::UnaryExprOrTypeTraitExpr *E);
-  bool VisitCXXConstructExpr(const clang::CXXConstructExpr *E);
-  bool VisitCXXDeleteExpr(const clang::CXXDeleteExpr *E);
-  bool VisitCXXPseudoDestructorExpr(const clang::CXXPseudoDestructorExpr *E);
-  bool
-  VisitCXXUnresolvedConstructExpr(const clang::CXXUnresolvedConstructExpr *E);
-  bool VisitCallExpr(const clang::CallExpr *Expr);
-  bool VisitMemberExpr(const clang::MemberExpr *Expr);
+  bool TraverseBinAssign(clang::BinaryOperator* BO);
+
+  bool TraverseInitListExpr(clang::InitListExpr* ILE);
+  bool VisitInitListExpr(const clang::InitListExpr* ILE);
+  bool VisitDesignatedInitExpr(const clang::DesignatedInitExpr* DIE);
+
+  bool VisitCXXConstructExpr(const clang::CXXConstructExpr* E);
+  bool VisitCXXDeleteExpr(const clang::CXXDeleteExpr* E);
+  bool VisitCXXNewExpr(const clang::CXXNewExpr* E);
+  bool VisitCXXPseudoDestructorExpr(const clang::CXXPseudoDestructorExpr* E);
+  bool VisitCXXUnresolvedConstructExpr(
+      const clang::CXXUnresolvedConstructExpr* E);
+  bool VisitCallExpr(const clang::CallExpr* Expr);
+  bool VisitMemberExpr(const clang::MemberExpr* Expr);
   bool VisitCXXDependentScopeMemberExpr(
-      const clang::CXXDependentScopeMemberExpr *Expr);
-  bool VisitTypedefNameDecl(const clang::TypedefNameDecl *Decl);
-  bool VisitRecordDecl(const clang::RecordDecl *Decl);
-  bool VisitEnumDecl(const clang::EnumDecl *Decl);
-  bool VisitEnumConstantDecl(const clang::EnumConstantDecl *Decl);
-  bool VisitFunctionDecl(clang::FunctionDecl *Decl);
-  bool TraverseDecl(clang::Decl *Decl);
+      const clang::CXXDependentScopeMemberExpr* Expr);
+
+  bool TraverseNestedNameSpecifierLoc(clang::NestedNameSpecifierLoc NNS);
+
+  // Visitors for leaf TypeLoc types.
+  bool VisitBuiltinTypeLoc(clang::BuiltinTypeLoc TL);
+  bool VisitEnumTypeLoc(clang::EnumTypeLoc TL);
+  bool VisitRecordTypeLoc(clang::RecordTypeLoc TL);
+  bool VisitTemplateTypeParmTypeLoc(clang::TemplateTypeParmTypeLoc TL);
+  bool VisitSubstTemplateTypeParmTypeLoc(
+      clang::SubstTemplateTypeParmTypeLoc TL);
+
+  template <typename TypeLoc, typename Type>
+  bool VisitTemplateSpecializationTypePairHelper(TypeLoc Written,
+                                                 const Type* Resolved);
+
+  bool VisitTemplateSpecializationTypeLoc(
+      clang::TemplateSpecializationTypeLoc TL);
+  bool VisitDeducedTemplateSpecializationTypePair(
+      clang::DeducedTemplateSpecializationTypeLoc TL,
+      const clang::DeducedTemplateSpecializationType* T);
+
+  bool VisitAutoTypePair(clang::AutoTypeLoc TL, const clang::AutoType* T);
+  bool VisitDecltypeTypeLoc(clang::DecltypeTypeLoc TL);
+  bool VisitElaboratedTypeLoc(clang::ElaboratedTypeLoc TL);
+  bool VisitTypedefTypeLoc(clang::TypedefTypeLoc TL);
+  bool VisitInjectedClassNameTypeLoc(clang::InjectedClassNameTypeLoc TL);
+  bool VisitDependentNameTypeLoc(clang::DependentNameTypeLoc TL);
+  bool VisitPackExpansionTypeLoc(clang::PackExpansionTypeLoc TL);
+  bool VisitObjCObjectTypeLoc(clang::ObjCObjectTypeLoc TL);
+  bool VisitObjCTypeParamTypeLoc(clang::ObjCTypeParamTypeLoc TL);
+
+  bool TraverseAttributedTypeLoc(clang::AttributedTypeLoc TL);
+  bool TraverseDependentAddressSpaceTypeLoc(
+      clang::DependentAddressSpaceTypeLoc TL);
+
+  bool TraverseMemberPointerTypeLoc(clang::MemberPointerTypeLoc TL);
+
+  // Emit edges for an anchor pointing to the indicated type.
+  NodeSet RecordTypeLocSpellingLocation(clang::TypeLoc TL);
+  NodeSet RecordTypeLocSpellingLocation(clang::TypeLoc Written,
+                                        const clang::Type* Resolved);
+
+  bool TraverseDeclarationNameInfo(clang::DeclarationNameInfo NameInfo);
+
+  // Visit the subtypes of TypedefNameDecl individually because we want to do
+  // something different with ObjCTypeParamDecl.
+  bool VisitTypedefDecl(const clang::TypedefDecl* Decl);
+  bool VisitTypeAliasDecl(const clang::TypeAliasDecl* Decl);
+  bool VisitObjCTypeParamDecl(const clang::ObjCTypeParamDecl* Decl);
+  bool VisitUsingShadowDecl(const clang::UsingShadowDecl* Decl);
+
+  bool VisitRecordDecl(const clang::RecordDecl* Decl);
+  bool VisitEnumDecl(const clang::EnumDecl* Decl);
+  bool VisitEnumConstantDecl(const clang::EnumConstantDecl* Decl);
+  bool VisitFunctionDecl(clang::FunctionDecl* Decl);
+  bool TraverseDecl(clang::Decl* Decl);
+  bool TraverseCXXConstructorDecl(clang::CXXConstructorDecl* CD);
+
+  bool TraverseConstructorInitializer(clang::CXXCtorInitializer* Init);
+  bool TraverseCXXNewExpr(clang::CXXNewExpr* E);
+  bool TraverseCXXFunctionalCastExpr(clang::CXXFunctionalCastExpr* E);
+  bool TraverseCXXTemporaryObjectExpr(clang::CXXTemporaryObjectExpr* E);
+
+  bool IndexConstructExpr(const clang::CXXConstructExpr* E,
+                          const clang::TypeSourceInfo* TSI);
+
+  // Objective C specific nodes
+  bool VisitObjCPropertyImplDecl(const clang::ObjCPropertyImplDecl* Decl);
+  bool VisitObjCCompatibleAliasDecl(const clang::ObjCCompatibleAliasDecl* Decl);
+  bool VisitObjCCategoryDecl(const clang::ObjCCategoryDecl* Decl);
+  bool VisitObjCImplementationDecl(
+      const clang::ObjCImplementationDecl* ImplDecl);
+  bool VisitObjCCategoryImplDecl(const clang::ObjCCategoryImplDecl* ImplDecl);
+  bool VisitObjCInterfaceDecl(const clang::ObjCInterfaceDecl* Decl);
+  bool VisitObjCProtocolDecl(const clang::ObjCProtocolDecl* Decl);
+  bool VisitObjCMethodDecl(const clang::ObjCMethodDecl* Decl);
+  bool VisitObjCPropertyDecl(const clang::ObjCPropertyDecl* Decl);
+  bool VisitObjCIvarRefExpr(const clang::ObjCIvarRefExpr* IRE);
+  bool VisitObjCMessageExpr(const clang::ObjCMessageExpr* Expr);
+  bool VisitObjCPropertyRefExpr(const clang::ObjCPropertyRefExpr* Expr);
+
+  // TODO(salguarnieri) We could link something here (the square brackets?) to
+  // the setter and getter methods
+  //   bool VisitObjCSubscriptRefExpr(const clang::ObjCSubscriptRefExpr *Expr);
+
+  // TODO(salguarnieri) delete this comment block when we have more objective-c
+  // support implemented.
+  //
+  //  Visitors that are left to their default behavior because we do not need
+  //  to take any action while visiting them.
+  //   bool VisitObjCDictionaryLiteral(const clang::ObjCDictionaryLiteral *D);
+  //   bool VisitObjCArrayLiteral(const clang::ObjCArrayLiteral *D);
+  //   bool VisitObjCBoolLiteralExpr(const clang::ObjCBoolLiteralExpr *D);
+  //   bool VisitObjCStringLiteral(const clang::ObjCStringLiteral *D);
+  //   bool VisitObjCEncodeExpr(const clang::ObjCEncodeExpr *Expr);
+  //   bool VisitObjCBoxedExpr(const clang::ObjCBoxedExpr *Expr);
+  //   bool VisitObjCSelectorExpr(const clang::ObjCSelectorExpr *Expr);
+  //   bool VisitObjCIndirectCopyRestoreExpr(
+  //    const clang::ObjCIndirectCopyRestoreExpr *Expr);
+  //   bool VisitObjCIsaExpr(const clang::ObjCIsaExpr *Expr);
+  //
+  //  We visit the subclasses of ObjCContainerDecl so there is nothing to do.
+  //   bool VisitObjCContainerDecl(const clang::ObjCContainerDecl *D);
+  //
+  //  We visit the subclasses of ObjCImpleDecl so there is nothing to do.
+  //   bool VisitObjCImplDecl(const clang::ObjCImplDecl *D);
+  //
+  //  There is nothing specific we need to do for blocks. The recursive visitor
+  //  will visit the components of them correctly.
+  //   bool VisitBlockDecl(const clang::BlockDecl *Decl);
+  //   bool VisitBlockExpr(const clang::BlockExpr *Expr);
 
   /// \brief For functions that support it, controls the emission of range
   /// information.
   enum class EmitRanges {
-    No, ///< Don't emit range information.
-    Yes ///< Emit range information when it's available.
+    No,  ///< Don't emit range information.
+    Yes  ///< Emit range information when it's available.
   };
+
+  // Objective C methods don't have TypeSourceInfo so we must construct a type
+  // for the methods to be used in the graph.
+  absl::optional<GraphObserver::NodeId> CreateObjCMethodTypeNode(
+      const clang::ObjCMethodDecl* MD);
 
   /// \brief Builds a stable node ID for a compile-time expression.
   /// \param Expr The expression to represent.
   /// \param ER Whether to notify the `GraphObserver` about source text
   /// ranges for expressions.
-  MaybeFew<GraphObserver::NodeId> BuildNodeIdForExpr(const clang::Expr *Expr,
-                                                     EmitRanges ER);
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForExpr(
+      const clang::Expr* Expr, EmitRanges ER);
+
+  /// \brief Builds a stable node ID for a special template argument.
+  /// \param Id A string representing the special argument.
+  GraphObserver::NodeId BuildNodeIdForSpecialTemplateArgument(
+      llvm::StringRef Id);
+
+  /// \brief Builds a stable node ID for a template expansion template argument.
+  /// \param Name The template pattern being expanded.
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForTemplateExpansion(
+      clang::TemplateName Name);
+
+  /// \brief Builds a stable NodeSet for the given TypeLoc.
+  /// \param TL The TypeLoc for which to build a NodeSet.
+  /// \returns NodeSet instance indicating claimability of the contained
+  /// NodeIds.
+  NodeSet BuildNodeSetForType(const clang::QualType& QT);
+  NodeSet BuildNodeSetForType(const clang::Type* T);
+  NodeSet BuildNodeSetForType(const clang::TypeLoc& TL);
+
+  NodeSet BuildNodeSetForTypeInternal(const clang::Type& T);
+  NodeSet BuildNodeSetForTypeInternal(const clang::QualType& QT);
+
+  NodeSet BuildNodeSetForBuiltin(const clang::BuiltinType& T) const;
+  NodeSet BuildNodeSetForEnum(const clang::EnumType& T);
+  NodeSet BuildNodeSetForRecord(const clang::RecordType& T);
+  NodeSet BuildNodeSetForInjectedClassName(
+      const clang::InjectedClassNameType& T);
+  NodeSet BuildNodeSetForTemplateTypeParm(const clang::TemplateTypeParmType& T);
+  NodeSet BuildNodeSetForPointer(const clang::PointerType& T);
+  NodeSet BuildNodeSetForMemberPointer(const clang::MemberPointerType& T);
+  NodeSet BuildNodeSetForLValueReference(const clang::LValueReferenceType& T);
+  NodeSet BuildNodeSetForRValueReference(const clang::RValueReferenceType& T);
+
+  NodeSet BuildNodeSetForAuto(const clang::AutoType& TL);
+  NodeSet BuildNodeSetForDeducedTemplateSpecialization(
+      const clang::DeducedTemplateSpecializationType& TL);
+  // Helper used for Auto and DeducedTemplateSpecialization.
+  NodeSet BuildNodeSetForDeduced(const clang::DeducedType& T);
+
+  NodeSet BuildNodeSetForConstantArray(const clang::ConstantArrayType& TL);
+  NodeSet BuildNodeSetForIncompleteArray(const clang::IncompleteArrayType& TL);
+  NodeSet BuildNodeSetForDependentSizedArray(
+      const clang::DependentSizedArrayType& T);
+  NodeSet BuildNodeSetForExtInt(const clang::ExtIntType& T);
+  NodeSet BuildNodeSetForDependentExtInt(const clang::DependentExtIntType& T);
+  NodeSet BuildNodeSetForFunctionProto(const clang::FunctionProtoType& T);
+  NodeSet BuildNodeSetForFunctionNoProto(const clang::FunctionNoProtoType& T);
+  NodeSet BuildNodeSetForParen(const clang::ParenType& T);
+  NodeSet BuildNodeSetForDecltype(const clang::DecltypeType& T);
+  NodeSet BuildNodeSetForElaborated(const clang::ElaboratedType& T);
+  NodeSet BuildNodeSetForTypedef(const clang::TypedefType& T);
+
+  NodeSet BuildNodeSetForSubstTemplateTypeParm(
+      const clang::SubstTemplateTypeParmType& T);
+  NodeSet BuildNodeSetForDependentName(const clang::DependentNameType& T);
+  NodeSet BuildNodeSetForTemplateSpecialization(
+      const clang::TemplateSpecializationType& T);
+  NodeSet BuildNodeSetForPackExpansion(const clang::PackExpansionType& T);
+  NodeSet BuildNodeSetForBlockPointer(const clang::BlockPointerType& T);
+  NodeSet BuildNodeSetForObjCObjectPointer(
+      const clang::ObjCObjectPointerType& T);
+  NodeSet BuildNodeSetForObjCObject(const clang::ObjCObjectType& T);
+  NodeSet BuildNodeSetForObjCTypeParam(const clang::ObjCTypeParamType& T);
+  NodeSet BuildNodeSetForObjCInterface(const clang::ObjCInterfaceType& T);
+  NodeSet BuildNodeSetForAttributed(const clang::AttributedType& T);
+  NodeSet BuildNodeSetForDependentAddressSpace(
+      const clang::DependentAddressSpaceType& T);
+
+  // Helper function which constructs marked source and records
+  // a tnominal node for the given `Decl`.
+  GraphObserver::NodeId BuildNominalNodeIdForDecl(const clang::NamedDecl* Decl);
+
+  // Helper used by BuildNodeSetForRecord and BuildNodeSetForInjectedClassName.
+  NodeSet BuildNodeSetForNonSpecializedRecordDecl(
+      const clang::RecordDecl* Decl);
+
+  const clang::TemplateTypeParmDecl* FindTemplateTypeParmTypeDecl(
+      const clang::TemplateTypeParmType& T) const;
+
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForObjCProtocols(
+      const clang::ObjCObjectType& T);
+  GraphObserver::NodeId BuildNodeIdForObjCProtocols(
+      absl::Span<const GraphObserver::NodeId> ProtocolIds);
+
+  std::vector<GraphObserver::NodeId> BuildNodeIdsForObjCProtocols(
+      GraphObserver::NodeId BaseType, const clang::ObjCObjectType& T);
+  std::vector<GraphObserver::NodeId> BuildNodeIdsForObjCProtocols(
+      const clang::ObjCObjectType& T);
 
   /// \brief Builds a stable node ID for `Type`.
-  /// \param Type The type that is being identified. If its location is valid
-  /// and `ER` is `EmitRanges::Yes`, notifies the attached `GraphObserver` about
-  /// the location of constituent elements.
-  /// \param DType The deduced form of `Type`. (May be `Type.getTypePtr()`).
-  /// \param ER whether to notify the `GraphObserver` about source text ranges
-  /// for types.
+  /// \param TypeLoc The type that is being identified.
   /// \return The Node ID for `Type`.
-  MaybeFew<GraphObserver::NodeId> BuildNodeIdForType(const clang::TypeLoc &Type,
-                                                     const clang::Type *DType,
-                                                     EmitRanges ER);
-
-  /// \brief Builds a stable node ID for `Type`.
-  /// \param Type The type that is being identified. If its location is valid
-  /// and `ER` is `EmitRanges::Yes`, notifies the attached `GraphObserver` about
-  /// the location of constituent elements.
-  /// \param QT The deduced form of `Type`. (May be `Type.getType()`).
-  /// \param ER whether to notify the `GraphObserver` about source text ranges
-  /// for types.
-  /// \return The Node ID for `Type`.
-  MaybeFew<GraphObserver::NodeId> BuildNodeIdForType(const clang::TypeLoc &Type,
-                                                     const clang::QualType &QT,
-                                                     EmitRanges ER);
-
-  /// \brief Builds a stable node ID for `Type`.
-  /// \param Type The type that is being identified. If its location is valid
-  /// and `ER` is `EmitRanges::Yes`, notifies the attached `GraphObserver` about
-  /// the location of constituent elements.
-  /// \param ER whether to notify the `GraphObserver` about source text ranges
-  /// for types.
-  /// \return The Node ID for `Type`.
-  MaybeFew<GraphObserver::NodeId> BuildNodeIdForType(const clang::TypeLoc &Type,
-                                                     EmitRanges ER);
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForType(
+      const clang::TypeLoc& TypeLoc);
 
   /// \brief Builds a stable node ID for `QT`.
   /// \param QT The type that is being identified.
   /// \return The Node ID for `QT`.
-  ///
-  /// This function will invent a `TypeLoc` with an invalid location.
-  /// If you can provide a `TypeLoc` for the type, it is better to use
-  /// `BuildNodeIdForType(const clang::TypeLoc, EmitRanges)`.
-  MaybeFew<GraphObserver::NodeId> BuildNodeIdForType(const clang::QualType &QT);
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForType(
+      const clang::QualType& QT);
+
+  /// \brief Builds a stable node ID for `T`.
+  /// \param T The type that is being identified.
+  /// \return The Node ID for `T`.
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForType(
+      const clang::Type* T);
 
   /// \brief Builds a stable node ID for the given `TemplateName`.
-  MaybeFew<GraphObserver::NodeId>
-  BuildNodeIdForTemplateName(const clang::TemplateName &Name,
-                             clang::SourceLocation L);
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForTemplateName(
+      const clang::TemplateName& Name);
+
+  /// \brief Builds a stable node ID for the given `TemplateArgumentLoc`.
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForTemplateArgument(
+      const clang::TemplateArgumentLoc& ArgLoc);
 
   /// \brief Builds a stable node ID for the given `TemplateArgument`.
-  MaybeFew<GraphObserver::NodeId>
-  BuildNodeIdForTemplateArgument(const clang::TemplateArgumentLoc &Arg,
-                                 EmitRanges ER);
-
-  /// \brief Builds a stable node ID for the given `TemplateArgument`.
-  MaybeFew<GraphObserver::NodeId>
-  BuildNodeIdForTemplateArgument(const clang::TemplateArgument &Arg,
-                                 clang::SourceLocation L);
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForTemplateArgument(
+      const clang::TemplateArgument& Arg);
 
   /// \brief Builds a stable node ID for `Stmt`.
   ///
@@ -384,20 +390,64 @@ public:
   /// \param Decl The statement that is being identified
   /// \return The node for `Stmt` if the statement was implicit; otherwise,
   /// None.
-  MaybeFew<GraphObserver::NodeId>
-  BuildNodeIdForImplicitStmt(const clang::Stmt *Stmt);
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForImplicitStmt(
+      const clang::Stmt* Stmt);
+
+  /// \brief Builds a stable node ID for `Decl`'s tapp if it's an implicit
+  /// template instantiation.
+  absl::optional<GraphObserver::NodeId>
+  BuildNodeIdForImplicitTemplateInstantiation(const clang::Decl* Decl);
+
+  /// \brief Builds a stable node ID for `Decl`'s tapp if it's an implicit
+  /// function template instantiation.
+  absl::optional<GraphObserver::NodeId>
+  BuildNodeIdForImplicitFunctionTemplateInstantiation(
+      const clang::FunctionDecl* FD);
+
+  /// \brief Builds a stable node ID for `Decl`'s tapp if it's an implicit
+  /// class template instantiation.
+  absl::optional<GraphObserver::NodeId>
+  BuildNodeIdForImplicitClassTemplateInstantiation(
+      const clang::ClassTemplateSpecializationDecl* CTSD);
+
+  /// \brief Builds a stable node ID for an external reference to `Decl`.
+  ///
+  /// This is equivalent to BuildNodeIdForDecl for Decls that are not
+  /// implicit template instantiations; otherwise, it returns the `NodeId`
+  /// for the tapp node for the instantiation.
+  ///
+  /// \param Decl The declaration that is being identified.
+  /// \return The node for `Decl`.
+  GraphObserver::NodeId BuildNodeIdForRefToDecl(const clang::Decl* Decl);
 
   /// \brief Builds a stable node ID for `Decl`.
   ///
   /// \param Decl The declaration that is being identified.
   /// \return The node for `Decl`.
-  GraphObserver::NodeId BuildNodeIdForDecl(const clang::Decl *Decl);
+  GraphObserver::NodeId BuildNodeIdForDecl(const clang::Decl* Decl);
+
+  /// \brief Builds a stable node ID for the definition of `Decl`, if
+  /// `Decl` is not already a definition and its definition can be found.
+  ///
+  /// \param Decl The declaration that is being identified.
+  /// \return The node for the definition `Decl` if `Decl` isn't a definition
+  /// and its definition can be found; or None.
+  template <typename D>
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForDefnOfDecl(
+      const D* Decl) {
+    if (const auto* Defn = Decl->getDefinition()) {
+      if (Defn != Decl) {
+        return BuildNodeIdForDecl(Defn);
+      }
+    }
+    return absl::nullopt;
+  }
 
   /// \brief Builds a stable node ID for `TND`.
   ///
   /// \param Decl The declaration that is being identified.
-  MaybeFew<GraphObserver::NodeId>
-  BuildNodeIdForTypedefNameDecl(const clang::TypedefNameDecl *TND);
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForTypedefNameDecl(
+      const clang::TypedefNameDecl* Decl);
 
   /// \brief Builds a stable node ID for `Decl`.
   ///
@@ -411,32 +461,81 @@ public:
   /// \param Index The index of the sub-id to generate.
   ///
   /// \return A stable node ID for `Decl`'s `Index`th subnode.
-  GraphObserver::NodeId BuildNodeIdForDecl(const clang::Decl *Decl,
+  GraphObserver::NodeId BuildNodeIdForDecl(const clang::Decl* Decl,
                                            unsigned Index);
 
   /// \brief Categorizes the name of `Decl` according to the equivalence classes
   /// defined by `GraphObserver::NameId::NameEqClass`.
-  GraphObserver::NameId::NameEqClass
-  BuildNameEqClassForDecl(const clang::Decl *Decl);
+  GraphObserver::NameId::NameEqClass BuildNameEqClassForDecl(
+      const clang::Decl* Decl) const;
 
   /// \brief Builds a stable name ID for the name of `Decl`.
   ///
   /// \param Decl The declaration that is being named.
   /// \return The name for `Decl`.
-  GraphObserver::NameId BuildNameIdForDecl(const clang::Decl *Decl);
+  GraphObserver::NameId BuildNameIdForDecl(const clang::Decl* Decl);
 
-  /// \brief Builds a NodeId for the given dependent name.
+  /// \brief Records parameter and lookup edges for the given dependent name.
   ///
   /// \param NNS The qualifier on the name.
   /// \param Id The name itself.
   /// \param IdLoc The name's location.
   /// \param Root If provided, the primary NodeId is morally prepended to `NNS`
   /// such that the dependent name is lookup(lookup*(Root, NNS), Id).
-  /// \param ER If `EmitRanges::Yes`, records ranges for syntactic elements.
-  MaybeFew<GraphObserver::NodeId> BuildNodeIdForDependentName(
-      const clang::NestedNameSpecifierLoc &NNS,
-      const clang::DeclarationName &Id, const clang::SourceLocation IdLoc,
-      const MaybeFew<GraphObserver::NodeId> &Root, EmitRanges ER);
+  /// \return The NodeId for the dependent name.
+  absl::optional<GraphObserver::NodeId> RecordEdgesForDependentName(
+      const clang::NestedNameSpecifierLoc& NNS,
+      const clang::DeclarationName& Id, const clang::SourceLocation IdLoc,
+      const absl::optional<GraphObserver::NodeId>& Root = absl::nullopt);
+
+  /// \brief Records parameter edges for the given dependent name.
+  /// Also records Lookup edges for any nested Identifiers.
+  /// \param DId The NodeId of the dependent name to use.
+  /// \param NNSLoc The qualifier prefix of the dependent name, if any.
+  /// \param Root If provided, the primary NodeId to prepend to `NNS`.
+  /// \return The provided NodeId or nullopt if an unhandled element is
+  /// encountered.
+  absl::optional<GraphObserver::NodeId> RecordParamEdgesForDependentName(
+      const GraphObserver::NodeId& DId, clang::NestedNameSpecifierLoc NNSLoc,
+      const absl::optional<GraphObserver::NodeId>& Root = absl::nullopt);
+
+  /// \brief Records the lookup edge for a dependent name.
+  ///
+  /// \param DId The NodeId of the name being looked up.
+  /// \param Name The kind of name being looked up.
+  /// \return The provided NodeId or absl::nullopt if Name is unsupported.
+  absl::optional<GraphObserver::NodeId> RecordLookupEdgeForDependentName(
+      const GraphObserver::NodeId& DId, const clang::DeclarationName& Name);
+
+  /// \brief Builds a NodeId for the DependentName.
+  ///
+  /// \param Prefix The qualifier preceding the name.
+  /// \param Identifier The identifier in question.
+  GraphObserver::NodeId BuildNodeIdForDependentIdentifier(
+      const clang::NestedNameSpecifier* Prefix,
+      const clang::IdentifierInfo* Identifier);
+
+  /// \brief Builds a NodeId for the DependentName.
+  ///
+  /// \param Prefix The qualifier preceding the name.
+  /// \param Identifier The DeclarationName in question.
+  GraphObserver::NodeId BuildNodeIdForDependentName(
+      const clang::NestedNameSpecifier* Prefix,
+      const clang::DeclarationName& Identifier);
+
+  /// \brief Builds a NodeId for the provided NestedNameSpecifier, depending on
+  /// its type.
+  ///
+  /// \param NNSLoc The NestedNameSpecifierLoc from which to construct a NodeId.
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForNestedNameSpecifier(
+      const clang::NestedNameSpecifier* NNS);
+
+  /// \brief Builds a NodeId for the provided NestedNameSpecifier, depending on
+  /// its type.
+  ///
+  /// \param NNSLoc The NestedNameSpecifierLoc from which to construct a NodeId.
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForNestedNameSpecifierLoc(
+      const clang::NestedNameSpecifierLoc& NNSLoc);
 
   /// \brief Is `VarDecl` a definition?
   ///
@@ -444,135 +543,146 @@ public:
   /// of a function definition; otherwise it is always a declaration. This
   /// differs from the C++ Standard, which treats these parameters as
   /// definitions (basic.scope.proto).
-  static bool IsDefinition(const clang::VarDecl *VD);
+  static bool IsDefinition(const clang::VarDecl* VD);
 
   /// \brief Is `FunctionDecl` a definition?
-  static bool IsDefinition(const clang::FunctionDecl *FD);
+  static bool IsDefinition(const clang::FunctionDecl* FunctionDecl);
 
   /// \brief Gets a range for the name of a declaration, whether that name is a
   /// single token or otherwise.
   ///
   /// The returned range is a best-effort attempt to cover the "name" of
   /// the entity as written in the source code.
-  clang::SourceRange
-  RangeForNameOfDeclaration(const clang::NamedDecl *Decl) const;
+  clang::SourceRange RangeForNameOfDeclaration(
+      const clang::NamedDecl* Decl) const;
 
-  /// \brief Gets a suitable range for an AST entity from the `StartLocation`.
-  ///
-  /// Note: if the AST entity is a declaration, use `RangeForNameOfDeclaration`,
-  /// as that can use more semantic information to determine a better range in
-  /// some cases.
-  ///
-  /// The returned range is a best-effort attempt to cover the "name" of
-  /// the entity as written in the source code.
-  ///
-  /// This range does double duty, being used for a "source link" as well as
-  /// to represent the semantic range of what's being used. Therefore,
-  /// if the entity is not in a macro expansion, or it comes from a top-level
-  /// macro argument and itself is not expanded from a macro, Kythe has found
-  /// it best to span just the entity's name -- in most cases, that's a
-  /// single token.  Otherwise, when the entity comes from a macro definition
-  /// (and not from a top-level macro argument), the resulting range is a
-  /// 0-width span (a point), so that no source link will be created.
-  ///
-  /// Note: the definition of "suitable" is in the context of the AST visitor.
-  /// Being suitable may mean something different to the preprocessor.
-  clang::SourceRange RangeForASTEntityFromSourceLocation(
-      clang::SourceLocation StartLocation) const;
-
-  /// \brief Gets a range for a token from the location specified by
-  /// `StartLocation`.
-  ///
-  /// Assumes the `StartLocation` is a file location (i.e., isFileID returning
-  /// true) because we want the range of a token in the context of the
-  /// original file.
-  clang::SourceRange RangeForSingleTokenFromSourceLocation(
-      clang::SourceLocation StartLocation) const;
-
-  /// \brief Gets a suitable range to represent the name of some `operator???`,
-  /// whether it's an overloaded operator or a conversion operator.
-  ///
-  /// For conversion operators, the range is the given `OperatorTokenRange`.
-  ///
-  /// For overloaded operators, the range covers the whole operator name
-  /// (e.g., "operator++" or "operator[]").  Note: There's currently a bug
-  /// in that operators new/delete/new[]/delete[] get single-token ranges.
-  ///
-  /// The argument `OperatorTokenRange` should span the text of the
-  /// `operator` keyword.
-  clang::SourceRange
-  RangeForOperatorName(const clang::SourceRange &OperatorTokenRange) const;
-
-  /// Consume a token of the `ExpectedKind` from the `StartLocation`,
-  /// returning the location after that token on success and an invalid
-  /// location otherwise.
-  clang::SourceLocation ConsumeToken(clang::SourceLocation StartLocation,
-                                     clang::tok::TokenKind ExpectedKind) const;
-
-  /// \brief Using the source manager and language options of the `Observer`,
-  /// find the location at the end of the token starting at `StartLocation`.
-  clang::SourceLocation
-  GetLocForEndOfToken(clang::SourceLocation StartLocation) const;
-
-  bool TraverseClassTemplateDecl(clang::ClassTemplateDecl *TD);
+  bool TraverseClassTemplateDecl(clang::ClassTemplateDecl* TD);
   bool TraverseClassTemplateSpecializationDecl(
-      clang::ClassTemplateSpecializationDecl *TD);
+      clang::ClassTemplateSpecializationDecl* TD);
   bool TraverseClassTemplatePartialSpecializationDecl(
-      clang::ClassTemplatePartialSpecializationDecl *TD);
+      clang::ClassTemplatePartialSpecializationDecl* TD);
 
-  bool TraverseVarTemplateDecl(clang::VarTemplateDecl *VD);
+  bool TraverseVarTemplateDecl(clang::VarTemplateDecl* TD);
   bool TraverseVarTemplateSpecializationDecl(
-      clang::VarTemplateSpecializationDecl *VD);
+      clang::VarTemplateSpecializationDecl* TD);
   bool ForceTraverseVarTemplateSpecializationDecl(
-      clang::VarTemplateSpecializationDecl *VD);
+      clang::VarTemplateSpecializationDecl* TD);
   bool TraverseVarTemplatePartialSpecializationDecl(
-      clang::VarTemplatePartialSpecializationDecl *TD);
+      clang::VarTemplatePartialSpecializationDecl* TD);
 
-  bool TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl *FTD);
+  bool TraverseFunctionDecl(clang::FunctionDecl* FD);
+  bool TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl* FTD);
 
-  bool TraverseTypeAliasTemplateDecl(clang::TypeAliasTemplateDecl *TATD);
+  bool TraverseTypeAliasTemplateDecl(clang::TypeAliasTemplateDecl* TATD);
 
   bool shouldVisitTemplateInstantiations() const {
     return TemplateMode == BehaviorOnTemplates::VisitInstantiations;
   }
+  bool shouldEmitObjCForwardClassDeclDocumentation() const {
+    return ObjCFwdDocs == BehaviorOnFwdDeclComments::Emit;
+  }
+  bool shouldEmitCppForwardDeclDocumentation() const {
+    return CppFwdDocs == BehaviorOnFwdDeclComments::Emit;
+  }
   bool shouldVisitImplicitCode() const { return true; }
   // Disables data recursion. We intercept Traverse* methods in the RAV, which
   // are not triggered during data recursion.
-  bool shouldUseDataRecursionFor(clang::Stmt *S) const { return false; }
+  bool shouldUseDataRecursionFor(clang::Stmt* S) const { return false; }
 
   /// \brief Records the range of a definition. If the range cannot be placed
   /// somewhere inside a source file, no record is made.
-  void MaybeRecordDefinitionRange(const MaybeFew<GraphObserver::Range> &R,
-                                  const GraphObserver::NodeId &Id);
+  void MaybeRecordDefinitionRange(
+      const absl::optional<GraphObserver::Range>& R,
+      const GraphObserver::NodeId& Id,
+      const absl::optional<GraphObserver::NodeId>& DeclId);
+
+  /// \brief Records the full range of a definition. If the range cannot be
+  /// placed somewhere inside a source file, no record is made.
+  void MaybeRecordFullDefinitionRange(
+      const absl::optional<GraphObserver::Range>& R,
+      const GraphObserver::NodeId& Id,
+      const absl::optional<GraphObserver::NodeId>& DeclId);
 
   /// \brief Returns the attached GraphObserver.
-  GraphObserver &getGraphObserver() { return Observer; }
+  GraphObserver& getGraphObserver() { return Observer; }
+
+  /// \brief Returns the ASTContext.
+  const clang::ASTContext& getASTContext() { return Context; }
 
   /// Returns `SR` as a `Range` in this `RecursiveASTVisitor`'s current
   /// RangeContext.
-  MaybeFew<GraphObserver::Range>
-  ExplicitRangeInCurrentContext(const clang::SourceRange &SR);
+  absl::optional<GraphObserver::Range> ExplicitRangeInCurrentContext(
+      const clang::SourceRange& SR);
+
+  /// Returns `SR` as a `Range` in this `RecursiveASTVisitor`'s current
+  /// RangeContext. If SR is in a macro, the returned Range will be mapped
+  /// to a file first. If the range would be zero-width, it will be expanded
+  /// via RangeForASTEntityFromSourceLocation.
+  absl::optional<GraphObserver::Range> ExpandedRangeInCurrentContext(
+      clang::SourceRange SR);
+  /// Returns `SR` as a character-based file range.
+  clang::SourceRange NormalizeRange(clang::SourceRange SR) const;
 
   /// If `Implicit` is true, returns `Id` as an implicit Range; otherwise,
   /// returns `SR` as a `Range` in this `RecursiveASTVisitor`'s current
   /// RangeContext.
-  MaybeFew<GraphObserver::Range>
-  RangeInCurrentContext(bool Implicit, const GraphObserver::NodeId &Id,
-                        const clang::SourceRange &SR);
+  absl::optional<GraphObserver::Range> RangeInCurrentContext(
+      bool Implicit, const GraphObserver::NodeId& Id,
+      const clang::SourceRange& SR);
 
   /// If `Id` is some NodeId, returns it as an implicit Range; otherwise,
   /// returns `SR` as a `Range` in this `RecursiveASTVisitor`'s current
   /// RangeContext.
-  MaybeFew<GraphObserver::Range>
-  RangeInCurrentContext(const MaybeFew<GraphObserver::NodeId> &Id,
-                        const clang::SourceRange &SR) {
-    if (auto &PrimaryId = Id) {
-      return GraphObserver::Range(PrimaryId.primary());
+  absl::optional<GraphObserver::Range> RangeInCurrentContext(
+      const absl::optional<GraphObserver::NodeId>& Id,
+      const clang::SourceRange& SR);
+
+  void RunJob(std::unique_ptr<IndexJob> JobToRun) {
+    Job = std::move(JobToRun);
+    if (Job->IsDeclJob) {
+      TraverseDecl(Job->Decl);
+    } else {
+      // There is no declaration attached to a top-level file comment.
+      HandleFileLevelComments(Job->FileId, Job->FileNode);
     }
-    return ExplicitRangeInCurrentContext(SR);
   }
 
-private:
+  const IndexJob& getCurrentJob() {
+    CHECK(Job != nullptr);
+    return *Job;
+  }
+
+  void Work(clang::Decl* InitialDecl,
+            std::unique_ptr<IndexerWorklist> NewWorklist) {
+    Worklist = std::move(NewWorklist);
+    Worklist->EnqueueJob(absl::make_unique<IndexJob>(InitialDecl));
+    while (!ShouldStopIndexing() && Worklist->DoWork())
+      ;
+    Observer.iterateOverClaimedFiles(
+        [this, InitialDecl](clang::FileID Id,
+                            const GraphObserver::NodeId& FileNode) {
+          RunJob(absl::make_unique<IndexJob>(InitialDecl, Id, FileNode));
+          return !ShouldStopIndexing();
+        });
+    Worklist.reset();
+  }
+
+  /// \brief Provides execute-only access to ShouldStopIndexing. Should be used
+  /// from the same thread that's walking the AST.
+  bool shouldStopIndexing() const { return ShouldStopIndexing(); }
+
+  /// Blames a call to `Callee` at `Range` on everything at the top of
+  /// `BlameStack` (or does nothing if there's nobody to blame).
+  void RecordCallEdges(const GraphObserver::Range& Range,
+                       const GraphObserver::NodeId& Callee);
+
+  /// \return whether `range` should be considered to be implicit under the
+  /// current context.
+  GraphObserver::Implicit IsImplicit(const GraphObserver::Range& range);
+
+ private:
+  friend class PruneCheck;
+
   /// Whether we should stop on missing cases or continue on.
   BehaviorOnUnimplemented IgnoreUnimplemented;
 
@@ -582,14 +692,20 @@ private:
   /// Should we emit all data?
   enum Verbosity Verbosity;
 
+  /// Should we emit documentation for forward class decls in ObjC?
+  BehaviorOnFwdDeclComments ObjCFwdDocs;
+
+  /// Should we emit documentation for forward decls in C++?
+  BehaviorOnFwdDeclComments CppFwdDocs;
+
   NullGraphObserver NullObserver;
-  GraphObserver &Observer;
-  clang::ASTContext &Context;
+  GraphObserver& Observer;
+  clang::ASTContext& Context;
 
   /// \brief The result of calling into the lexer.
   enum class LexerResult {
-    Failure, ///< The operation failed.
-    Success  ///< The operation completed.
+    Failure,  ///< The operation failed.
+    Success   ///< The operation completed.
   };
 
   /// \brief Using the `Observer`'s preprocessor, relexes the token at the
@@ -598,85 +714,64 @@ private:
   /// \param Token The token to overwrite.
   /// \return `Failure` if there was a failure, `Success` on success.
   LexerResult getRawToken(clang::SourceLocation StartLocation,
-                          clang::Token &Token) const {
+                          clang::Token& Token) const {
     return Observer.getPreprocessor()->getRawToken(StartLocation, Token,
                                                    true /* ignoreWhiteSpace */)
                ? LexerResult::Failure
                : LexerResult::Success;
   }
 
-  /// \brief Builds a semantic hash of the given `Decl`, which should look
-  /// like a `TemplateDecl` (eg, a `TemplateDecl` itself or a partial
-  /// specialization).
-  template <typename TemplateDeclish>
-  uint64_t SemanticHashTemplateDeclish(const TemplateDeclish *Decl);
+  /// \brief Handle the file-level comments for `Id` with node ID `FileId`.
+  void HandleFileLevelComments(clang::FileID Id,
+                               const GraphObserver::NodeId& FileNode);
 
-  /// \brief Builds a semantic hash of the given `TemplateArgumentList`.
-  uint64_t SemanticHash(const clang::TemplateArgumentList *TAL);
+  /// \brief Emit data for `Comment` that documents `DocumentedNode`, using
+  /// `DC` for lookups.
+  void VisitComment(const clang::RawComment* Comment,
+                    const clang::DeclContext* DC,
+                    const GraphObserver::NodeId& DocumentedNode);
 
-  /// \brief Builds a semantic hash of the given `TemplateArgument`.
-  uint64_t SemanticHash(const clang::TemplateArgument &TA);
-
-  /// \brief Builds a semantic hash of the given `TemplateName`.
-  uint64_t SemanticHash(const clang::TemplateName &TN);
-
-  /// \brief Builds a semantic hash of the given `Type`, such that
-  /// if T and T' are similar types, SH(T) == SH(T'). Note that the type is
-  /// always canonicalized before its hash is taken.
-  uint64_t SemanticHash(const clang::QualType &T);
-
-  /// \brief Builds a semantic hash of the given `RecordDecl`, such that
-  /// if R and R' are similar records, SH(R) == SH(R'). This notion of
-  /// similarity is meant to join together definitions copied and pasted
-  /// across different translation units. As it is at best an approximation,
-  /// it should be paired with the spelled-out name of the object being declared
-  /// to form an identifying token.
-  uint64_t SemanticHash(const clang::RecordDecl *RD);
-
-  /// \brief Builds a semantic hash of the given `EnumDecl`, such that
-  /// if E and E' are similar records, SH(E) == SH(E'). This notion of
-  /// similarity is meant to join together definitions copied and pasted
-  /// across different translation units. As it is at best an approximation,
-  /// it should be paired with the spelled-out name of the object being declared
-  /// to form an identifying token.
-  uint64_t SemanticHash(const clang::EnumDecl *ED);
-
-  /// \brief Gets a format string for `ND`.
-  std::string GetFormat(const clang::NamedDecl *ND);
-
-  /// \brief Attempts to add a format string representation of `ND` to
-  /// `Ostream`.
-  /// \return true on success; false on failure.
-  bool AddFormatToStream(llvm::raw_string_ostream &Ostream,
-                         const clang::NamedDecl *ND);
+  /// \brief Emit data for attributes attached to `Decl`, whose `NodeId`
+  /// is `TargetNode`.
+  void VisitAttributes(const clang::Decl* Decl,
+                       const GraphObserver::NodeId& TargetNode);
 
   /// \brief Attempts to find the ID of the first parent of `Decl` for
-  /// generating a format string.
-  MaybeFew<GraphObserver::NodeId> GetParentForFormat(const clang::Decl *D);
+  /// attaching a `childof` relationship.
+  absl::optional<GraphObserver::NodeId> GetDeclChildOf(const clang::Decl* D);
 
   /// \brief Attempts to add some representation of `ND` to `Ostream`.
   /// \return true on success; false on failure.
-  bool AddNameToStream(llvm::raw_string_ostream &Ostream,
-                       const clang::NamedDecl *ND);
+  bool AddNameToStream(llvm::raw_string_ostream& Ostream,
+                       const clang::NamedDecl* ND);
 
-  MaybeFew<GraphObserver::NodeId>
-  ApplyBuiltinTypeConstructor(const char *BuiltinName,
-                              const MaybeFew<GraphObserver::NodeId> &Param);
-
-  /// \brief Ascribes a type to `AscribeTo`.
-  /// \param Type The `TypeLoc` referring to the type
-  /// \param DType A possibly deduced type (or simply Type->getType()).
-  /// \param AscribeTo The node to which the type should be ascribed.
+  /// \brief Assign `ND` (whose node ID is `TargetNode`) a USR if USRs are
+  /// enabled.
   ///
-  /// `auto` does not update TypeSourceInfo records after deduction, so
-  /// a deduced `auto` in the source text will appear to be undeduced.
-  /// In this case, it's useful to query the object being ascribed for its
-  /// unlocated QualType, as this does get updated.
-  void AscribeSpelledType(const clang::TypeLoc &Type,
-                          const clang::QualType &DType,
-                          const GraphObserver::NodeId &AscribeTo);
+  /// USRs are added only for NamedDecls that:
+  ///   * are not under implicit template instantiations
+  ///   * are not in a DeclContext inside a function body
+  ///   * can actually be assigned USRs from Clang
+  ///
+  /// Similar to the way we deal with JVM names, the corpus, path,
+  /// and root fields of a usr vname are cleared. Clients are permitted
+  /// to write their own USR tickets. The USR value itself is encoded
+  /// in capital hex (to match Clang's own internal USR stringification,
+  /// modulo the configurable size of the SHA1 prefix).
+  void AssignUSR(const GraphObserver::NodeId& TargetNode,
+                 const clang::NamedDecl* ND);
 
-  /// \brief Returns the parents of the given node, along with the index
+  /// Assigns a USR to an alias.
+  void AssignUSR(const GraphObserver::NameId& TargetName,
+                 const GraphObserver::NodeId& AliasedType,
+                 const clang::NamedDecl* ND) {
+    AssignUSR(Observer.nodeIdForTypeAliasNode(TargetName, AliasedType), ND);
+  }
+
+  GraphObserver::NodeId ApplyBuiltinTypeConstructor(
+      const char* BuiltinName, const GraphObserver::NodeId& Param);
+
+  /// \brief Returns the parent of the given node, along with the index
   /// at which the node appears underneath each parent.
   ///
   /// Note that this will lazily compute the parents of all nodes
@@ -702,40 +797,45 @@ private:
   /// 'NodeT' can be one of Decl, Stmt, Type, TypeLoc,
   /// NestedNameSpecifier or NestedNameSpecifierLoc.
   template <typename NodeT>
-  IndexedParentVector getIndexedParents(const NodeT &Node) {
-    return getIndexedParents(
-        clang::ast_type_traits::DynTypedNode::create(Node));
+  const IndexedParent* getIndexedParent(const NodeT& Node) {
+    return getIndexedParent(clang::ast_type_traits::DynTypedNode::create(Node));
   }
 
-  IndexedParentVector
-  getIndexedParents(const clang::ast_type_traits::DynTypedNode &Node);
+  /// \return true if `Decl` and all of the nodes underneath it are prunable.
+  ///
+  /// A subtree is prunable if it's "the same" in all possible indexer runs.
+  /// This excludes, for example, certain template instantiations.
+  bool declDominatesPrunableSubtree(const clang::Decl* Decl);
+
+  const IndexedParent* getIndexedParent(
+      const clang::ast_type_traits::DynTypedNode& Node);
+
+  /// Initializes AllParents, if necessary, and then returns a pointer to it.
+  const IndexedParentMap* getAllParents();
+
   /// A map from memoizable DynTypedNodes to their parent nodes
   /// and their child indices with respect to those parents.
   /// Filled on the first call to `getIndexedParents`.
   std::unique_ptr<IndexedParentMap> AllParents;
 
-  /// \brief Deallocates `AllParents`.
-  void deleteAllParents();
-
   /// Records information about the template `Template` wrapping the node
   /// `BodyId`, including the edge linking the template and its body. Returns
   /// the `NodeId` for the dominating template.
   template <typename TemplateDeclish>
-  GraphObserver::NodeId RecordTemplate(const TemplateDeclish *Template,
-                                       const GraphObserver::NodeId &BodyId);
+  GraphObserver::NodeId RecordTemplate(
+      const TemplateDeclish* Decl, const GraphObserver::NodeId& BodyDeclNode);
 
-  /// \brief Fills `ArgNodeIds` with pointers to `NodeId`s for a template
-  /// argument list.
-  /// \param `ArgsAsWritten` Use this argument list if it isn't null.
-  /// \param `Args` Use this argument list if `ArgsAsWritten` is null.
-  /// \param `ArgIds` Vector into which pointers in `ArgNodeIds` will point.
-  /// \param `ArgNodeIds` Vector of pointers to the result type list.
-  /// \return true on success; if false, `ArgNodeIds` is invalid.
-  bool BuildTemplateArgumentList(
-      const clang::ASTTemplateArgumentListInfo *ArgsAsWritten,
-      const clang::TemplateArgumentList *Args,
-      std::vector<GraphObserver::NodeId> &ArgIds,
-      std::vector<const GraphObserver::NodeId *> &ArgNodeIds);
+  /// Records information about the generic class by wrapping the node
+  /// `BodyId`. Returns the `NodeId` for the dominating generic type.
+  GraphObserver::NodeId RecordGenericClass(
+      const clang::ObjCInterfaceDecl* IDecl,
+      const clang::ObjCTypeParamList* TPL, const GraphObserver::NodeId& BodyId);
+
+  /// \brief Returns a vector of NodeId for each template argument.
+  absl::optional<std::vector<GraphObserver::NodeId>> BuildTemplateArgumentList(
+      llvm::ArrayRef<clang::TemplateArgument> Args);
+  absl::optional<std::vector<GraphObserver::NodeId>> BuildTemplateArgumentList(
+      llvm::ArrayRef<clang::TemplateArgumentLoc> Args);
 
   /// Dumps information about `TypeContext` to standard error when looking for
   /// an entry at (`Depth`, `Index`).
@@ -744,97 +844,207 @@ private:
   /// \brief Attempts to add a childof edge between DeclNode and its parent.
   /// \param Decl The (outer, in the case of a template) decl.
   /// \param DeclNode The (outer) `NodeId` for `Decl`.
-  void AddChildOfEdgeToDeclContext(const clang::Decl *Decl,
-                                   const GraphObserver::NodeId DeclNode);
+  void AddChildOfEdgeToDeclContext(const clang::Decl* Decl,
+                                   const GraphObserver::NodeId& DeclNode);
 
   /// Points at the inner node of the DeclContext, if it's a template.
   /// Otherwise points at the DeclContext as a Decl.
-  MaybeFew<GraphObserver::NodeId>
-  BuildNodeIdForDeclContext(const clang::DeclContext *DC);
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForDeclContext(
+      const clang::DeclContext* DC);
+
+  /// Points at the tapp node for a DeclContext, if it's an implicit template
+  /// instantiation. Otherwise behaves as `BuildNodeIdForDeclContext`.
+  absl::optional<GraphObserver::NodeId> BuildNodeIdForRefToDeclContext(
+      const clang::DeclContext* DC);
 
   /// Avoid regenerating type node IDs and keep track of where we are while
   /// generating node IDs for recursive types. The key is opaque and
   /// makes sense only within the implementation of this class.
-  std::unordered_map<int64_t, MaybeFew<GraphObserver::NodeId>> TypeNodes;
+  TypeMap<NodeSet> TypeNodes;
 
-  /// The current type variable context for the visitor (indexed by depth).
-  std::vector<clang::TemplateParameterList *> TypeContext;
-
-  /// At least 1 NodeId.
-  using SomeNodes = llvm::SmallVector<GraphObserver::NodeId, 1>;
-
-  /// A stack of ID groups to use when assigning blame for references (such as
-  /// function calls).
-  std::vector<SomeNodes> BlameStack;
-
-  /// Blames a call to `Callee` at `Range` on everything at the top of
-  /// `BlameStack` (or does nothing if there's nobody to blame).
-  void RecordCallEdges(const GraphObserver::Range &Range,
-                       const GraphObserver::NodeId &Callee);
-
-  /// \brief The current context for constructing `GraphObserver::Range`s.
+  /// \brief Visit an Expr that refers to some NamedDecl.
   ///
-  /// This is used whenever we enter a context where a section of source
-  /// code might have different meaning depending on assignments to
-  /// type variables (or, potentially eventually, preprocessor variables).
-  /// The `RangeContext` does not need to be extended when the meaning of
-  /// a section of code (given the current context) is unambiguous; for example,
-  /// the programmer must write down explicit specializations of template
-  /// classes (so they have distinct ranges), but the programmer does *not*
-  /// write down implicit specializations (so the context must be extended to
-  /// give them distinct ranges).
-  std::vector<GraphObserver::NodeId> RangeContext;
+  /// DeclRefExpr and ObjCIvarRefExpr are similar entities and can be processed
+  /// in the same way but do not have a useful common ancestry.
+  bool VisitDeclRefOrIvarRefExpr(const clang::Expr* Expr,
+                                 const clang::NamedDecl* const FoundDecl,
+                                 clang::SourceLocation SL,
+                                 bool IsImplicit = false);
+
+  /// \brief Connect a NodeId to the super and implemented protocols for a
+  /// ObjCInterfaceDecl.
+  ///
+  /// Helper method used to connect an interface to the super and protocols it
+  /// implements. It is also used to connect the interface implementation to
+  /// these nodes as well. In that case, the interface implementation node is
+  /// passed in as the first argument and the interface decl is passed in as the
+  /// second.
+  ///
+  /// \param BodyDeclNode The node to connect to the super and protocols for
+  /// the interface. This may be a interface decl node or an interface impl
+  /// node.
+  /// \param IFace The interface decl to use to look up the super and
+  //// protocols.
+  void ConnectToSuperClassAndProtocols(const GraphObserver::NodeId BodyDeclNode,
+                                       const clang::ObjCInterfaceDecl* IFace);
+  void ConnectToProtocols(const GraphObserver::NodeId BodyDeclNode,
+                          clang::ObjCProtocolList::loc_iterator locStart,
+                          clang::ObjCProtocolList::loc_iterator locEnd,
+                          clang::ObjCProtocolList::iterator itStart,
+                          clang::ObjCProtocolList::iterator itEnd);
+
+  /// \brief Connect a parameter to a function decl.
+  ///
+  /// For FunctionDecl and ObjCMethodDecl, this connects the parameters to the
+  /// function/method decl.
+  /// \param Decl This should be a FunctionDecl or ObjCMethodDecl.
+  void ConnectParam(const clang::Decl* Decl,
+                    const GraphObserver::NodeId& FuncNode,
+                    bool IsFunctionDefinition, const unsigned int ParamNumber,
+                    const clang::ParmVarDecl* Param, bool DeclIsImplicit);
+
+  /// \brief Draw the completes edge from a Decl to each of its redecls.
+  void RecordCompletesForRedecls(const clang::Decl* Decl,
+                                 const clang::SourceRange& NameRange,
+                                 const GraphObserver::NodeId& DeclNode);
+
+  /// \brief Draw an extends/category edge from the category to the class the
+  /// category is extending.
+  ///
+  /// For example, @interface A (Cat) ... We draw an extends edge from the
+  /// ObjCCategoryDecl for Cat to the ObjCInterfaceDecl for A.
+  ///
+  /// \param DeclNode The node for the category (impl or decl).
+  /// \param IFace The class interface for class we are adding a category to.
+  void ConnectCategoryToBaseClass(const GraphObserver::NodeId& DeclNode,
+                                  const clang::ObjCInterfaceDecl* IFace);
+
+  void LogErrorWithASTDump(const std::string& msg,
+                           const clang::Decl* Decl) const;
+  void LogErrorWithASTDump(const std::string& msg,
+                           const clang::Expr* Expr) const;
+
+  /// \brief This is used to handle the visitation of a clang::TypedefDecl
+  /// or a clang::TypeAliasDecl.
+  bool VisitCTypedef(const clang::TypedefNameDecl* Decl);
+
+  /// \brief Find the implementation for `MD`. If `MD` is a definition, `MD` is
+  /// returned. Otherwise, the method tries to find the implementation by
+  /// looking through the interface and its implementation. If a method
+  /// implementation is found, it is returned otherwise `MD` is returned.
+  const clang::ObjCMethodDecl* FindMethodDefn(
+      const clang::ObjCMethodDecl* MD, const clang::ObjCInterfaceDecl* I);
+
+  void VisitObjCInterfaceDeclComment(
+      const clang::ObjCInterfaceDecl* Decl, const clang::RawComment* Comment,
+      const clang::DeclContext* DCxt,
+      absl::optional<GraphObserver::NodeId> DCID);
+
+  void VisitRecordDeclComment(const clang::RecordDecl* Decl,
+                              const clang::RawComment* Comment,
+                              const clang::DeclContext* DCxt,
+                              absl::optional<GraphObserver::NodeId> DCID);
 
   /// \brief Maps known Decls to their NodeIds.
-  llvm::DenseMap<const clang::Decl *, GraphObserver::NodeId> DeclToNodeId;
+  llvm::DenseMap<const clang::Decl*, GraphObserver::NodeId> DeclToNodeId;
 
-  /// \brief Maps EnumDecls to semantic hashes.
-  llvm::DenseMap<const clang::EnumDecl *, uint64_t> EnumToHash;
+  /// \brief Used for calculating semantic hashes.
+  SemanticHash Hash{
+      [this](const clang::Decl* Decl) {
+        return BuildNameIdForDecl(Decl).ToString();
+      },
+      // These enums are intentionally compatible.
+      static_cast<SemanticHash::OnUnimplemented>(IgnoreUnimplemented)};
 
   /// \brief Enabled library-specific callbacks.
-  const LibrarySupports &Supports;
+  const LibrarySupports& Supports;
 
   /// \brief The `Sema` instance to use.
-  clang::Sema &Sema;
+  clang::Sema& Sema;
+
+  /// \brief The cache to use to generate signatures.
+  MarkedSourceCache MarkedSources;
+
+  /// \return true if we should stop indexing.
+  std::function<bool()> ShouldStopIndexing;
+
+  /// \brief The active indexing job.
+  std::unique_ptr<IndexJob> Job;
+
+  /// \brief The controlling worklist.
+  std::unique_ptr<IndexerWorklist> Worklist;
+
+  /// \brief Comments we've already visited.
+  std::unordered_set<const clang::RawComment*> VisitedComments;
+
+  /// \brief The number of (raw) bytes to use to represent a USR. If 0,
+  /// no USRs will be recorded.
+  int UsrByteSize = 0;
 };
 
 /// \brief An `ASTConsumer` that passes events to a `GraphObserver`.
 class IndexerASTConsumer : public clang::SemaConsumer {
-public:
-  explicit IndexerASTConsumer(GraphObserver *GO, BehaviorOnUnimplemented B,
-                              BehaviorOnTemplates T, Verbosity V,
-                              const LibrarySupports &S)
-      : Observer(GO), IgnoreUnimplemented(B), TemplateMode(T), Verbosity(V),
-        Supports(S) {}
+ public:
+  explicit IndexerASTConsumer(
+      GraphObserver* GO, BehaviorOnUnimplemented B, BehaviorOnTemplates T,
+      Verbosity V, BehaviorOnFwdDeclComments ObjC,
+      BehaviorOnFwdDeclComments Cpp, const LibrarySupports& S,
+      std::function<bool()> ShouldStopIndexing,
+      std::function<std::unique_ptr<IndexerWorklist>(IndexerASTVisitor*)>
+          CreateWorklist,
+      int UsrByteSize)
+      : Observer(GO),
+        IgnoreUnimplemented(B),
+        TemplateMode(T),
+        Verbosity(V),
+        ObjCFwdDocs(ObjC),
+        CppFwdDocs(Cpp),
+        Supports(S),
+        ShouldStopIndexing(std::move(ShouldStopIndexing)),
+        CreateWorklist(std::move(CreateWorklist)),
+        UsrByteSize(UsrByteSize) {}
 
-  void HandleTranslationUnit(clang::ASTContext &Context) override {
+  void HandleTranslationUnit(clang::ASTContext& Context) override {
     CHECK(Sema != nullptr);
     IndexerASTVisitor Visitor(Context, IgnoreUnimplemented, TemplateMode,
-                              Verbosity, Supports, *Sema, Observer);
+                              Verbosity, ObjCFwdDocs, CppFwdDocs, Supports,
+                              *Sema, ShouldStopIndexing, Observer, UsrByteSize);
     {
       ProfileBlock block(Observer->getProfilingCallback(), "traverse_tu");
-      Visitor.TraverseDecl(Context.getTranslationUnitDecl());
+      Visitor.Work(Context.getTranslationUnitDecl(), CreateWorklist(&Visitor));
     }
   }
 
-  void InitializeSema(clang::Sema &S) override { Sema = &S; }
+  void InitializeSema(clang::Sema& S) override { Sema = &S; }
 
   void ForgetSema() override { Sema = nullptr; }
 
-private:
-  GraphObserver *const Observer;
+ private:
+  GraphObserver* const Observer;
   /// Whether we should stop on missing cases or continue on.
   BehaviorOnUnimplemented IgnoreUnimplemented;
   /// Whether we should visit template instantiations.
   BehaviorOnTemplates TemplateMode;
   /// Whether we should emit all data.
   enum Verbosity Verbosity;
+  /// Should we emit documentation for forward class decls in ObjC?
+  BehaviorOnFwdDeclComments ObjCFwdDocs;
+  /// Should we emit documentation for forward decls in C++?
+  BehaviorOnFwdDeclComments CppFwdDocs;
   /// Which library supports are enabled.
-  const LibrarySupports &Supports;
+  const LibrarySupports& Supports;
   /// The active Sema instance.
-  clang::Sema *Sema;
+  clang::Sema* Sema;
+  /// \return true if we should stop indexing.
+  std::function<bool()> ShouldStopIndexing;
+  /// \return a new worklist for the given visitor.
+  std::function<std::unique_ptr<IndexerWorklist>(IndexerASTVisitor*)>
+      CreateWorklist;
+  /// \brief The number of (raw) bytes to use to represent a USR. If 0,
+  /// no USRs will be recorded.
+  int UsrByteSize = 0;
 };
 
-} // namespace kythe
+}  // namespace kythe
 
-#endif // KYTHE_CXX_INDEXER_CXX_INDEXER_AST_HOOKS_H_
+#endif  // KYTHE_CXX_INDEXER_CXX_INDEXER_AST_HOOKS_H_

@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,41 +18,39 @@
 
 #include <sstream>
 
+#include "kythe/cxx/common/file_utils.h"
 #include "verifier.h"
 
 namespace kythe {
 namespace verifier {
 
-void EVar::Dump(const SymbolTable &symbol_table, PrettyPrinter *printer) {
-  printer->Print("EVar(");
-  printer->Print(this);
-  printer->Print(" = ");
-  if (AstNode *node = current()) {
+void EVar::Dump(const SymbolTable& symbol_table, PrettyPrinter* printer) {
+  if (AstNode* node = current()) {
     node->Dump(symbol_table, printer);
   } else {
-    printer->Print("<nullptr>");
-  }
-  printer->Print(")");
-}
-
-void Identifier::Dump(const SymbolTable &symbol_table, PrettyPrinter *printer) {
-  const auto &text = symbol_table.text(symbol_);
-  if (text.size()) {
-    printer->Print(text);
-  } else {
-    printer->Print("\"\"");
+    printer->Print("<null>");
   }
 }
 
-void Range::Dump(const SymbolTable &symbol_table, PrettyPrinter *printer) {
+void Identifier::Dump(const SymbolTable& symbol_table, PrettyPrinter* printer) {
+  printer->Print(symbol_table.PrettyText(symbol_));
+}
+
+void Range::Dump(const SymbolTable& symbol_table, PrettyPrinter* printer) {
   printer->Print("Range(");
+  printer->Print(symbol_table.PrettyText(corpus_));
+  printer->Print(",");
+  printer->Print(symbol_table.PrettyText(root_));
+  printer->Print(",");
+  printer->Print(symbol_table.PrettyText(path_));
+  printer->Print(",");
   printer->Print(std::to_string(begin_));
   printer->Print(",");
   printer->Print(std::to_string(end_));
   printer->Print(")");
 }
 
-void Tuple::Dump(const SymbolTable &symbol_table, PrettyPrinter *printer) {
+void Tuple::Dump(const SymbolTable& symbol_table, PrettyPrinter* printer) {
   printer->Print("(");
   for (size_t v = 0; v < element_count_; ++v) {
     elements_[v]->Dump(symbol_table, printer);
@@ -63,22 +61,24 @@ void Tuple::Dump(const SymbolTable &symbol_table, PrettyPrinter *printer) {
   printer->Print(")");
 }
 
-void App::Dump(const SymbolTable &symbol_table, PrettyPrinter *printer) {
-  printer->Print("App(");
+void App::Dump(const SymbolTable& symbol_table, PrettyPrinter* printer) {
   lhs_->Dump(symbol_table, printer);
-  printer->Print(", ");
+  // rhs_ should be a Tuple, which outputs "(...)" around itself.
   rhs_->Dump(symbol_table, printer);
-  printer->Print(")");
 }
 
-bool AssertionParser::ParseInlineRuleString(const std::string &content,
-                                            const std::string &fake_filename,
-                                            const char *comment_prefix) {
-  lex_check_against_ = comment_prefix;
+bool AssertionParser::ParseInlineRuleString(const std::string& content,
+                                            const std::string& fake_filename,
+                                            Symbol path, Symbol root,
+                                            Symbol corpus,
+                                            const RE2& goal_comment_regex) {
+  path_ = path;
+  root_ = root;
+  corpus_ = corpus;
   had_errors_ = false;
   files_.push_back(fake_filename);
-  ResetLexCheck();
-  ScanBeginString(content, trace_lex_);
+  ResetLine();
+  ScanBeginString(goal_comment_regex, content, trace_lex_);
   yy::AssertionParserImpl parser(*this);
   parser.set_debug_level(trace_parse_);
   int result = parser.parse();
@@ -86,13 +86,17 @@ bool AssertionParser::ParseInlineRuleString(const std::string &content,
   return result == 0 && !had_errors_;
 }
 
-bool AssertionParser::ParseInlineRuleFile(const std::string &filename,
-                                          const char *comment_prefix) {
-  lex_check_against_ = comment_prefix;
+bool AssertionParser::ParseInlineRuleFile(const std::string& filename,
+                                          Symbol path, Symbol root,
+                                          Symbol corpus,
+                                          const RE2& goal_comment_regex) {
+  path_ = path;
+  root_ = root;
+  corpus_ = corpus;
   files_.push_back(filename);
   had_errors_ = false;
-  ResetLexCheck();
-  ScanBeginFile(trace_lex_);
+  ResetLine();
+  ScanBeginFile(goal_comment_regex, trace_lex_);
   yy::AssertionParserImpl parser(*this);
   parser.set_debug_level(trace_parse_);
   int result = parser.parse();
@@ -100,20 +104,32 @@ bool AssertionParser::ParseInlineRuleFile(const std::string &filename,
   return result == 0 && !had_errors_;
 }
 
-void AssertionParser::Error(const yy::location &location,
-                            const std::string &message) {
+void AssertionParser::Error(const yy::location& location,
+                            const std::string& message) {
   // TODO(zarko): replace with a PrettyPrinter
   std::cerr << location << ": " << message << std::endl;
   had_errors_ = true;
 }
 
-void AssertionParser::Error(const std::string &message) {
+void AssertionParser::Error(const std::string& message) {
   // TODO(zarko): replace with a PrettyPrinter
   std::cerr << "When trying " << file() << ": " << message << std::endl;
   had_errors_ = true;
 }
 
-AssertionParser::AssertionParser(Verifier *verifier, bool trace_lex,
+bool AssertionParser::CheckForSingletonEVars() {
+  bool old_had_errors = had_errors_;
+  for (const auto& singleton : singleton_evars_) {
+    Error(singleton.first->location(),
+          "singleton variable " +
+              verifier_.symbol_table()->text(singleton.second) +
+              " used only here");
+  }
+  had_errors_ = old_had_errors;
+  return !singleton_evars_.empty();
+}
+
+AssertionParser::AssertionParser(Verifier* verifier, bool trace_lex,
                                  bool trace_parse)
     : verifier_(*verifier),
       arena_(verifier->arena()),
@@ -122,7 +138,7 @@ AssertionParser::AssertionParser(Verifier *verifier, bool trace_lex,
   groups_.push_back(GoalGroup{GoalGroup::kNoneMayFail});
 }
 
-bool AssertionParser::Unescape(const char *yytext, std::string *out) {
+bool AssertionParser::Unescape(const char* yytext, std::string* out) {
   if (out == nullptr || *yytext != '\"') {
     return false;
   }
@@ -152,55 +168,62 @@ bool AssertionParser::Unescape(const char *yytext, std::string *out) {
   return (current == '\"' && *yytext == '\0');
 }
 
-void AssertionParser::ResetLexCheck() {
-  lex_check_buffer_size_ = 0;
-  line_.clear();
-}
+void AssertionParser::ResetLine() { line_.clear(); }
 
-void AssertionParser::PushLocationSpec(const std::string &for_token) {
+void AssertionParser::PushLocationSpec(const std::string& for_token) {
   location_spec_stack_.emplace_back(LocationSpec{for_token, -1, false, true});
 }
 
-void AssertionParser::PushRelativeLocationSpec(const std::string &for_token,
-                                               const std::string &relative) {
+void AssertionParser::PushRelativeLocationSpec(const std::string& for_token,
+                                               const std::string& relative) {
   location_spec_stack_.emplace_back(
       LocationSpec{for_token, atoi(relative.c_str()), false, true});
 }
 
-void AssertionParser::PushAbsoluteLocationSpec(const std::string &for_token,
-                                               const std::string &absolute) {
+void AssertionParser::PushAbsoluteLocationSpec(const std::string& for_token,
+                                               const std::string& absolute) {
   location_spec_stack_.emplace_back(
       LocationSpec{for_token, atoi(absolute.c_str()), true, true});
 }
 
-void AssertionParser::SetTopLocationSpecMatchNumber(const std::string &number) {
+void AssertionParser::SetTopLocationSpecMatchNumber(const std::string& number) {
   if (!location_spec_stack_.empty()) {
+    // number is "#"{blank}*{int}
     location_spec_stack_.back().must_be_unambiguous = false;
-    location_spec_stack_.back().match_number = atoi(number.c_str());
+    location_spec_stack_.back().match_number = atoi(number.c_str() + 1);
   }
 }
 
-Identifier *AssertionParser::PathIdentifierFor(
-    const yy::location &location, const std::string &path_frag,
-    const std::string &default_root) {
-  if (path_frag.size() == 0) {
+Identifier* AssertionParser::PathIdentifierFor(
+    const yy::location& location, const std::string& path_frag,
+    const std::string& default_root) {
+  if (path_frag.empty()) {
     return verifier_.IdentifierFor(location, "/");
-  } else if (path_frag[0] != '/') {
-    return verifier_.IdentifierFor(location, default_root + path_frag);
+  }
+  std::string sigil;
+  if (path_frag[0] == '#' || path_frag[0] == '%') {
+    sigil = path_frag[0];
+    if (path_frag.size() == 1) {
+      return verifier_.IdentifierFor(location, sigil);
+    }
+  }
+  if (path_frag[sigil.size()] != '/') {
+    return verifier_.IdentifierFor(
+        location, sigil + default_root + path_frag.substr(sigil.size()));
   }
   return verifier_.IdentifierFor(location, path_frag);
 }
 
-AstNode *AssertionParser::CreateEqualityConstraint(const yy::location &location,
-                                                   AstNode *lhs, AstNode *rhs) {
+AstNode* AssertionParser::CreateEqualityConstraint(const yy::location& location,
+                                                   AstNode* lhs, AstNode* rhs) {
   return verifier_.MakePredicate(location, verifier_.eq_id(), {lhs, rhs});
 }
 
-AstNode *AssertionParser::CreateSimpleEdgeFact(const yy::location &location,
-                                               AstNode *edge_lhs,
-                                               const std::string &literal_kind,
-                                               AstNode *edge_rhs,
-                                               AstNode *ordinal) {
+AstNode* AssertionParser::CreateSimpleEdgeFact(const yy::location& location,
+                                               AstNode* edge_lhs,
+                                               const std::string& literal_kind,
+                                               AstNode* edge_rhs,
+                                               AstNode* ordinal) {
   if (ordinal) {
     return verifier_.MakePredicate(
         location, verifier_.fact_id(),
@@ -214,20 +237,21 @@ AstNode *AssertionParser::CreateSimpleEdgeFact(const yy::location &location,
   }
 }
 
-AstNode *AssertionParser::CreateSimpleNodeFact(const yy::location &location,
-                                               AstNode *lhs,
-                                               const std::string &literal_key,
-                                               AstNode *value) {
+AstNode* AssertionParser::CreateSimpleNodeFact(const yy::location& location,
+                                               AstNode* lhs,
+                                               const std::string& literal_key,
+                                               AstNode* value) {
   return verifier_.MakePredicate(
       location, verifier_.fact_id(),
       {lhs, verifier_.empty_string_id(), verifier_.empty_string_id(),
        PathIdentifierFor(location, literal_key, "/kythe/"), value});
 }
 
-AstNode *AssertionParser::CreateInspect(const yy::location &location,
-                                        const std::string &inspect_id,
-                                        AstNode *to_inspect) {
-  if (EVar *evar = to_inspect->AsEVar()) {
+AstNode* AssertionParser::CreateInspect(const yy::location& location,
+                                        const std::string& inspect_id,
+                                        AstNode* to_inspect) {
+  if (EVar* evar = to_inspect->AsEVar()) {
+    singleton_evars_.erase(evar);
     inspections_.emplace_back(inspect_id, evar, Inspection::Kind::EXPLICIT);
     return to_inspect;
   } else {
@@ -236,25 +260,27 @@ AstNode *AssertionParser::CreateInspect(const yy::location &location,
   }
 }
 
-AstNode *AssertionParser::CreateDontCare(const yy::location &location) {
+AstNode* AssertionParser::CreateDontCare(const yy::location& location) {
   return new (verifier_.arena()) EVar(location);
 }
 
-AstNode *AssertionParser::CreateAtom(const yy::location &location,
-                                     const std::string &for_token) {
-  if (for_token.size() && isupper(for_token[0])) {
+AstNode* AssertionParser::CreateAtom(const yy::location& location,
+                                     const std::string& for_token) {
+  if (!for_token.empty() && for_token[0] == '_') {
+    return CreateDontCare(location);
+  } else if (!for_token.empty() && isupper(for_token[0])) {
     return CreateEVar(location, for_token);
   } else {
     return CreateIdentifier(location, for_token);
   }
 }
 
-Identifier *AssertionParser::CreateIdentifier(const yy::location &location,
-                                              const std::string &for_text) {
+Identifier* AssertionParser::CreateIdentifier(const yy::location& location,
+                                              const std::string& for_text) {
   Symbol symbol = verifier_.symbol_table()->intern(for_text);
   const auto old_binding = identifier_context_.find(symbol);
   if (old_binding == identifier_context_.end()) {
-    Identifier *new_id = new (verifier_.arena()) Identifier(location, symbol);
+    Identifier* new_id = new (verifier_.arena()) Identifier(location, symbol);
     identifier_context_.emplace(symbol, new_id);
     return new_id;
   } else {
@@ -262,33 +288,35 @@ Identifier *AssertionParser::CreateIdentifier(const yy::location &location,
   }
 }
 
-EVar *AssertionParser::CreateEVar(const yy::location &location,
-                                  const std::string &for_token) {
+EVar* AssertionParser::CreateEVar(const yy::location& location,
+                                  const std::string& for_token) {
   Symbol symbol = verifier_.symbol_table()->intern(for_token);
   const auto old_binding = evar_context_.find(symbol);
   if (old_binding == evar_context_.end()) {
-    EVar *new_evar = new (verifier_.arena()) EVar(location);
+    EVar* new_evar = new (verifier_.arena()) EVar(location);
     evar_context_.emplace(symbol, new_evar);
     if (default_inspect_) {
       inspections_.emplace_back(for_token, new_evar,
                                 Inspection::Kind::IMPLICIT);
     }
+    singleton_evars_[new_evar] = symbol;
     return new_evar;
   } else {
+    singleton_evars_.erase(old_binding->second);
     return old_binding->second;
   }
 }
 
-bool AssertionParser::ValidateTopLocationSpec(const yy::location &location,
-                                              size_t *line_number,
-                                              bool *use_line_number,
-                                              bool *must_be_unambiguous,
-                                              int *match_number) {
-  if (!location_spec_stack_.size()) {
+bool AssertionParser::ValidateTopLocationSpec(const yy::location& location,
+                                              size_t* line_number,
+                                              bool* use_line_number,
+                                              bool* must_be_unambiguous,
+                                              int* match_number) {
+  if (location_spec_stack_.empty()) {
     Error(location, "No locations on location stack.");
     return verifier_.empty_string_id();
   }
-  const auto &spec = location_spec_stack_.back();
+  const auto& spec = location_spec_stack_.back();
   *must_be_unambiguous = spec.must_be_unambiguous;
   *match_number = spec.match_number;
   if (spec.line_offset == 0) {
@@ -309,17 +337,17 @@ bool AssertionParser::ValidateTopLocationSpec(const yy::location &location,
   return true;
 }
 
-AstNode *AssertionParser::CreateAnchorSpec(const yy::location &location) {
-  size_t line_number;
-  bool use_line_number;
-  bool must_be_unambiguous;
-  int match_number;
+AstNode* AssertionParser::CreateAnchorSpec(const yy::location& location) {
+  size_t line_number = -1;
+  bool use_line_number = false;
+  bool must_be_unambiguous = false;
+  int match_number = -1;
   if (!ValidateTopLocationSpec(location, &line_number, &use_line_number,
                                &must_be_unambiguous, &match_number)) {
     return verifier_.empty_string_id();
   }
-  const auto &spec = location_spec_stack_.back();
-  EVar *new_evar = new (verifier_.arena()) EVar(location);
+  const auto& spec = location_spec_stack_.back();
+  EVar* new_evar = new (verifier_.arena()) EVar(location);
   unresolved_locations_.push_back(UnresolvedLocation{
       new_evar, spec.spec, line_number, use_line_number, group_id(),
       UnresolvedLocation::Kind::kAnchor, must_be_unambiguous, match_number});
@@ -327,18 +355,18 @@ AstNode *AssertionParser::CreateAnchorSpec(const yy::location &location) {
   return new_evar;
 }
 
-AstNode *AssertionParser::CreateOffsetSpec(const yy::location &location,
+AstNode* AssertionParser::CreateOffsetSpec(const yy::location& location,
                                            bool at_end) {
-  size_t line_number;
-  bool use_line_number;
-  bool must_be_unambiguous;
-  int match_number;
+  size_t line_number = -1;
+  bool use_line_number = false;
+  bool must_be_unambiguous = false;
+  int match_number = -1;
   if (!ValidateTopLocationSpec(location, &line_number, &use_line_number,
                                &must_be_unambiguous, &match_number)) {
     return verifier_.empty_string_id();
   }
-  const auto &spec = location_spec_stack_.back();
-  EVar *new_evar = new (verifier_.arena()) EVar(location);
+  const auto& spec = location_spec_stack_.back();
+  EVar* new_evar = new (verifier_.arena()) EVar(location);
   unresolved_locations_.push_back(UnresolvedLocation{
       new_evar, spec.spec, line_number, use_line_number, group_id(),
       at_end ? UnresolvedLocation::Kind::kOffsetEnd
@@ -348,15 +376,16 @@ AstNode *AssertionParser::CreateOffsetSpec(const yy::location &location,
   return new_evar;
 }
 
-bool AssertionParser::ResolveLocations(const yy::location &end_of_line,
+bool AssertionParser::ResolveLocations(const yy::location& end_of_line,
                                        size_t offset_after_endline,
                                        bool end_of_file) {
   bool was_ok = true;
   std::vector<UnresolvedLocation> succ_lines;
-  for (auto &record : unresolved_locations_) {
-    EVar *evar = record.anchor_evar;
-    std::string &token = record.anchor_text;
+  for (auto& record : unresolved_locations_) {
+    EVar* evar = record.anchor_evar;
+    std::string& token = record.anchor_text;
     yy::location location = evar->location();
+    location.columns(token.size());
     if (record.use_line_number &&
         (record.line_number != end_of_line.begin.line)) {
       if (end_of_file) {
@@ -428,38 +457,23 @@ bool AssertionParser::ResolveLocations(const yy::location &end_of_line,
                                  location, verifier_.eq_id(),
                                  {new (verifier_.arena())
                                       Range(location, line_start + col,
-                                            line_start + col + token.size()),
+                                            line_start + col + token.size(),
+                                            path_, root_, corpus_),
                                   evar}));
         break;
     }
   }
   unresolved_locations_.swap(succ_lines);
-  ResetLexCheck();
+  ResetLine();
   return was_ok;
 }
 
-void AssertionParser::AppendToLine(const char *yytext) { line_.append(yytext); }
+void AssertionParser::AppendToLine(const char* yytext) { line_.append(yytext); }
 
-int AssertionParser::NextLexCheck(const char *yytext) {
-  char ch = yytext[0];
-  size_t max_len = lex_check_against_.size();
-  if (max_len == 0) {
-    return 1;
-  }
-  line_.push_back(ch);
-  if (lex_check_buffer_size_ == 0 && (ch == '\t' || ch == ' ')) {
-    return 0;
-  } else if (ch == lex_check_against_[lex_check_buffer_size_++]) {
-    return static_cast<size_t>(lex_check_buffer_size_) == max_len ? 1 : 0;
-  }
-  return -1;
-}
+void AssertionParser::PushNode(AstNode* node) { node_stack_.push_back(node); }
 
-void AssertionParser::PushNode(AstNode *node) { node_stack_.push_back(node); }
-
-AstNode **AssertionParser::PopNodes(size_t count) {
-  AstNode **nodes =
-      (AstNode **)verifier_.arena()->New(count * sizeof(AstNode *));
+AstNode** AssertionParser::PopNodes(size_t count) {
+  AstNode** nodes = (AstNode**)verifier_.arena()->New(count * sizeof(AstNode*));
   size_t start = node_stack_.size() - count;
   for (size_t c = 0; c < count; ++c) {
     nodes[c] = node_stack_[start + c];
@@ -468,12 +482,12 @@ AstNode **AssertionParser::PopNodes(size_t count) {
   return nodes;
 }
 
-void AssertionParser::AppendGoal(size_t group_id, AstNode *goal) {
+void AssertionParser::AppendGoal(size_t group_id, AstNode* goal) {
   assert(group_id < groups_.size());
   groups_[group_id].goals.push_back(goal);
 }
 
-void AssertionParser::EnterGoalGroup(const yy::location &location,
+void AssertionParser::EnterGoalGroup(const yy::location& location,
                                      bool negated) {
   if (inside_goal_group_) {
     Error(location, "It is not valid to enter nested goal groups.");
@@ -484,12 +498,68 @@ void AssertionParser::EnterGoalGroup(const yy::location &location,
       GoalGroup{negated ? GoalGroup::kSomeMustFail : GoalGroup::kNoneMayFail});
 }
 
-void AssertionParser::ExitGoalGroup(const yy::location &location) {
+void AssertionParser::ExitGoalGroup(const yy::location& location) {
   if (!inside_goal_group_) {
     Error(location, "You've left a goal group before you've entered it.");
     return;
   }
   inside_goal_group_ = false;
+}
+
+void AssertionParser::ScanBeginString(const RE2& goal_comment_regex,
+                                      const std::string& data,
+                                      bool trace_scanning) {
+  // Preprocess the input by adding a - to the left of every goal line and a
+  // . to the left of every non-goal line. From every goal line remove any
+  // character that is not part of the goal regex's capture group. This means
+  // that we don't have to push RE2 deeper into the lexer; it also preserves
+  // file locations for diagnostics (after taking into account the constant
+  // 1 offset).
+  std::string yy_buf;
+  size_t next_line_begin = 0;
+  auto append_line = [&](size_t line_end) {
+    re2::StringPiece match_region;
+    size_t line_length = line_end - next_line_begin;
+    auto is_goal = RE2::FullMatch(
+        re2::StringPiece(data.data() + next_line_begin, line_length),
+        goal_comment_regex, &match_region);
+    if (is_goal == 1) {
+      yy_buf.push_back('-');
+      size_t pre_pad = match_region.data() - data.data() - next_line_begin;
+      for (size_t s = 0; s < pre_pad; ++s) {
+        yy_buf.push_back(' ');
+      }
+      yy_buf.append(match_region.data(), match_region.size());
+      size_t post_pad = line_length - pre_pad - match_region.size();
+      for (size_t s = 0; s < post_pad; ++s) {
+        yy_buf.push_back(' ');
+      }
+    } else {
+      yy_buf.push_back('.');
+      yy_buf.append(data, next_line_begin, line_length);
+    }
+    if (line_end != data.size()) {
+      yy_buf.push_back('\n');
+    }
+    next_line_begin = line_end + 1;
+  };
+  auto endline = data.find('\n');
+  while (endline != std::string::npos) {
+    append_line(endline);
+    endline = data.find('\n', next_line_begin);
+  }
+  append_line(data.size());
+  SetScanBuffer(yy_buf, trace_scanning);
+}
+
+void AssertionParser::ScanBeginFile(const RE2& goal_comment_regex,
+                                    bool trace_scanning) {
+  if (file().empty() || file() == "-") {
+    Error("will not read goals from stdin");
+    exit(EXIT_FAILURE);
+  }
+  std::string buffer = LoadFileOrDie(file());
+  ScanBeginString(goal_comment_regex, buffer, trace_scanning);
 }
 
 }  // namespace verifier

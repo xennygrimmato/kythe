@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import java.io.Serializable;
 public class NullStatisticsCollector implements StatisticsCollector, Serializable {
   private static final long serialVersionUID = 7642617128987532613L;
 
-  private static NullStatisticsCollector instance = new NullStatisticsCollector();
+  private static final NullStatisticsCollector instance = new NullStatisticsCollector();
 
   /** Returns the single instance of the {@link StatisticsCollector} that ignores all statistics. */
   public static NullStatisticsCollector getInstance() {

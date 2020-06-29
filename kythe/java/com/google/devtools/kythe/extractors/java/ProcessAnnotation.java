@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,15 +16,25 @@
 
 package com.google.devtools.kythe.extractors.java;
 
-import com.google.devtools.kythe.common.FormattingLogger;
+import static com.google.auto.common.AnnotationMirrors.getAnnotationValue;
+import static com.google.auto.common.MoreElements.asType;
+
+import com.google.common.collect.ImmutableSet;
+import com.google.common.flogger.FluentLogger;
+import com.google.devtools.kythe.platform.shared.Metadata;
+import com.sun.tools.javac.code.Symbol.ClassSymbol;
 import com.sun.tools.javac.code.Symbol.TypeSymbol;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.Set;
 import javax.annotation.processing.AbstractProcessor;
 import javax.annotation.processing.RoundEnvironment;
 import javax.annotation.processing.SupportedAnnotationTypes;
 import javax.lang.model.SourceVersion;
+import javax.lang.model.element.AnnotationMirror;
+import javax.lang.model.element.Element;
 import javax.lang.model.element.TypeElement;
+import javax.tools.JavaFileObject;
 import javax.tools.JavaFileObject.Kind;
 import javax.tools.StandardLocation;
 
@@ -37,8 +47,10 @@ import javax.tools.StandardLocation;
 @SupportedAnnotationTypes(value = {"*"})
 public class ProcessAnnotation extends AbstractProcessor {
 
-  private static final FormattingLogger logger =
-      FormattingLogger.getLogger(ProcessAnnotation.class);
+  private static final FluentLogger logger = FluentLogger.forEnclosingClass();
+
+  private static final ImmutableSet<String> GENERATED_ANNOTATIONS =
+      ImmutableSet.of("javax.annotation.Generated", "javax.annotation.processing.Generated");
 
   UsageAsInputReportingFileManager fileManager;
 
@@ -73,9 +85,19 @@ public class ProcessAnnotation extends AbstractProcessor {
       } catch (IOException ex) {
         // We only log any IO exception here and do not cancel the whole processing because of an
         // exception in this stage.
-        logger.severefmt("Error in annotation processing: %s", ex.getMessage());
+        logger.atSevere().withCause(ex).log("Error in annotation processing");
       }
     }
+
+    for (String annotationName : GENERATED_ANNOTATIONS) {
+      TypeElement generatedType = processingEnv.getElementUtils().getTypeElement(annotationName);
+      if (generatedType == null) {
+        // javax.annotation.processing.Generated isn't available until Java 9
+        continue;
+      }
+      visitGeneratedElements(roundEnv, generatedType);
+    }
+
     // We must return false so normal processors run after us.
     return false;
   }
@@ -83,5 +105,50 @@ public class ProcessAnnotation extends AbstractProcessor {
   @Override
   public SourceVersion getSupportedSourceVersion() {
     return SourceVersion.latest();
+  }
+
+  private void visitGeneratedElements(RoundEnvironment roundEnv, TypeElement generatedElement) {
+    for (Element ae : roundEnv.getElementsAnnotatedWith(generatedElement)) {
+      String comments = getGeneratedComments(ae, generatedElement);
+      if (comments == null || !comments.startsWith(Metadata.ANNOTATION_COMMENT_PREFIX)) {
+        continue;
+      }
+      String annotationFile = comments.substring(Metadata.ANNOTATION_COMMENT_PREFIX.length());
+      if (ae instanceof ClassSymbol) {
+        ClassSymbol cs = (ClassSymbol) ae;
+        try {
+          String annotationPath = cs.sourcefile.toUri().resolve(annotationFile).getPath();
+          for (JavaFileObject file :
+              fileManager.getJavaFileForSources(Arrays.asList(annotationPath))) {
+            ((UsageAsInputReportingJavaFileObject) file).markUsed();
+          }
+        } catch (IllegalArgumentException ex) {
+          logger.atWarning().withCause(ex).log("Bad annotationFile: %s", annotationFile);
+        }
+      }
+    }
+  }
+
+  private static String getGeneratedComments(
+      Element annotatedElement, TypeElement generatedElement) {
+    AnnotationMirror mirror = getAnnotationMirror(annotatedElement, generatedElement);
+    if (mirror == null) {
+      return null;
+    }
+    Object value = getAnnotationValue(mirror, "comments").getValue();
+    if (value instanceof String) {
+      return (String) value;
+    }
+    return null;
+  }
+
+  private static AnnotationMirror getAnnotationMirror(Element element, TypeElement annotationType) {
+    for (AnnotationMirror annotationMirror : element.getAnnotationMirrors()) {
+      TypeElement annotationTypeElement = asType(annotationMirror.getAnnotationType().asElement());
+      if (annotationTypeElement.equals(annotationType)) {
+        return annotationMirror;
+      }
+    }
+    return null;
   }
 }

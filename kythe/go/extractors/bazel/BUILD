@@ -1,19 +1,37 @@
-load("//tools:build_rules/go.bzl", "go_package")
+load("//:visibility.bzl", "PUBLIC_VISIBILITY")
+load("//tools:build_rules/shims.bzl", "go_library", "go_test")
 
 package(default_visibility = ["//kythe:default_visibility"])
 
-go_package(
-    deps = [
-        "@go_protobuf//:proto",
-        "@go_shell//:shell",
-        "@go_x_net//:context",
-        "//kythe/go/extractors/golang",
-        "//kythe/go/extractors/govname",
-        "//kythe/go/platform/indexpack",
-        "//kythe/go/platform/kindex",
-        "//kythe/go/storage/vnameutil",
-        "//kythe/proto:analysis_proto_go",
-        "//kythe/proto:storage_proto_go",
-        "//third_party/bazel:extra_actions_base_proto_go",
+go_library(
+    name = "bazel",
+    srcs = [
+        "extractor.go",
+        "settings.go",
+        "utils.go",
     ],
+    visibility = [PUBLIC_VISIBILITY],
+    deps = [
+        "//kythe/go/platform/kindex",
+        "//kythe/go/platform/kzip",
+        "//kythe/go/util/ptypes",
+        "//kythe/go/util/vnameutil",
+        "//kythe/proto:analysis_go_proto",
+        "//kythe/proto:buildinfo_go_proto",
+        "//kythe/proto:storage_go_proto",
+        "//third_party/bazel:extra_actions_base_go_proto",
+        "@org_bitbucket_creachadair_stringset//:go_default_library",
+        "@com_github_golang_protobuf//proto:go_default_library",
+        "@org_golang_x_sync//errgroup:go_default_library",
+    ],
+)
+
+go_test(
+    name = "bazel_test",
+    size = "small",
+    srcs = [
+        "extractor_test.go",
+        "settings_test.go",
+    ],
+    library = ":bazel",
 )

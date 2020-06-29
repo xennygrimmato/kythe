@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,11 @@
 
 // Package pipeline implements an in-process pipeline to create a combined
 // filetree and xrefs serving table from a stream of GraphStore-ordered entries.
-package pipeline
+package pipeline // import "kythe.io/kythe/go/serving/pipeline"
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -28,24 +29,26 @@ import (
 
 	"kythe.io/kythe/go/services/filetree"
 	"kythe.io/kythe/go/services/graphstore"
-	"kythe.io/kythe/go/services/xrefs"
 	ftsrv "kythe.io/kythe/go/serving/filetree"
+	gsrv "kythe.io/kythe/go/serving/graph"
 	xsrv "kythe.io/kythe/go/serving/xrefs"
 	"kythe.io/kythe/go/serving/xrefs/assemble"
 	"kythe.io/kythe/go/storage/keyvalue"
 	"kythe.io/kythe/go/storage/stream"
 	"kythe.io/kythe/go/storage/table"
 	"kythe.io/kythe/go/util/disksort"
-	"kythe.io/kythe/go/util/schema"
+	"kythe.io/kythe/go/util/schema/edges"
+	"kythe.io/kythe/go/util/schema/facts"
+	"kythe.io/kythe/go/util/schema/nodes"
 	"kythe.io/kythe/go/util/sortutil"
+	"kythe.io/kythe/go/util/span"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
-	ftpb "kythe.io/kythe/proto/filetree_proto"
-	ipb "kythe.io/kythe/proto/internal_proto"
-	srvpb "kythe.io/kythe/proto/serving_proto"
-	spb "kythe.io/kythe/proto/storage_proto"
+	ftpb "kythe.io/kythe/proto/filetree_go_proto"
+	ipb "kythe.io/kythe/proto/internal_go_proto"
+	srvpb "kythe.io/kythe/proto/serving_go_proto"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
 // Options controls the behavior of pipeline.Run.
@@ -65,10 +68,6 @@ type Options struct {
 	// MaxShardSize is the maximum number of elements to keep in-memory before
 	// flushing an intermediary data shard to disk.
 	MaxShardSize int
-
-	// IOBufferSize is the size of the reading/writing buffers for the temporary
-	// file shards.
-	IOBufferSize int
 }
 
 func (o *Options) diskSorter(l sortutil.Lesser, m disksort.Marshaler) (disksort.Interface, error) {
@@ -77,15 +76,13 @@ func (o *Options) diskSorter(l sortutil.Lesser, m disksort.Marshaler) (disksort.
 		Marshaler:      m,
 		MaxInMemory:    o.MaxShardSize,
 		CompressShards: o.CompressShards,
-		IOBufferSize:   o.IOBufferSize,
 	})
 }
 
 const chBuf = 512
 
 type servingOutput struct {
-	xs  table.Proto
-	idx table.Inverted
+	xs table.Proto
 }
 
 // Run writes the xrefs and filetree serving tables to db based on the given
@@ -98,8 +95,7 @@ func Run(ctx context.Context, rd stream.EntryReader, db keyvalue.DB, opts *Optio
 	log.Println("Starting serving pipeline")
 
 	out := &servingOutput{
-		xs:  table.ProtoBatchParallel{&table.KVProto{DB: db}},
-		idx: &table.KVInverted{DB: db},
+		xs: &table.KVProto{DB: db},
 	}
 	rd = filterReverses(rd)
 
@@ -161,7 +157,7 @@ func combineNodesAndEdges(ctx context.Context, opts *Options, out *servingOutput
 	tree := filetree.NewMap()
 	rd := func(f func(*spb.Entry) error) error {
 		return rdIn(func(e *spb.Entry) error {
-			if e.FactName == schema.NodeKindFact && string(e.FactValue) == schema.FileKind {
+			if e.FactName == facts.NodeKind && string(e.FactValue) == nodes.File {
 				tree.AddFile(e.Source)
 				// TODO(schroederc): evict finished directories (based on GraphStore order)
 			}
@@ -174,13 +170,9 @@ func combineNodesAndEdges(ctx context.Context, opts *Options, out *servingOutput
 		return nil, err
 	}
 
-	bIdx := out.idx.Buffered()
 	if err := assemble.Sources(rd, func(src *ipb.Source) error {
-		return writePartialEdges(ctx, partialSorter, bIdx, src)
+		return writePartialEdges(ctx, partialSorter, src)
 	}); err != nil {
-		return nil, err
-	}
-	if err := bIdx.Flush(ctx); err != nil {
 		return nil, err
 	}
 
@@ -233,7 +225,21 @@ func writeFileTree(ctx context.Context, tree *filetree.Map, out table.Proto) err
 	for corpus, roots := range tree.M {
 		for root, dirs := range roots {
 			for path, dir := range dirs {
-				if err := buffer.Put(ctx, ftsrv.PrefixedDirKey(corpus, root, path), dir); err != nil {
+				fd := &srvpb.FileDirectory{}
+				for _, e := range dir.Entry {
+					kind := srvpb.FileDirectory_UNKNOWN
+					switch e.Kind {
+					case ftpb.DirectoryReply_FILE:
+						kind = srvpb.FileDirectory_FILE
+					case ftpb.DirectoryReply_DIRECTORY:
+						kind = srvpb.FileDirectory_DIRECTORY
+					}
+					fd.Entry = append(fd.Entry, &srvpb.FileDirectory_Entry{
+						Kind: kind,
+						Name: e.Name,
+					})
+				}
+				if err := buffer.Put(ctx, ftsrv.PrefixedDirKey(corpus, root, path), fd); err != nil {
 					return err
 				}
 			}
@@ -252,7 +258,7 @@ func writeFileTree(ctx context.Context, tree *filetree.Map, out table.Proto) err
 func filterReverses(rd stream.EntryReader) stream.EntryReader {
 	return func(f func(*spb.Entry) error) error {
 		return rd(func(e *spb.Entry) error {
-			if graphstore.IsNodeFact(e) || schema.EdgeDirection(e.EdgeKind) == schema.Forward {
+			if graphstore.IsNodeFact(e) || edges.IsForward(e.EdgeKind) {
 				return f(e)
 			}
 			return nil
@@ -260,7 +266,7 @@ func filterReverses(rd stream.EntryReader) stream.EntryReader {
 	}
 }
 
-func writePartialEdges(ctx context.Context, sorter disksort.Interface, idx table.BufferedInverted, src *ipb.Source) error {
+func writePartialEdges(ctx context.Context, sorter disksort.Interface, src *ipb.Source) error {
 	edges := assemble.PartialReverseEdges(src)
 	for _, pe := range edges {
 		if err := sorter.Add(pe); err != nil {
@@ -270,8 +276,8 @@ func writePartialEdges(ctx context.Context, sorter disksort.Interface, idx table
 	return nil
 }
 
-func writeCompletedEdges(ctx context.Context, edges disksort.Interface, e *srvpb.Edge) error {
-	if err := edges.Add(&srvpb.Edge{
+func writeCompletedEdges(ctx context.Context, output disksort.Interface, e *srvpb.Edge) error {
+	if err := output.Add(&srvpb.Edge{
 		Source:  &srvpb.Node{Ticket: e.Source.Ticket},
 		Kind:    e.Kind,
 		Ordinal: e.Ordinal,
@@ -279,9 +285,9 @@ func writeCompletedEdges(ctx context.Context, edges disksort.Interface, e *srvpb
 	}); err != nil {
 		return fmt.Errorf("error writing complete edge: %v", err)
 	}
-	if err := edges.Add(&srvpb.Edge{
+	if err := output.Add(&srvpb.Edge{
 		Source:  &srvpb.Node{Ticket: e.Target.Ticket},
-		Kind:    schema.MirrorEdge(e.Kind),
+		Kind:    edges.Mirror(e.Kind),
 		Ordinal: e.Ordinal,
 		Target:  assemble.FilterTextFacts(e.Source),
 	}); err != nil {
@@ -296,10 +302,10 @@ func writePagedEdges(ctx context.Context, edges <-chan *srvpb.Edge, out table.Pr
 	esb := &assemble.EdgeSetBuilder{
 		MaxEdgePageSize: opts.MaxPageSize,
 		Output: func(ctx context.Context, pes *srvpb.PagedEdgeSet) error {
-			return buffer.Put(ctx, xsrv.EdgeSetKey(pes.Source.Ticket), pes)
+			return buffer.Put(ctx, gsrv.EdgeSetKey(pes.Source.Ticket), pes)
 		},
 		OutputPage: func(ctx context.Context, ep *srvpb.EdgePage) error {
-			return buffer.Put(ctx, xsrv.EdgePageKey(ep.PageKey), ep)
+			return buffer.Put(ctx, gsrv.EdgePageKey(ep.PageKey), ep)
 		},
 	}
 
@@ -408,7 +414,7 @@ func writeDecorAndRefs(ctx context.Context, opts *Options, edges <-chan *srvpb.E
 	var (
 		curFile string
 		file    *srvpb.File
-		norm    *xrefs.Normalizer
+		norm    *span.Normalizer
 		decor   *srvpb.FileDecorations
 		targets map[string]*srvpb.Node
 	)
@@ -438,7 +444,8 @@ func writeDecorAndRefs(ctx context.Context, opts *Options, edges <-chan *srvpb.E
 				targets[n.Ticket] = n
 			}
 			if file == nil {
-				return errors.New("missing file for anchors")
+				log.Printf("Warning: no file set for anchor. fileTicket:[%v] curFile:[%v] fragment:[%v]", fileTicket, curFile, fragment)
+				return nil
 			}
 
 			// Reverse each fragment.Decoration to create a *ipb.CrossReference
@@ -461,7 +468,7 @@ func writeDecorAndRefs(ctx context.Context, opts *Options, edges <-chan *srvpb.E
 		} else {
 			decor.File = fragment.File
 			file = fragment.File
-			norm = xrefs.NewNormalizer(file.Text)
+			norm = span.NewNormalizer(file.Text)
 		}
 
 		return nil
@@ -599,12 +606,6 @@ func (refLesser) Less(a, b interface{}) bool {
 			return x.TargetAnchor == nil
 		} else if x.TargetAnchor.Kind == y.TargetAnchor.Kind {
 			if x.TargetAnchor.Span.Start.ByteOffset == y.TargetAnchor.Span.Start.ByteOffset {
-				if x.TargetAnchor.Span.End.ByteOffset == y.TargetAnchor.Span.End.ByteOffset {
-					if x.TargetAnchor.Parent == y.TargetAnchor.Parent {
-						return x.TargetAnchor.Ticket < y.TargetAnchor.Ticket
-					}
-					return x.TargetAnchor.Parent < y.TargetAnchor.Parent
-				}
 				return x.TargetAnchor.Span.End.ByteOffset < y.TargetAnchor.Span.End.ByteOffset
 			}
 			return x.TargetAnchor.Span.Start.ByteOffset < y.TargetAnchor.Span.Start.ByteOffset

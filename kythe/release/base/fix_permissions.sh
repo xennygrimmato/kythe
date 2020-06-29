@@ -1,5 +1,5 @@
 #!/bin/sh -e
-# Copyright 2015 Google Inc. All rights reserved.
+# Copyright 2015 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,4 +13,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 dir="${1:?missing path}"
-chown -R $(stat "$dir" -c %u:%g) "$dir"
+ug=$(ls -ld "$dir" | awk '{print $3":"$4}')
+chown -R "$ug" "$dir"

@@ -1,0 +1,5 @@
+/graphstore
+node_modules
+/tables
+*.js
+*.js.map

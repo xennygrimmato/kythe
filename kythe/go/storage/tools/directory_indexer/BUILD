@@ -1,4 +1,4 @@
-load("//tools:build_rules/go.bzl", "go_binary")
+load("//tools:build_rules/shims.bzl", "go_binary")
 
 package(default_visibility = ["//kythe:default_visibility"])
 
@@ -8,9 +8,8 @@ go_binary(
     deps = [
         "//kythe/go/platform/delimited",
         "//kythe/go/platform/vfs",
-        "//kythe/go/storage/vnameutil",
         "//kythe/go/util/flagutil",
-        "//kythe/proto:storage_proto_go",
-        "@go_x_net//:context",
+        "//kythe/go/util/vnameutil",
+        "//kythe/proto:storage_go_proto",
     ],
 )

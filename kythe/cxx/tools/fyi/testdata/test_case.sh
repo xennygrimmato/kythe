@@ -1,5 +1,5 @@
-#!/bin/bash -e
-# Copyright 2015 Google Inc. All rights reserved.
+#!/bin/bash
+# Copyright 2015 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,12 +21,12 @@
 #   compile_commands.json.in -- shared compilation database
 #     will substitute "OUT_DIR" for the test output directory
 
-set -o pipefail
+set -eo pipefail
+: ${FYI?:missing fyi}
 TEST_NAME="$1"
 BASE_DIR="$PWD/kythe/cxx/tools/fyi/testdata"
 TEST_JSON="${BASE_DIR}/${TEST_NAME}.json"
 TEST_EXPECTED="${BASE_DIR}/${TEST_NAME}.expected"
-FYI="kythe/cxx/tools/fyi/fyi"
 OUT_DIR="$TEST_TMPDIR"
 TEST_FILE="${OUT_DIR}/${TEST_NAME}"
 HAD_ERRORS=0

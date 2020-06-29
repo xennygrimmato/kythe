@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,8 +30,8 @@ import javax.tools.JavaFileObject.Kind;
 /** An implementation of {@link JavaFileStore} based on data from a {@link CompilationUnit}. */
 public class CompilationUnitBasedJavaFileStore implements JavaFileStore {
   private final CompilationUnitFileTree fileTree;
-  private FileDataProvider contentProvider;
-  private Charset encoding;
+  private final FileDataProvider contentProvider;
+  private final Charset encoding;
 
   public CompilationUnitBasedJavaFileStore(
       CompilationUnit unit, FileDataProvider contentProvider, Charset encoding) {
@@ -44,7 +44,7 @@ public class CompilationUnitBasedJavaFileStore implements JavaFileStore {
   @Override
   public CustomJavaFileObject find(String className, Kind kind, Set<String> pathPrefixes) {
     Path file = Paths.get(className.replace('.', '/') + kind.extension);
-    String dirname = file.getParent().toString();
+    String dirname = file.getParent() == null ? "." : file.getParent().toString();
     String basename = file.getFileName().toString();
     for (String prefix : pathPrefixes) {
       String dirToLookIn = join(prefix, dirname);
@@ -83,8 +83,8 @@ public class CompilationUnitBasedJavaFileStore implements JavaFileStore {
   /**
    * {@inheritDoc}
    *
-   * TODO: recurse option does not work yet. This method only returns the classes inside
-   * {@code packageName} and ignores the sub-packages.
+   * <p>TODO: recurse option does not work yet. This method only returns the classes inside {@code
+   * packageName} and ignores the sub-packages.
    */
   @Override
   public Set<CustomJavaFileObject> list(
@@ -110,18 +110,20 @@ public class CompilationUnitBasedJavaFileStore implements JavaFileStore {
     Set<CustomJavaFileObject> files = new HashSet<>();
     for (Entry<String, String> entry : entries.entrySet()) {
       String fileName = entry.getKey();
+      String digest = entry.getValue();
+      if (digest.equals(CompilationUnitFileTree.DIRECTORY_DIGEST)) {
+        // Don't include directories in the file listing.
+        continue;
+      }
       for (Kind kind : kinds) {
         if (fileName.endsWith(kind.extension)) {
           int lastDot = fileName.lastIndexOf('.');
-          String clsName = packageName + "." + fileName.substring(0, lastDot);
+          // files with kind == OTHER may not have an extension.
+          String simpleName = lastDot == -1 ? fileName : fileName.substring(0, lastDot);
+          String clsName = packageName + "." + simpleName;
           files.add(
               new CustomJavaFileObject(
-                  contentProvider,
-                  join(dirToLookIn, entry.getKey()),
-                  entry.getValue(),
-                  clsName,
-                  kind,
-                  encoding));
+                  contentProvider, join(dirToLookIn, fileName), digest, clsName, kind, encoding));
           break;
         }
       }

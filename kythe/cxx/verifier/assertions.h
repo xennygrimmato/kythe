@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ class AssertionParserImpl;
 
 #include "kythe/cxx/verifier/assertion_ast.h"
 #include "kythe/cxx/verifier/parser.yy.hh"
+#include "re2/re2.h"
 
 namespace kythe {
 namespace verifier {
@@ -48,39 +49,43 @@ class AssertionParser {
       kSomeMustFail  ///< For this group to pass, some goals must fail.
     };
     AcceptanceCriterion accept_if;  ///< How this group is handled.
-    std::vector<AstNode *> goals;   ///< Grouped goals, implicitly conjoined.
+    std::vector<AstNode*> goals;    ///< Grouped goals, implicitly conjoined.
   };
 
   /// \param trace_lex Dump lexing debug information
   /// \param trace_parse Dump parsing debug information
-  explicit AssertionParser(Verifier *verifier, bool trace_lex = false,
+  explicit AssertionParser(Verifier* verifier, bool trace_lex = false,
                            bool trace_parse = false);
 
   /// \brief Loads a file containing rules in marked comments.
   /// \param filename The filename of the file to load
-  /// \param comment_prefix Lines starting with this prefix are goals (eg "//-")
+  /// \param goal_comment_regex Lines matching this regex are goals. Goals
+  /// will be read from the regex's first capture group.
   /// \return true if there were no errors
-  bool ParseInlineRuleFile(const std::string &filename,
-                           const char *comment_prefix);
+  bool ParseInlineRuleFile(const std::string& filename, Symbol path,
+                           Symbol root, Symbol corpus,
+                           const RE2& goal_comment_regex);
 
   /// \brief Loads a string containing rules in marked comments.
   /// \param content The content to parse and load
   /// \param fake_filename Some string to use when printing errors and locations
-  /// \param comment_prefix Lines starting with this prefix are goals (eg "//-")
+  /// \param goal_comment_regex Lines matching this regex are goals. Goals
+  /// will be read from the regex's first capture group.
   /// \return true if there were no errors
-  bool ParseInlineRuleString(const std::string &content,
-                             const std::string &fake_filename,
-                             const char *comment_prefix);
+  bool ParseInlineRuleString(const std::string& content,
+                             const std::string& fake_filename, Symbol path,
+                             Symbol root, Symbol corpus,
+                             const RE2& goal_comment_regex);
 
   /// \brief The name of the current file being read. It is safe to take
   /// the address of this string (which shares the lifetime of this object.)
-  std::string &file() { return files_.back(); }
+  std::string& file() { return files_.back(); }
 
   /// \brief This `AssertionParser`'s associated `Verifier`.
-  Verifier &verifier() { return verifier_; }
+  Verifier& verifier() { return verifier_; }
 
   /// \brief All of the goal groups in this `AssertionParser`.
-  std::vector<GoalGroup> &groups() { return groups_; }
+  std::vector<GoalGroup>& groups() { return groups_; }
 
   /// An EVar whose assignment is interesting to display.
   struct Inspection {
@@ -89,51 +94,44 @@ class AssertionParser {
       IMPLICIT   ///< This inspection was added by default.
     };
     std::string label;  ///< A label for user reference.
-    EVar *evar;         ///< The EVar to inspect.
+    EVar* evar;         ///< The EVar to inspect.
     Kind kind;          ///< Whether this inspection was added by default.
-    Inspection(const std::string &label, EVar *evar, Kind kind)
+    Inspection(const std::string& label, EVar* evar, Kind kind)
         : label(label), evar(evar), kind(kind) {}
   };
 
   /// \brief All of the inspections in this `AssertionParser`.
-  std::vector<Inspection> &inspections() { return inspections_; }
+  std::vector<Inspection>& inspections() { return inspections_; }
 
   /// \brief Unescapes a string literal (which is expected to include
   /// terminating quotes).
   /// \param yytext literal string to escape
   /// \param out pointer to a string to overwrite with `yytext` unescaped.
   /// \return true if `yytext` was a valid literal string; false otherwise.
-  static bool Unescape(const char *yytext, std::string *out);
+  static bool Unescape(const char* yytext, std::string* out);
 
   /// Should every EVar be added by default to the inspection list?
   void InspectAllEVars() { default_inspect_ = true; }
 
+  /// \brief Check that there are no singleton EVars.
+  /// \return true if there were singletons.
+  bool CheckForSingletonEVars();
+
  private:
   friend class yy::AssertionParserImpl;
 
-  /// \brief Resets the goal comment token check.
-  /// \sa NextLexCheck
-  void ResetLexCheck();
+  /// \brief Sets the scan buffer to a premarked string and turns on
+  /// tracing.
+  /// \note Implemented in `assertions.lex`.
+  void SetScanBuffer(const std::string& scan_buffer, bool trace_scanning);
 
-  /// \brief Advances the goal comment token check.
-  ///
-  /// It isn't possible to bake goal comments into the lexer because there is
-  /// not a single supported comment syntax across all languages; while many
-  /// do allow BCPL-style // comments, some (like Python) do not. The lexer
-  /// starts each line by calling `NextLexCheck` on each character until
-  /// it determines whether the line begins with a goal comment or not.
-  /// Whitespace (\t ) is ignored.
-  ///
-  /// \param yytext A 1-length string containing the character to check.
-  /// \return 0 on inconclusive; 1 if this is a goal comment; -1 if this is
-  /// an ordinary source line.
-  int NextLexCheck(const char *yytext);
+  /// \brief Resets recorded source text.
+  void ResetLine();
 
   /// \brief Records source text after determining that it does not
   /// begin with a goal comment marker.
   /// \param yytext A 1-length string containing the character to append.
-  /// \sa NextLexCheck
-  void AppendToLine(const char *yytext);
+  void AppendToLine(const char* yytext);
 
   /// \brief Called at the end of an ordinary line of source text to resolve
   /// available forward location references.
@@ -144,42 +142,43 @@ class AssertionParser {
   /// features at the correct locations.
   ///
   /// \return true if all locations could be resolved
-  bool ResolveLocations(const yy::location &end_of_line,
+  bool ResolveLocations(const yy::location& end_of_line,
                         size_t offset_after_endline, bool end_of_file);
 
   /// \brief Called by the lexer to save the end location of the current file
   /// or buffer.
-  void save_eof(const yy::location &eof, size_t eof_ofs) {
+  void save_eof(const yy::location& eof, size_t eof_ofs) {
     last_eof_ = eof;
     last_eof_ofs_ = eof_ofs;
   }
 
   /// \note Implemented by generated code care of flex.
-  static int lex(YYSTYPE *, yy::location *, AssertionParser &context);
+  static int lex(YYSTYPE*, yy::location*, AssertionParser& context);
 
   /// \brief Used by the lexer and parser to report errors.
   /// \param location Source location where an error occurred.
   /// \param message Text of the error.
-  void Error(const yy::location &location, const std::string &message);
+  void Error(const yy::location& location, const std::string& message);
 
   /// \brief Used by the lexer and parser to report errors.
   /// \param message Text of the error.
-  void Error(const std::string &message);
+  void Error(const std::string& message);
 
   /// \brief Initializes the lexer to scan from file_.
-  /// \note Implemented in `assertions.lex`.
-  void ScanBeginFile(bool trace_scanning);
+  /// \param goal_comment_regex regex to identify goal comments.
+  void ScanBeginFile(const RE2& goal_comment_regex, bool trace_scanning);
 
   /// \brief Initializes the lexer to scan from a string.
-  /// \note Implemented in `assertions.lex`.
-  void ScanBeginString(const std::string &data, bool trace_scanning);
+  /// \param goal_comment_regex regex to identify goal comments.
+  void ScanBeginString(const RE2& goal_comment_regex, const std::string& data,
+                       bool trace_scanning);
 
   /// \brief Handles end-of-scan actions and destroys any buffers.
   /// \note Implemented in `assertions.lex`.
-  void ScanEnd(const yy::location &eof_loc, size_t eof_loc_ofs);
-  AstNode **PopNodes(size_t node_count);
-  void PushNode(AstNode *node);
-  void AppendGoal(size_t group_id, AstNode *goal);
+  void ScanEnd(const yy::location& eof_loc, size_t eof_loc_ofs);
+  AstNode** PopNodes(size_t node_count);
+  void PushNode(AstNode* node);
+  void AppendGoal(size_t group_id, AstNode* goal);
 
   /// \brief Generates deduplicated `Identifier`s or `EVar`s.
   /// \param location Source location of the token.
@@ -187,15 +186,15 @@ class AssertionParser {
   /// \return An `EVar` if `for_token` starts with a capital letter;
   /// an `Identifier` otherwise.
   /// \sa CreateEVar, CreateIdentifier
-  AstNode *CreateAtom(const yy::location &location,
-                      const std::string &for_token);
+  AstNode* CreateAtom(const yy::location& location,
+                      const std::string& for_token);
 
   /// \brief Generates an equality constraint between the lhs and the rhs.
   /// \param location Source location of the "=" token.
   /// \param lhs The lhs of the equality.
   /// \param rhs The rhs of the equality.
-  AstNode *CreateEqualityConstraint(const yy::location &location, AstNode *lhs,
-                                    AstNode *rhs);
+  AstNode* CreateEqualityConstraint(const yy::location& location, AstNode* lhs,
+                                    AstNode* rhs);
 
   /// \brief Generates deduplicated `EVar`s.
   /// \param location Source location of the token.
@@ -203,7 +202,7 @@ class AssertionParser {
   /// \return A new `EVar` if `for_token` has not yet been made into
   /// an `EVar` already, or the previous `EVar` returned the last
   /// time `CreateEVar` was called.
-  EVar *CreateEVar(const yy::location &location, const std::string &for_token);
+  EVar* CreateEVar(const yy::location& location, const std::string& for_token);
 
   /// \brief Generates deduplicated `Identifier`s.
   /// \param location Source location of the text.
@@ -211,60 +210,60 @@ class AssertionParser {
   /// \return A new `Identifier` if `for_text` has not yet been made into
   /// an `Identifier` already, or the previous `Identifier` returned the last
   /// time `CreateIdenfier` was called.
-  Identifier *CreateIdentifier(const yy::location &location,
-                               const std::string &for_text);
+  Identifier* CreateIdentifier(const yy::location& location,
+                               const std::string& for_text);
 
   /// \brief Creates an anonymous `EVar` to implement the `_` token.
   /// \param location Source location of the token.
-  AstNode *CreateDontCare(const yy::location &location);
+  AstNode* CreateDontCare(const yy::location& location);
 
   /// \brief Adds an inspect post-action to the current goal.
   /// \param location Source location for the inspection.
   /// \param for_exp Expression to inspect.
   /// \return An inspection record.
-  AstNode *CreateInspect(const yy::location &location,
-                         const std::string &inspect_id, AstNode *to_inspect);
+  AstNode* CreateInspect(const yy::location& location,
+                         const std::string& inspect_id, AstNode* to_inspect);
 
-  void PushLocationSpec(const std::string &for_token);
+  void PushLocationSpec(const std::string& for_token);
 
   /// \brief Pushes a relative location spec (@token:+2).
-  void PushRelativeLocationSpec(const std::string &for_token,
-                                const std::string &relative_spec);
+  void PushRelativeLocationSpec(const std::string& for_token,
+                                const std::string& relative_spec);
 
   /// \brief Pushes an absolute location spec (@token:1234).
-  void PushAbsoluteLocationSpec(const std::string &for_token,
-                                const std::string &abs_spec);
+  void PushAbsoluteLocationSpec(const std::string& for_token,
+                                const std::string& absolute);
 
   /// \brief Changes the last-pushed location spec to match the `match_spec`th
   /// instance of its match string.
-  void SetTopLocationSpecMatchNumber(const std::string &match_spec);
+  void SetTopLocationSpecMatchNumber(const std::string& number);
 
-  AstNode *CreateAnchorSpec(const yy::location &location);
+  AstNode* CreateAnchorSpec(const yy::location& location);
 
   /// \brief Generates a new offset spec (equivalent to a string literal).
   /// \param location The location in the goal text of this offset spec.
   /// \param at_end should this offset spec be at the end of the search string?
-  AstNode *CreateOffsetSpec(const yy::location &location, bool at_end);
+  AstNode* CreateOffsetSpec(const yy::location& location, bool at_end);
 
-  AstNode *CreateSimpleEdgeFact(const yy::location &location, AstNode *edge_lhs,
-                                const std::string &literal_kind,
-                                AstNode *edge_rhs, AstNode *ordinal);
+  AstNode* CreateSimpleEdgeFact(const yy::location& location, AstNode* edge_lhs,
+                                const std::string& literal_kind,
+                                AstNode* edge_rhs, AstNode* ordinal);
 
-  AstNode *CreateSimpleNodeFact(const yy::location &location, AstNode *lhs,
-                                const std::string &literal_key, AstNode *value);
+  AstNode* CreateSimpleNodeFact(const yy::location& location, AstNode* lhs,
+                                const std::string& literal_key, AstNode* value);
 
-  Identifier *PathIdentifierFor(const yy::location &location,
-                                const std::string &path_fragment,
-                                const std::string &default_root);
+  Identifier* PathIdentifierFor(const yy::location& location,
+                                const std::string& path_fragment,
+                                const std::string& default_root);
 
   /// \brief Enters a new goal group.
   /// \param location The location for diagnostics.
   /// \param negated true if this group is negated.
   /// Only one goal group may be entered at once.
-  void EnterGoalGroup(const yy::location &location, bool negated);
+  void EnterGoalGroup(const yy::location& location, bool negated);
 
   /// \brief Exits the last-entered goal group.
-  void ExitGoalGroup(const yy::location &location);
+  void ExitGoalGroup(const yy::location& location);
 
   /// \brief The current goal group.
   size_t group_id() const {
@@ -275,10 +274,10 @@ class AssertionParser {
     }
   }
 
-  Verifier &verifier_;
+  Verifier& verifier_;
 
   /// The arena from the verifier; needed by the parser implementation.
-  Arena *arena_;
+  Arena* arena_;
 
   std::vector<GoalGroup> groups_;
   bool inside_goal_group_ = false;
@@ -289,7 +288,7 @@ class AssertionParser {
       kOffsetBegin,  ///< The offset at the start of the location (@^tok).
       kOffsetEnd     ///< The offset at the end of the location (@$tok).
     };
-    EVar *anchor_evar;        ///< The EVar to be solved.
+    EVar* anchor_evar;        ///< The EVar to be solved.
     std::string anchor_text;  ///< The text to match.
     size_t line_number;       ///< The line to match text on.
     bool use_line_number;     ///< Whether to match with `line_number` or
@@ -301,7 +300,7 @@ class AssertionParser {
                        ///< `anchor_text`.
   };
   std::vector<UnresolvedLocation> unresolved_locations_;
-  std::vector<AstNode *> node_stack_;
+  std::vector<AstNode*> node_stack_;
   struct LocationSpec {
     std::string spec;
     int line_offset;
@@ -310,17 +309,13 @@ class AssertionParser {
     int match_number;
   };
   std::vector<LocationSpec> location_spec_stack_;
-  bool ValidateTopLocationSpec(const yy::location &location,
-                               size_t *line_number, bool *use_line_number,
-                               bool *must_be_unambiguous, int *match_number);
+  bool ValidateTopLocationSpec(const yy::location& location,
+                               size_t* line_number, bool* use_line_number,
+                               bool* must_be_unambiguous, int* match_number);
   /// Files we've parsed or are parsing (pushed onto the back).
   /// Note that location records will have internal pointers to these strings.
   std::deque<std::string> files_;
   std::string line_;
-  /// The comment prefix we're looking for.
-  std::string lex_check_against_;
-  /// How many characters into lex_check_against_ we've seen.
-  int lex_check_buffer_size_;
   /// Did we encounter errors during lexing or parsing?
   bool had_errors_ = false;
   /// Save the end-of-file location from the lexer.
@@ -329,14 +324,21 @@ class AssertionParser {
   /// Inspections to be performed after the verifier stops.
   std::vector<Inspection> inspections_;
   /// Context mapping symbols to AST nodes.
-  std::unordered_map<Symbol, Identifier *> identifier_context_;
-  std::unordered_map<Symbol, EVar *> evar_context_;
+  std::unordered_map<Symbol, Identifier*> identifier_context_;
+  std::unordered_map<Symbol, EVar*> evar_context_;
+  std::unordered_map<EVar*, Symbol> singleton_evars_;
   /// Are we dumping lexer trace information?
   bool trace_lex_;
   /// Are we dumping parser trace information?
   bool trace_parse_;
   /// Should we inspect every user-provided EVar?
   bool default_inspect_ = false;
+  /// The current file's path.
+  Symbol path_;
+  /// The current file's root.
+  Symbol root_;
+  /// The current file's corpus.
+  Symbol corpus_;
 };
 
 }  // namespace verifier

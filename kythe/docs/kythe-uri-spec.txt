@@ -1,4 +1,4 @@
-// Copyright 2014 Google Inc. All rights reserved.
+// Copyright 2014 The Kythe Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -55,7 +55,7 @@ label        = ireg-name -- RFC 3987
 attrs        = ["?" lang-attr] ["?" path-attr] ["?" root-attr]
 lang-attr    = "lang=" language
 path-attr    = "path=" path-segment 0*{"/" path-segment}
-root-attr    = "root=" 1*{"/" root-segment}
+root-attr    = "root=" root-segment 0*{"/" root-segment}
 language     = 1*ipchar  -- RFC 3987
 signature    = 1*ipchar  -- RFC 3987
 root-segment = 1*ipchar  -- RFC 3987
@@ -64,6 +64,11 @@ path-segment = 1*{unreserved | pct-encoded | "/"}  -- RFC 3987
 
 Note that the order of the attributes (the `attrs` production) is fixed, to
 ensure that a Kythe URI has a canonical string encoding.
+
+For queries, path-segment is resolved as specified in
+http://tools.ietf.org/html/rfc3986#section-5.2.4[RFC 3986 Section 5.2.4 (Remove Dot Segments)].
+
+See also link:kythe-storage.html#TermVName[Vector-Name (*VName*)]
 
 Examples (subject to change):
 
@@ -74,7 +79,7 @@ Examples (subject to change):
 * Maven (corpus, path, language): `kythe://maven.org/central/org/apache/thrift?lang=java?path=libthrift/0.9.1`
 * Language, path, signature: `kythe:?lang=go?path=mapreduce/go/contrib/plan.go#MR`
 * Corpus, path, language: `kythe://code.google.com/p/go.tools?lang=go?path=cmd/godoc/doc.go`
-* Alternate root: `kythe://chromium.org/chrome?root=third_party/openssl/1650?path=openssl/crypto/bf/bf_pi.h`
+* Alternate root: `kythe://chromium.org/chrome?path=openssl/crypto/bf/bf_pi.h?root=third_party/openssl/1650`
 
 === Rationale
 
@@ -100,6 +105,3 @@ whether the "project" label is likely to vary.  A github.com repo will not
 frequently change name, so it makes sense to include the repo name as part of
 the corpus, and reserve the `root` field for branches.  The encoding of the URI
 is agnostic to the decision.
-
-
-

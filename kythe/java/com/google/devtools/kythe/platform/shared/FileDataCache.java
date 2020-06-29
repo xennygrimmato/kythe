@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,29 +20,40 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.devtools.kythe.proto.Analysis.FileData;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
- * {@link FileDataProvider} that looks up file data from a given {@link List} of {@link FileData}.
+ * {@link FileDataProvider} that looks up file data from a given {@link Iterable} of {@link
+ * FileData}.
  */
 public class FileDataCache implements FileDataProvider {
+
   private final Map<String, byte[]> fileContents;
 
   public FileDataCache(Iterable<FileData> fileData) {
     ImmutableMap.Builder<String, byte[]> builder = ImmutableMap.builder();
+    Set<String> addedFiles = new HashSet<>();
     for (FileData data : fileData) {
-      builder.put(data.getInfo().getDigest(), data.getContent().toByteArray());
+      String digest = data.getInfo().getDigest();
+      if (addedFiles.add(digest)) {
+        builder.put(digest, data.getContent().toByteArray());
+      }
     }
     fileContents = builder.build();
   }
 
   @Override
   public ListenableFuture<byte[]> startLookup(String path, String digest) {
+    if (digest == null) {
+      return Futures.immediateFailedFuture(new IllegalArgumentException("digest cannot be null"));
+    }
     byte[] content = fileContents.get(digest);
-    return content != null
-        ? Futures.immediateFuture(content)
-        : Futures.<byte[]>immediateFailedFuture(
-            new RuntimeException("Cache does not contain file for digest: " + digest));
+    return content == null
+        ? Futures.immediateFailedFuture(
+            new RuntimeException("Cache does not contain file for digest: " + digest))
+        : Futures.immediateFuture(content);
   }
 
   @Override

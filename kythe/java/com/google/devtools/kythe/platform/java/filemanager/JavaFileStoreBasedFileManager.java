@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,10 @@
 
 package com.google.devtools.kythe.platform.java.filemanager;
 
+import com.google.common.collect.Iterables;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -26,19 +28,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import javax.tools.FileObject;
-import javax.tools.ForwardingJavaFileManager;
 import javax.tools.JavaFileObject;
 import javax.tools.JavaFileObject.Kind;
 import javax.tools.StandardJavaFileManager;
 import javax.tools.StandardLocation;
 
-/**
- * TODO(schroederc) Refactor this code to not use Forwarding to avoid picking up spurious files from
- * the local file system. We do this today as we need to pick up the JDK etc...
- */
+/** {@link StandardJavaFileManager} backed by a {@link JavaFileStore}. */
 @com.sun.tools.javac.api.ClientCodeWrapper.Trusted
-public class JavaFileStoreBasedFileManager
-    extends ForwardingJavaFileManager<StandardJavaFileManager> implements StandardJavaFileManager {
+public class JavaFileStoreBasedFileManager extends ForwardingStandardJavaFileManager {
 
   protected JavaFileStore javaFileStore;
 
@@ -90,12 +87,18 @@ public class JavaFileStoreBasedFileManager
     }
 
     // TODO(schroederc): handle case where some of the package is in the JavaFileStore, but not all
-    if (matchingFiles.size() > 0) {
-      return new ArrayList<JavaFileObject>(matchingFiles);
+    if (!matchingFiles.isEmpty()) {
+      return new ArrayList<>(matchingFiles);
     }
 
     List<JavaFileObject> matchedFiles = new ArrayList<>();
     matchedFiles.addAll(matchingFiles);
+
+    if (location == StandardLocation.SOURCE_PATH) {
+      // XXX(#818): do not search the underlying file manager (and the local fs) for source files
+      return matchedFiles;
+    }
+
     // Ask underlying file manager for its knowledge of files, e.g.
     // in case of JRE we use the files locally known to the compiler.
     for (JavaFileObject jfo : super.list(location, packageName, kinds, recurse)) {
@@ -129,18 +132,11 @@ public class JavaFileStoreBasedFileManager
       CustomJavaFileObject cjfo = (CustomJavaFileObject) file;
       return cjfo.getClassName();
     }
-    return fileManager.inferBinaryName(location, file);
+    return super.inferBinaryName(location, file);
   }
 
-  private JavaFileObject getJavaFileFromPath(String file, Kind kind) {
+  public JavaFileObject getJavaFileFromPath(String file, Kind kind) {
     return javaFileStore.findByPath(file, kind);
-  }
-
-  @Override
-  public JavaFileObject getJavaFileForOutput(
-      Location location, String className, JavaFileObject.Kind kind, FileObject sibling)
-      throws IOException {
-    return fileManager.getJavaFileForOutput(location, className, kind, sibling);
   }
 
   @Override
@@ -173,30 +169,49 @@ public class JavaFileStoreBasedFileManager
 
   @Override
   public Iterable<? extends JavaFileObject> getJavaFileObjectsFromStrings(Iterable<String> names) {
-    List<File> files = new ArrayList<>();
-    for (String name : names) {
-      files.add(new File(name));
-    }
-    return getJavaFileObjectsFromFiles(files);
+    return getJavaFileObjectsFromFiles(Iterables.transform(names, File::new));
   }
 
   @Override
   public Iterable<? extends JavaFileObject> getJavaFileObjects(String... names) {
-    List<File> files = new ArrayList<>();
-    for (String name : names) {
-      files.add(new File(name));
+    return getJavaFileObjectsFromStrings(Arrays.asList(names));
+  }
+
+  @Override
+  public Iterable<? extends JavaFileObject> getJavaFileObjectsFromPaths(
+      @SuppressWarnings("IterablePathParameter") Iterable<? extends Path> paths) {
+    return getJavaFileObjectsFromFiles(Iterables.transform(paths, Path::toFile));
+  }
+
+  @Override
+  public Iterable<? extends JavaFileObject> getJavaFileObjects(Path... paths) {
+    return getJavaFileObjectsFromPaths(Arrays.asList(paths));
+  }
+
+  @Override
+  public boolean contains(Location location, FileObject file) throws IOException {
+    if (file instanceof CustomFileObject) {
+      // The URI paths for custom file objects will always include an
+      // extra leading '/'.
+      String filePath = file.toUri().getPath().substring(1);
+      // Do a trivial prefix-search based on the search paths for the given location.
+      Set<String> paths = getSearchPaths(location);
+      for (String path : paths) {
+        if (filePath.startsWith(path)) {
+          return true;
+        }
+      }
+      return false;
     }
-    return getJavaFileObjectsFromFiles(files);
+    return super.contains(location, file);
   }
 
   @Override
-  public Iterable<? extends File> getLocation(Location location) {
-    return fileManager.getLocation(location);
-  }
-
-  @Override
-  public void setLocation(Location location, Iterable<? extends File> path) throws IOException {
-    fileManager.setLocation(location, path);
+  public Path asPath(FileObject file) {
+    if (file instanceof CustomFileObject) {
+      return ((CustomFileObject) file).path;
+    }
+    return super.asPath(file);
   }
 
   public static Kind getKind(String name) {
@@ -218,6 +233,6 @@ public class JavaFileStoreBasedFileManager
     } else if (b instanceof CustomFileObject) {
       return b.equals(a);
     }
-    return fileManager.isSameFile(a, b);
+    return super.isSameFile(a, b);
   }
 }

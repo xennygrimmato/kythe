@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"io/ioutil"
@@ -29,9 +30,8 @@ import (
 	"kythe.io/kythe/go/platform/vfs"
 
 	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
 
-	xapb "kythe.io/third_party/bazel/extra_actions_base_proto"
+	xapb "kythe.io/third_party/bazel/extra_actions_base_go_proto"
 )
 
 var knownExtensions = []*proto.ExtensionDesc{

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,24 +18,25 @@ package xrefs
 
 import (
 	"bytes"
+	"context"
 	"sort"
 	"testing"
 
 	"kythe.io/kythe/go/services/xrefs"
 	"kythe.io/kythe/go/storage/table"
 	"kythe.io/kythe/go/test/testutil"
+	"kythe.io/kythe/go/util/compare"
 	"kythe.io/kythe/go/util/kytheuri"
-	"kythe.io/kythe/go/util/stringset"
+	"kythe.io/kythe/go/util/span"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
+	"google.golang.org/protobuf/proto"
 
-	cpb "kythe.io/kythe/proto/common_proto"
-	srvpb "kythe.io/kythe/proto/serving_proto"
-	xpb "kythe.io/kythe/proto/xref_proto"
+	cpb "kythe.io/kythe/proto/common_go_proto"
+	srvpb "kythe.io/kythe/proto/serving_go_proto"
+	xpb "kythe.io/kythe/proto/xref_go_proto"
 )
 
 var (
@@ -105,14 +106,14 @@ var (
 				"/kythe/loc/start", "51",
 			),
 		}, {
-			Ticket: "kythe://someCorpus?path=some/path#aFileNode",
+			Ticket: "kythe://c?path=/a/path",
 			Fact: makeFactList(
 				"/kythe/node/kind", "file",
 				"/kythe/text/encoding", "utf-8",
 				"/kythe/text", "some random text\nhere and  \n  there\nsome random text\nhere and  \n  there\n",
 			),
 		}, {
-			Ticket: "kythe://someCorpus?path=some/utf16/file#utf16FTW",
+			Ticket: "kythe:?path=some/utf16/file",
 			Fact: []*cpb.Fact{{
 				Name:  "/kythe/text/encoding",
 				Value: []byte("utf-16le"),
@@ -130,123 +131,46 @@ var (
 				"/kythe/loc/start", "0",
 				"/kythe/loc/end", "4",
 			),
+		}, {
+			Ticket: "kythe:#documented",
+			Fact: makeFactList(
+				"/kythe/node/kind", "record",
+			),
+			DefinitionLocation: &srvpb.ExpandedAnchor{Ticket: "kythe:?path=def/location#defDoc"},
+		}, {
+			Ticket: "kythe:#documentedBy",
+			Fact: makeFactList(
+				"/kythe/node/kind", "record",
+			),
+		}, {
+			Ticket: "kythe:#childDoc",
+			Fact: makeFactList(
+				"/kythe/node/kind", "record",
+			),
+		}, {
+			Ticket: "kythe:#childDocBy",
+			Fact: makeFactList(
+				"/kythe/node/kind", "record",
+			),
+		}, {
+			Ticket: "kythe:#secondChildDoc",
+			Fact: makeFactList(
+				"/kythe/node/kind", "record",
+			),
+		}, {
+			Ticket: "kythe://someCorpus?lang=otpl#withRelated",
+			Fact:   makeFactList("/kythe/node/kind", "testNode"),
+		}, {
+			Ticket: "kythe:#aliasNode",
+			Fact:   makeFactList("/kythe/node/kind", "talias"),
+		}, {
+			Ticket: "kythe:#indirect",
+			Fact:   makeFactList("/kythe/node/kind", "indirect"),
 		},
 	}
 
 	tbl = &testTable{
 		Nodes: nodes,
-		EdgeSets: []*srvpb.PagedEdgeSet{
-			{
-				TotalEdges: 3,
-
-				Source: getNode("kythe://someCorpus?lang=otpl#something"),
-				Group: []*srvpb.EdgeGroup{
-					{
-						Kind: "someEdgeKind",
-						Edge: getEdgeTargets(
-							"kythe://someCorpus#aTicketSig",
-						),
-					},
-					{
-						Kind: "anotherEdge",
-						Edge: getEdgeTargets(
-							"kythe://someCorpus#aTicketSig",
-							"kythe://someCorpus?lang=otpl#signature",
-						),
-					},
-				},
-			}, {
-				TotalEdges: 6,
-
-				Source: getNode("kythe://someCorpus?lang=otpl#signature"),
-				Group: []*srvpb.EdgeGroup{{
-					Kind: "%/kythe/edge/ref",
-					Edge: getEdgeTargets(
-						"kythe://c?lang=otpl?path=/a/path#51-55",
-						"kythe:?path=some/utf16/file#0-4",
-					),
-				}, {
-					Kind: "%/kythe/edge/defines/binding",
-					Edge: getEdgeTargets("kythe://c?lang=otpl?path=/a/path#27-33"),
-				}},
-
-				PageIndex: []*srvpb.PageIndex{{
-					PageKey:   "firstPage",
-					EdgeKind:  "someEdgeKind",
-					EdgeCount: 2,
-				}, {
-					PageKey:   "secondPage",
-					EdgeKind:  "anotherEdge",
-					EdgeCount: 1,
-				}},
-			}, {
-				TotalEdges: 2,
-
-				Source: getNode("kythe:?path=some/utf16/file#0-4"),
-				Group: []*srvpb.EdgeGroup{{
-					Kind: "/kythe/edge/ref",
-					Edge: getEdgeTargets("kythe://someCorpus?lang=otpl#signature"),
-				}, {
-					Kind: "/kythe/edge/childof",
-					Edge: getEdgeTargets("kythe://someCorpus?path=some/utf16/file#utf16FTW"),
-				}},
-			}, {
-				TotalEdges: 1,
-
-				Source: getNode("kythe://someCorpus?path=some/utf16/file#utf16FTW"),
-				Group: []*srvpb.EdgeGroup{{
-					Kind: "%/kythe/edge/childof",
-					Edge: getEdgeTargets("kythe:?path=some/utf16/file#0-4"),
-				}},
-			}, {
-				TotalEdges: 2,
-
-				Source: getNode("kythe://c?lang=otpl?path=/a/path#51-55"),
-				Group: []*srvpb.EdgeGroup{{
-					Kind: "/kythe/edge/ref",
-					Edge: getEdgeTargets("kythe://someCorpus?lang=otpl#signature"),
-				}, {
-					Kind: "/kythe/edge/childof",
-					Edge: getEdgeTargets("kythe://someCorpus?path=some/path#aFileNode"),
-				}},
-			}, {
-				TotalEdges: 2,
-
-				Source: getNode("kythe://c?lang=otpl?path=/a/path#27-33"),
-				Group: []*srvpb.EdgeGroup{{
-					Kind: "/kythe/edge/defines/binding",
-					Edge: getEdgeTargets("kythe://someCorpus?lang=otpl#signature"),
-				}, {
-					Kind: "/kythe/edge/childof",
-					Edge: getEdgeTargets("kythe://someCorpus?path=some/path#aFileNode"),
-				}},
-			},
-		},
-		EdgePages: []*srvpb.EdgePage{
-			{
-				PageKey:      "orphanedEdgePage",
-				SourceTicket: "kythe://someCorpus?lang=otpl#something",
-			}, {
-				PageKey:      "firstPage",
-				SourceTicket: "kythe://someCorpus?lang=otpl#signature",
-				EdgesGroup: &srvpb.EdgeGroup{
-					Kind: "someEdgeKind",
-					Edge: getEdgeTargets(
-						"kythe://someCorpus?lang=otpl#sig3",
-						"kythe://someCorpus?lang=otpl#sig4",
-					),
-				},
-			}, {
-				PageKey:      "secondPage",
-				SourceTicket: "kythe://someCorpus?lang=otpl#signature",
-				EdgesGroup: &srvpb.EdgeGroup{
-					Kind: "anotherEdge",
-					Edge: getEdgeTargets(
-						"kythe://someCorpus?lang=otpl#sig2",
-					),
-				},
-			},
-		},
 		Decorations: []*srvpb.FileDecorations{
 			{
 				File: &srvpb.File{
@@ -271,8 +195,10 @@ var (
 							Ticket:      "kythe://c?lang=otpl?path=/a/path#6-9",
 							StartOffset: 6,
 							EndOffset:   9,
+
+							BuildConfiguration: "test-build-config",
 						},
-						Kind:   "/kythe/defines/binding",
+						Kind:   "/kythe/edge/defines/binding",
 						Target: "kythe://c?lang=otpl?path=/a/path#map",
 					},
 					{
@@ -283,6 +209,8 @@ var (
 						},
 						Kind:   "/kythe/refs",
 						Target: "kythe://core?lang=otpl#empty?",
+
+						SemanticScope: "kythe://c?lang=otpl?path=/a/path#map",
 					},
 					{
 						Anchor: &srvpb.RawAnchor{
@@ -292,21 +220,84 @@ var (
 						},
 						Kind:   "/kythe/refs",
 						Target: "kythe://core?lang=otpl#cons",
+
+						SemanticScope: "kythe://c?lang=otpl?path=/a/path#map",
 					},
 				},
+				TargetOverride: []*srvpb.FileDecorations_Override{{
+					Kind:                 srvpb.FileDecorations_Override_EXTENDS,
+					Overriding:           "kythe://c?lang=otpl?path=/a/path#map",
+					Overridden:           "kythe://c?lang=otpl#map",
+					OverriddenDefinition: "kythe://c?lang=otpl?path=/b/path#mapDef",
+					MarkedSource: &cpb.MarkedSource{
+						Kind:    cpb.MarkedSource_IDENTIFIER,
+						PreText: "OverrideMS",
+					},
+				}, {
+					Kind:                 srvpb.FileDecorations_Override_EXTENDS,
+					Overriding:           "kythe://c?lang=otpl?path=/a/path#map",
+					Overridden:           "kythe://c?lang=otpl#map",
+					OverriddenDefinition: "kythe://c?lang=otpl?path=/b/path#mapDefOtherConfig",
+					MarkedSource: &cpb.MarkedSource{
+						Kind:    cpb.MarkedSource_IDENTIFIER,
+						PreText: "OverrideMS",
+					},
+				}},
 				Target: getNodes("kythe://c?lang=otpl?path=/a/path#map", "kythe://core?lang=otpl#empty?", "kythe://core?lang=otpl#cons"),
+				TargetDefinitions: []*srvpb.ExpandedAnchor{{
+					Ticket:             "kythe://c?lang=otpl?path=/b/path#mapDef",
+					BuildConfiguration: "test-build-config",
+					Span: &cpb.Span{
+						Start: &cpb.Point{LineNumber: 1},
+						End:   &cpb.Point{ByteOffset: 4, LineNumber: 1, ColumnOffset: 4},
+					},
+				}, {
+					Ticket:             "kythe://c?lang=otpl?path=/b/path#mapDefOtherConfig",
+					BuildConfiguration: "other-build-config",
+					Span: &cpb.Span{
+						Start: &cpb.Point{LineNumber: 1},
+						End:   &cpb.Point{ByteOffset: 4, LineNumber: 1, ColumnOffset: 4},
+					},
+				}},
+				Diagnostic: []*cpb.Diagnostic{
+					{Message: "Test diagnostic message"},
+					{
+						Span: &cpb.Span{
+							Start: &cpb.Point{
+								ByteOffset:   6,
+								LineNumber:   1,
+								ColumnOffset: 6,
+							},
+							End: &cpb.Point{
+								ByteOffset:   9,
+								LineNumber:   1,
+								ColumnOffset: 9,
+							},
+						},
+						Message: "Test diagnostic message w/ Span",
+					},
+				},
+			},
+			{
+				File: &srvpb.File{
+					Ticket:   "kythe://corpus?path=/some/proto.proto?root=generated",
+					Text:     []byte("// Generated by /some/proto.proto"),
+					Encoding: "utf-8",
+				},
+				GeneratedBy: []string{"kythe://corpus?path=/some/proto.proto"},
 			},
 		},
 
 		RefSets: []*srvpb.PagedCrossReferences{{
 			SourceTicket: "kythe://someCorpus?lang=otpl#signature",
+			SourceNode:   getNode("kythe://someCorpus?lang=otpl#signature"),
 
 			Group: []*srvpb.PagedCrossReferences_Group{{
-				Kind: "%/kythe/edge/defines/binding",
+				BuildConfig: "testConfig",
+				Kind:        "%/kythe/edge/defines/binding",
 				Anchor: []*srvpb.ExpandedAnchor{{
-					Ticket: "kythe://c?lang=otpl?path=/a/path#27-33",
-					Kind:   "/kythe/edge/defines/binding",
-					Parent: "kythe://someCorpus?path=some/path#aFileNode",
+					Ticket:             "kythe://c?lang=otpl?path=/a/path#27-33",
+					BuildConfiguration: "testConfig",
 
 					Span: &cpb.Span{
 						Start: &cpb.Point{
@@ -335,11 +326,130 @@ var (
 					Snippet: "here and  ",
 				}},
 			}},
-
 			PageIndex: []*srvpb.PagedCrossReferences_PageIndex{{
 				PageKey: "aBcDeFg",
 				Kind:    "%/kythe/edge/ref",
 				Count:   2,
+			}},
+		}, {
+			SourceTicket: "kythe://someCorpus?lang=otpl#withRelated",
+			SourceNode:   getNode("kythe://someCorpus?lang=otpl#withRelated"),
+			MarkedSource: &cpb.MarkedSource{
+				Kind:    cpb.MarkedSource_IDENTIFIER,
+				PreText: "id",
+			},
+
+			Group: []*srvpb.PagedCrossReferences_Group{{
+				Kind: "/kythe/edge/extends",
+				RelatedNode: []*srvpb.PagedCrossReferences_RelatedNode{{
+					Node: &srvpb.Node{
+						Ticket: "kythe:#someRelatedNode",
+					},
+				}},
+			}, {
+				Kind: "/kythe/edge/param",
+				RelatedNode: []*srvpb.PagedCrossReferences_RelatedNode{{
+					Ordinal: 0,
+					Node: &srvpb.Node{
+						Ticket: "kythe:#someParameter0",
+					},
+				}, {
+					Ordinal: 1,
+					Node: &srvpb.Node{
+						Ticket: "kythe:#someParameter1",
+					},
+				}},
+			}},
+		}, {
+			SourceTicket: "kythe://someCorpus?lang=otpl#withMerge",
+			SourceNode:   getNode("kythe://someCorpus?lang=otpl#withMerge"),
+			MergeWith: []string{
+				"kythe://someCorpus?lang=otpl#withCallers",
+				"kythe://someCorpus?lang=otpl#withRelated",
+			},
+		}, {
+			SourceTicket: "kythe://someCorpus?lang=otpl#withCallers",
+			SourceNode:   getNode("kythe://someCorpus?lang=otpl#withCallers"),
+
+			Group: []*srvpb.PagedCrossReferences_Group{{
+				Kind: "#internal/ref/call/direct",
+				Caller: []*srvpb.PagedCrossReferences_Caller{{
+					Caller: &srvpb.ExpandedAnchor{
+						Ticket: "kythe:?path=someFile#someCallerAnchor",
+						Span:   arbitrarySpan,
+					},
+					MarkedSource: &cpb.MarkedSource{
+						Kind:    cpb.MarkedSource_IDENTIFIER,
+						PreText: "id",
+					},
+					SemanticCaller: "kythe:#someCaller",
+					Callsite: []*srvpb.ExpandedAnchor{{
+						Ticket: "kythe:?path=someFile#someCallsiteAnchor",
+					}},
+				}},
+			}, {
+				Kind: "#internal/ref/call/override",
+				Caller: []*srvpb.PagedCrossReferences_Caller{{
+					Caller: &srvpb.ExpandedAnchor{
+						Ticket: "kythe:?path=someFile#someOverrideCallerAnchor1",
+						Span:   arbitrarySpan,
+					},
+					Callsite: []*srvpb.ExpandedAnchor{{
+						Ticket: "kythe:?path=someFile#someCallsiteAnchor",
+						Span:   arbitrarySpan,
+					}},
+				}, {
+					Caller: &srvpb.ExpandedAnchor{
+						Ticket: "kythe:?path=someFile#someOverrideCallerAnchor2",
+						Span:   arbitrarySpan,
+					},
+					Callsite: []*srvpb.ExpandedAnchor{{
+						Ticket: "kythe:?path=someFile#someCallsiteAnchor",
+					}},
+				}},
+			}},
+		}, {
+			SourceTicket: "kythe:#aliasNode",
+			SourceNode:   getNode("kythe:#aliasNode"),
+			Group: []*srvpb.PagedCrossReferences_Group{{
+				Kind: "%/kythe/edge/aliases",
+				RelatedNode: []*srvpb.PagedCrossReferences_RelatedNode{{
+					Node: getNode("kythe://someCorpus?lang=otpl#signature"),
+				}},
+			}, {
+				Kind: "/kythe/edge/indirect",
+				RelatedNode: []*srvpb.PagedCrossReferences_RelatedNode{{
+					Node: getNode("kythe:#indirect"),
+				}},
+			}, {
+				Kind: "%/kythe/edge/ref",
+				Anchor: []*srvpb.ExpandedAnchor{{
+					Ticket: "kythe:?path=somewhere#0-9",
+
+					Span: &cpb.Span{
+						Start: &cpb.Point{LineNumber: 1},
+						End:   &cpb.Point{ByteOffset: 9, LineNumber: 1, ColumnOffset: 9},
+					},
+				}},
+			}},
+		}, {
+			SourceTicket: "kythe:#indirect",
+			SourceNode:   getNode("kythe:#indirect"),
+			Group: []*srvpb.PagedCrossReferences_Group{{
+				Kind: "%/kythe/edge/ref",
+				Anchor: []*srvpb.ExpandedAnchor{{
+					Ticket: "kythe:?path=somewhereElse#0-9",
+
+					Span: &cpb.Span{
+						Start: &cpb.Point{LineNumber: 1},
+						End:   &cpb.Point{ByteOffset: 9, LineNumber: 1, ColumnOffset: 9},
+					},
+				}},
+			}},
+			PageIndex: []*srvpb.PagedCrossReferences_PageIndex{{
+				PageKey: "indirectPage",
+				Kind:    "/kythe/edge/indirect",
+				Count:   1,
 			}},
 		}},
 		RefPages: []*srvpb.PagedCrossReferences_Page{{
@@ -348,8 +458,6 @@ var (
 				Kind: "%/kythe/edge/ref",
 				Anchor: []*srvpb.ExpandedAnchor{{
 					Ticket: "kythe:?path=some/utf16/file#0-4",
-					Kind:   "/kythe/edge/ref",
-					Parent: "kythe://someCorpus?path=some/utf16/file#utf16FTW",
 
 					Span: &cpb.Span{
 						Start: &cpb.Point{LineNumber: 1},
@@ -369,8 +477,6 @@ var (
 					Snippet: "これはいくつかのテキストです",
 				}, {
 					Ticket: "kythe://c?lang=otpl?path=/a/path#51-55",
-					Kind:   "/kythe/edge/ref",
-					Parent: "kythe://someCorpus?path=some/path#aFileNode",
 
 					Span: &cpb.Span{
 						Start: &cpb.Point{
@@ -399,20 +505,54 @@ var (
 					Snippet: "some random text",
 				}},
 			},
+		}, {
+			PageKey: "indirectPage",
+			Group: &srvpb.PagedCrossReferences_Group{
+				Kind: "/kythe/edge/indirect",
+				RelatedNode: []*srvpb.PagedCrossReferences_RelatedNode{{
+					Node: getNode("kythe://someCorpus?lang=otpl#signature"),
+				}},
+			},
+		}},
+
+		Documents: []*srvpb.Document{{
+			Ticket:  "kythe:#documented",
+			RawText: "some documentation text",
+			MarkedSource: &cpb.MarkedSource{
+				Kind:    cpb.MarkedSource_IDENTIFIER,
+				PreText: "DocumentBuilderFactory",
+			},
+			Node:        getNodes("kythe:#documented"),
+			ChildTicket: []string{"kythe:#childDoc", "kythe:#childDocBy"},
+		}, {
+			Ticket:       "kythe:#documentedBy",
+			DocumentedBy: "kythe:#documented",
+			RawText:      "replaced documentation text",
+			MarkedSource: &cpb.MarkedSource{
+				Kind:    cpb.MarkedSource_IDENTIFIER,
+				PreText: "ReplacedDocumentBuilderFactory",
+			},
+			Node: getNodes("kythe:#documentedBy"),
+		}, {
+			Ticket:  "kythe:#childDoc",
+			RawText: "child document text",
+			Node:    getNodes("kythe:#childDoc"),
+		}, {
+			Ticket:       "kythe:#childDocBy",
+			DocumentedBy: "kythe:#secondChildDoc",
+			Node:         getNodes("kythe:#childDocBy"),
+		}, {
+			Ticket:  "kythe:#secondChildDoc",
+			RawText: "second child document text",
+			Node:    getNodes("kythe:#secondChildDoc"),
 		}},
 	}
-)
 
-func getEdgeTargets(tickets ...string) []*srvpb.EdgeGroup_Edge {
-	es := make([]*srvpb.EdgeGroup_Edge, len(tickets))
-	for i, t := range tickets {
-		es[i] = &srvpb.EdgeGroup_Edge{
-			Target:  getNode(t),
-			Ordinal: int32(i),
-		}
+	arbitrarySpan = &cpb.Span{
+		Start: &cpb.Point{LineNumber: 1},
+		End:   &cpb.Point{ByteOffset: 4, LineNumber: 1, ColumnOffset: 4},
 	}
-	return es
-}
+)
 
 func getNodes(ts ...string) []*srvpb.Node {
 	var res []*srvpb.Node
@@ -441,191 +581,6 @@ func encodeText(e encoding.Encoding, text string) []byte {
 	return res
 }
 
-func TestNodes(t *testing.T) {
-	st := tbl.Construct(t)
-
-	for _, node := range tbl.Nodes {
-		reply, err := st.Nodes(ctx, &xpb.NodesRequest{
-			Ticket: []string{node.Ticket},
-		})
-		testutil.FatalOnErrT(t, "NodesRequest error: %v", err)
-
-		if len(reply.Nodes) != 1 {
-			t.Fatalf("Expected 1 node for %q; found %d: {%v}", node.Ticket, len(reply.Nodes), reply)
-		} else if err := testutil.DeepEqual(nodeInfo(node), reply.Nodes[node.Ticket]); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	var tickets []string
-	expected := make(map[string]*xpb.NodeInfo)
-	for _, n := range tbl.Nodes {
-		tickets = append(tickets, n.Ticket)
-		expected[n.Ticket] = nodeInfo(n)
-	}
-	reply, err := st.Nodes(ctx, &xpb.NodesRequest{Ticket: tickets})
-	testutil.FatalOnErrT(t, "NodesRequest error: %v", err)
-
-	if err := testutil.DeepEqual(expected, reply.Nodes); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestNodesMissing(t *testing.T) {
-	st := tbl.Construct(t)
-	reply, err := st.Nodes(ctx, &xpb.NodesRequest{
-		Ticket: []string{"kythe:#someMissingTicket"},
-	})
-	testutil.FatalOnErrT(t, "NodesRequest error: %v", err)
-
-	if len(reply.Nodes) > 0 {
-		t.Fatalf("Received unexpected reply for missing node: {%v}", reply)
-	}
-}
-
-func TestEdgesSinglePage(t *testing.T) {
-	tests := []struct {
-		Ticket string
-		Kinds  []string
-
-		EdgeSet *srvpb.PagedEdgeSet
-	}{{
-		Ticket:  tbl.EdgeSets[0].Source.Ticket,
-		EdgeSet: tbl.EdgeSets[0],
-	}, {
-		Ticket:  tbl.EdgeSets[0].Source.Ticket,
-		Kinds:   []string{"someEdgeKind", "anotherEdge"},
-		EdgeSet: tbl.EdgeSets[0],
-	}}
-
-	st := tbl.Construct(t)
-
-	for _, test := range tests {
-		reply, err := st.Edges(ctx, &xpb.EdgesRequest{
-			Ticket: []string{test.Ticket},
-			Kind:   test.Kinds,
-		})
-		testutil.FatalOnErrT(t, "EdgesRequest error: %v", err)
-
-		if len(reply.Nodes) > 0 {
-			t.Errorf("Received unexpected nodes in EdgesReply: {%v}", reply)
-		}
-		if reply.NextPageToken != "" {
-			t.Errorf("Received unexpected next_page_token in EdgesReply: {%v}", reply)
-		}
-		if len(reply.EdgeSets) != 1 {
-			t.Errorf("Expected 1 EdgeSet in EdgesReply; found %d: {%v}", len(reply.EdgeSets), reply)
-		}
-
-		expected := edgeSet(test.Kinds, test.EdgeSet, nil)
-		if err := testutil.DeepEqual(expected, reply.EdgeSets[test.Ticket]); err != nil {
-			t.Error(err)
-		}
-		if err := testutil.DeepEqual(map[string]int64{
-			"someEdgeKind": 1,
-			"anotherEdge":  2,
-		}, reply.TotalEdgesByKind); err != nil {
-			t.Error(err)
-		}
-	}
-}
-
-func TestEdgesLastPage(t *testing.T) {
-	tests := [][]string{
-		nil, // all kinds
-		{"%/kythe/edge/ref"},
-		{"%/kythe/edge/defines/binding"},
-	}
-
-	ticket := tbl.EdgeSets[1].Source.Ticket
-	es := tbl.EdgeSets[1]
-	pages := []*srvpb.EdgePage{tbl.EdgePages[1], tbl.EdgePages[2]}
-
-	st := tbl.Construct(t)
-
-	for _, kinds := range tests {
-		reply, err := st.Edges(ctx, &xpb.EdgesRequest{
-			Ticket: []string{ticket},
-			Kind:   kinds,
-		})
-		testutil.FatalOnErrT(t, "EdgesRequest error: %v", err)
-
-		if len(reply.Nodes) > 0 {
-			t.Errorf("Received unexpected nodes in EdgesReply: {%v}", reply)
-		}
-		if reply.NextPageToken != "" {
-			t.Errorf("Received unexpected next_page_token in EdgesReply: {%v}", reply)
-		}
-		if len(reply.EdgeSets) != 1 {
-			t.Fatalf("Expected 1 EdgeSet in EdgesReply; found %d: {%v}", len(reply.EdgeSets), reply)
-		}
-
-		expected := edgeSet(kinds, es, pages)
-		if err := testutil.DeepEqual(expected, reply.EdgeSets[ticket]); err != nil {
-			t.Error(err)
-		}
-	}
-}
-
-func TestEdgesMultiPage(t *testing.T) {
-	tests := []struct {
-		Ticket string
-		Kinds  []string
-
-		EdgeSet *srvpb.PagedEdgeSet
-		Pages   []*srvpb.EdgePage
-	}{{
-		Ticket:  tbl.EdgeSets[1].Source.Ticket,
-		EdgeSet: tbl.EdgeSets[1],
-		Pages:   []*srvpb.EdgePage{tbl.EdgePages[1], tbl.EdgePages[2]},
-	}}
-
-	st := tbl.Construct(t)
-
-	for _, test := range tests {
-		reply, err := st.Edges(ctx, &xpb.EdgesRequest{
-			Ticket: []string{test.Ticket},
-			Kind:   test.Kinds,
-		})
-		testutil.FatalOnErrT(t, "EdgesRequest error: %v", err)
-
-		if len(reply.Nodes) > 0 {
-			t.Errorf("Received unexpected nodes in EdgesReply: {%v}", reply)
-		}
-		if reply.NextPageToken != "" {
-			t.Errorf("Received unexpected next_page_token in EdgesReply: {%v}", reply)
-		}
-		if len(reply.EdgeSets) != 1 {
-			t.Errorf("Expected 1 EdgeSet in EdgesReply; found %d: {%v}", len(reply.EdgeSets), reply)
-		}
-
-		expected := edgeSet(test.Kinds, test.EdgeSet, test.Pages)
-		if err := testutil.DeepEqual(expected, reply.EdgeSets[test.Ticket]); err != nil {
-			t.Error(err)
-		}
-		if err := testutil.DeepEqual(map[string]int64{
-			"%/kythe/edge/defines/binding": 1,
-			"%/kythe/edge/ref":             2,
-			"someEdgeKind":                 2,
-			"anotherEdge":                  1,
-		}, reply.TotalEdgesByKind); err != nil {
-			t.Error(err)
-		}
-	}
-}
-
-func TestEdgesMissing(t *testing.T) {
-	st := tbl.Construct(t)
-	reply, err := st.Edges(ctx, &xpb.EdgesRequest{
-		Ticket: []string{"kythe:#someMissingTicket"},
-	})
-	testutil.FatalOnErrT(t, "EdgesRequest error: %v", err)
-
-	if len(reply.EdgeSets) > 0 || len(reply.Nodes) > 0 || reply.NextPageToken != "" {
-		t.Fatalf("Received unexpected reply for missing edges: {%v}", reply)
-	}
-}
-
 func TestDecorationsRefs(t *testing.T) {
 	d := tbl.Decorations[1]
 
@@ -644,7 +599,10 @@ func TestDecorationsRefs(t *testing.T) {
 		t.Errorf("Unexpected encoding: %q", reply.Encoding)
 	}
 
-	expected := refs(xrefs.NewNormalizer(d.File.Text), d.Decoration)
+	expected := refs(span.NewNormalizer(d.File.Text), d.Decoration)
+	for _, ref := range expected {
+		ref.SemanticScope = "" // not requested
+	}
 	if err := testutil.DeepEqual(expected, reply.Reference); err != nil {
 		t.Fatal(err)
 	}
@@ -653,6 +611,154 @@ func TestDecorationsRefs(t *testing.T) {
 	if err := testutil.DeepEqual(expectedNodes, reply.Nodes); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestDecorationsRefScopes(t *testing.T) {
+	d := tbl.Decorations[1]
+
+	st := tbl.Construct(t)
+	reply, err := st.Decorations(ctx, &xpb.DecorationsRequest{
+		Location:       &xpb.Location{Ticket: d.File.Ticket},
+		References:     true,
+		SemanticScopes: true,
+	})
+	testutil.FatalOnErrT(t, "DecorationsRequest error: %v", err)
+
+	expected := refs(span.NewNormalizer(d.File.Text), d.Decoration)
+	if err := testutil.DeepEqual(expected, reply.Reference); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDecorationsExtendsOverrides(t *testing.T) {
+	d := tbl.Decorations[1]
+
+	st := tbl.Construct(t)
+	reply, err := st.Decorations(ctx, &xpb.DecorationsRequest{
+		Location:          &xpb.Location{Ticket: d.File.Ticket},
+		References:        true,
+		ExtendsOverrides:  true,
+		SemanticScopes:    true,
+		TargetDefinitions: true,
+	})
+	testutil.FatalOnErrT(t, "DecorationsRequest error: %v", err)
+
+	expectedOverrides := map[string]*xpb.DecorationsReply_Overrides{
+		"kythe://c?lang=otpl?path=/a/path#map": &xpb.DecorationsReply_Overrides{
+			Override: []*xpb.DecorationsReply_Override{{
+				Kind:             xpb.DecorationsReply_Override_EXTENDS,
+				Target:           "kythe://c?lang=otpl#map",
+				TargetDefinition: "kythe://c?lang=otpl?path=/b/path#mapDef",
+				MarkedSource: &cpb.MarkedSource{
+					Kind:    cpb.MarkedSource_IDENTIFIER,
+					PreText: "OverrideMS",
+				},
+			}, {
+				Kind:             xpb.DecorationsReply_Override_EXTENDS,
+				Target:           "kythe://c?lang=otpl#map",
+				TargetDefinition: "kythe://c?lang=otpl?path=/b/path#mapDefOtherConfig",
+				MarkedSource: &cpb.MarkedSource{
+					Kind:    cpb.MarkedSource_IDENTIFIER,
+					PreText: "OverrideMS",
+				},
+			}},
+		},
+	}
+	if err := testutil.DeepEqual(expectedOverrides, reply.ExtendsOverrides); err != nil {
+		t.Fatal(err)
+	}
+
+	expectedDefs := map[string]*xpb.Anchor{
+		"kythe://c?lang=otpl?path=/b/path#mapDef": &xpb.Anchor{
+			Ticket:      "kythe://c?lang=otpl?path=/b/path#mapDef",
+			Parent:      "kythe://c?path=/b/path",
+			BuildConfig: "test-build-config",
+			Span: &cpb.Span{
+				Start: &cpb.Point{LineNumber: 1},
+				End:   &cpb.Point{ByteOffset: 4, LineNumber: 1, ColumnOffset: 4},
+			},
+		},
+		"kythe://c?lang=otpl?path=/b/path#mapDefOtherConfig": &xpb.Anchor{
+			Ticket:      "kythe://c?lang=otpl?path=/b/path#mapDefOtherConfig",
+			Parent:      "kythe://c?path=/b/path",
+			BuildConfig: "other-build-config",
+			Span: &cpb.Span{
+				Start: &cpb.Point{LineNumber: 1},
+				End:   &cpb.Point{ByteOffset: 4, LineNumber: 1, ColumnOffset: 4},
+			},
+		},
+	}
+	if err := testutil.DeepEqual(expectedDefs, reply.DefinitionLocations); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDecorationsBuildConfig(t *testing.T) {
+	d := tbl.Decorations[1]
+	st := tbl.Construct(t)
+
+	t.Run("MissingConfig", func(t *testing.T) {
+		reply, err := st.Decorations(ctx, &xpb.DecorationsRequest{
+			Location:          &xpb.Location{Ticket: d.File.Ticket},
+			References:        true,
+			BuildConfig:       []string{"missing-build-config"},
+			ExtendsOverrides:  true,
+			TargetDefinitions: true,
+		})
+		testutil.FatalOnErrT(t, "DecorationsRequest error: %v", err)
+
+		if err := testutil.DeepEqual([]*xpb.DecorationsReply_Reference{}, reply.Reference); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("FoundConfig", func(t *testing.T) {
+		reply, err := st.Decorations(ctx, &xpb.DecorationsRequest{
+			Location:          &xpb.Location{Ticket: d.File.Ticket},
+			References:        true,
+			BuildConfig:       []string{"test-build-config"},
+			ExtendsOverrides:  true,
+			TargetDefinitions: true,
+		})
+		testutil.FatalOnErrT(t, "DecorationsRequest error: %v", err)
+
+		expected := refs(span.NewNormalizer(d.File.Text), d.Decoration[:1])
+		if err := testutil.DeepEqual(expected, reply.Reference); err != nil {
+			t.Fatal(err)
+		}
+
+		expectedOverrides := map[string]*xpb.DecorationsReply_Overrides{
+			"kythe://c?lang=otpl?path=/a/path#map": &xpb.DecorationsReply_Overrides{
+				Override: []*xpb.DecorationsReply_Override{{
+					Kind:             xpb.DecorationsReply_Override_EXTENDS,
+					Target:           "kythe://c?lang=otpl#map",
+					TargetDefinition: "kythe://c?lang=otpl?path=/b/path#mapDef",
+					MarkedSource: &cpb.MarkedSource{
+						Kind:    cpb.MarkedSource_IDENTIFIER,
+						PreText: "OverrideMS",
+					},
+				}},
+			},
+		}
+		if err := testutil.DeepEqual(expectedOverrides, reply.ExtendsOverrides); err != nil {
+			t.Fatal(err)
+		}
+
+		expectedDefs := map[string]*xpb.Anchor{
+			"kythe://c?lang=otpl?path=/b/path#mapDef": &xpb.Anchor{
+				Ticket:      "kythe://c?lang=otpl?path=/b/path#mapDef",
+				Parent:      "kythe://c?path=/b/path",
+				BuildConfig: "test-build-config",
+				Span: &cpb.Span{
+					Start: &cpb.Point{LineNumber: 1},
+					End:   &cpb.Point{ByteOffset: 4, LineNumber: 1, ColumnOffset: 4},
+				},
+			},
+		}
+		if err := testutil.DeepEqual(expectedDefs, reply.DefinitionLocations); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestDecorationsDirtyBuffer(t *testing.T) {
@@ -683,36 +789,40 @@ func TestDecorationsDirtyBuffer(t *testing.T) {
 	expected := []*xpb.DecorationsReply_Reference{
 		{
 			// Unpatched anchor for "map"
-			SourceTicket: "kythe://c?lang=otpl?path=/a/path#6-9",
 			TargetTicket: "kythe://c?lang=otpl?path=/a/path#map",
-			Kind:         "/kythe/defines/binding",
+			Kind:         "/kythe/edge/defines/binding",
 
-			AnchorStart: &xpb.Location_Point{
-				ByteOffset:   6,
-				LineNumber:   1,
-				ColumnOffset: 6,
+			Span: &cpb.Span{
+				Start: &cpb.Point{
+					ByteOffset:   6,
+					LineNumber:   1,
+					ColumnOffset: 6,
+				},
+				End: &cpb.Point{
+					ByteOffset:   9,
+					LineNumber:   1,
+					ColumnOffset: 9,
+				},
 			},
-			AnchorEnd: &xpb.Location_Point{
-				ByteOffset:   9,
-				LineNumber:   1,
-				ColumnOffset: 9,
-			},
+
+			BuildConfig: "test-build-config",
 		},
 		// Skipped anchor for "empty?" (inside edit region)
 		{
 			// Patched anchor for "cons" (moved backwards by 3 bytes)
-			SourceTicket: "kythe://c?lang=otpl?path=/a/path#51-55",
 			TargetTicket: "kythe://core?lang=otpl#cons",
 			Kind:         "/kythe/refs",
-			AnchorStart: &xpb.Location_Point{
-				ByteOffset:   48,
-				LineNumber:   4,
-				ColumnOffset: 5,
-			},
-			AnchorEnd: &xpb.Location_Point{
-				ByteOffset:   52,
-				LineNumber:   4,
-				ColumnOffset: 9,
+			Span: &cpb.Span{
+				Start: &cpb.Point{
+					ByteOffset:   48,
+					LineNumber:   4,
+					ColumnOffset: 5,
+				},
+				End: &cpb.Point{
+					ByteOffset:   52,
+					LineNumber:   4,
+					ColumnOffset: 9,
+				},
 			},
 		},
 	}
@@ -779,13 +889,45 @@ func TestDecorationsSourceText(t *testing.T) {
 	}
 }
 
+func TestDecorationsGeneratedBy(t *testing.T) {
+	st := tbl.Construct(t)
+	reply, err := st.Decorations(ctx, &xpb.DecorationsRequest{
+		Location: &xpb.Location{Ticket: "kythe://corpus?path=/some/proto.proto?root=generated"},
+	})
+	testutil.FatalOnErrT(t, "DecorationsRequest error: %v", err)
+
+	expected := &xpb.DecorationsReply{
+		Location:    &xpb.Location{Ticket: "kythe://corpus?path=/some/proto.proto?root=generated"},
+		GeneratedBy: []string{"kythe://corpus?path=/some/proto.proto"},
+	}
+
+	if diff := compare.ProtoDiff(expected, reply); diff != "" {
+		t.Fatalf("Unexpected diff (- expected; + found):\n%s", diff)
+	}
+}
+
+func TestDecorationsDiagnostics(t *testing.T) {
+	d := tbl.Decorations[1]
+
+	st := tbl.Construct(t)
+	reply, err := st.Decorations(ctx, &xpb.DecorationsRequest{
+		Location:    &xpb.Location{Ticket: d.File.Ticket},
+		Diagnostics: true,
+	})
+	testutil.FatalOnErrT(t, "DecorationsRequest error: %v", err)
+
+	expected := tbl.Decorations[1].Diagnostic
+	if err := testutil.DeepEqual(expected, reply.Diagnostic); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCrossReferencesNone(t *testing.T) {
 	st := tbl.Construct(t)
 	reply, err := st.CrossReferences(ctx, &xpb.CrossReferencesRequest{
-		Ticket:            []string{"kythe://someCorpus?lang=otpl#sig2"},
-		DocumentationKind: xpb.CrossReferencesRequest_ALL_DOCUMENTATION,
-		DefinitionKind:    xpb.CrossReferencesRequest_ALL_DEFINITIONS,
-		ReferenceKind:     xpb.CrossReferencesRequest_ALL_REFERENCES,
+		Ticket:         []string{"kythe://someCorpus?lang=otpl#sig2"},
+		DefinitionKind: xpb.CrossReferencesRequest_ALL_DEFINITIONS,
+		ReferenceKind:  xpb.CrossReferencesRequest_ALL_REFERENCES,
 	})
 	testutil.FatalOnErrT(t, "CrossReferencesRequest error: %v", err)
 
@@ -802,84 +944,95 @@ func TestCrossReferences(t *testing.T) {
 		Ticket:         []string{ticket},
 		DefinitionKind: xpb.CrossReferencesRequest_BINDING_DEFINITIONS,
 		ReferenceKind:  xpb.CrossReferencesRequest_ALL_REFERENCES,
-
-		ExperimentalSignatures: true,
+		Snippets:       xpb.SnippetsKind_DEFAULT,
 	})
 	testutil.FatalOnErrT(t, "CrossReferencesRequest error: %v", err)
 
 	expected := &xpb.CrossReferencesReply_CrossReferenceSet{
-		Ticket:      ticket,
-		DisplayName: &xpb.Printable{RawText: ""},
+		Ticket: ticket,
 
 		Reference: []*xpb.CrossReferencesReply_RelatedAnchor{{Anchor: &xpb.Anchor{
 			Ticket: "kythe:?path=some/utf16/file#0-4",
 			Kind:   "/kythe/edge/ref",
-			Parent: "kythe://someCorpus?path=some/utf16/file#utf16FTW",
+			Parent: "kythe:?path=some/utf16/file",
 
-			Start: &xpb.Location_Point{LineNumber: 1},
-			End:   &xpb.Location_Point{ByteOffset: 4, LineNumber: 1, ColumnOffset: 4},
-
-			SnippetStart: &xpb.Location_Point{
-				LineNumber: 1,
+			Span: &cpb.Span{
+				Start: &cpb.Point{LineNumber: 1},
+				End:   &cpb.Point{ByteOffset: 4, LineNumber: 1, ColumnOffset: 4},
 			},
-			SnippetEnd: &xpb.Location_Point{
-				ByteOffset:   28,
-				LineNumber:   1,
-				ColumnOffset: 28,
+
+			SnippetSpan: &cpb.Span{
+				Start: &cpb.Point{
+					LineNumber: 1,
+				},
+				End: &cpb.Point{
+					ByteOffset:   28,
+					LineNumber:   1,
+					ColumnOffset: 28,
+				},
 			},
 			Snippet: "これはいくつかのテキストです",
 		}}, {Anchor: &xpb.Anchor{
 			Ticket: "kythe://c?lang=otpl?path=/a/path#51-55",
 			Kind:   "/kythe/edge/ref",
-			Parent: "kythe://someCorpus?path=some/path#aFileNode",
+			Parent: "kythe://c?path=/a/path",
 
-			Start: &xpb.Location_Point{
-				ByteOffset:   51,
-				LineNumber:   4,
-				ColumnOffset: 15,
-			},
-			End: &xpb.Location_Point{
-				ByteOffset:   55,
-				LineNumber:   5,
-				ColumnOffset: 2,
+			Span: &cpb.Span{
+				Start: &cpb.Point{
+					ByteOffset:   51,
+					LineNumber:   4,
+					ColumnOffset: 15,
+				},
+				End: &cpb.Point{
+					ByteOffset:   55,
+					LineNumber:   5,
+					ColumnOffset: 2,
+				},
 			},
 
-			SnippetStart: &xpb.Location_Point{
-				ByteOffset: 36,
-				LineNumber: 4,
-			},
-			SnippetEnd: &xpb.Location_Point{
-				ByteOffset:   52,
-				LineNumber:   4,
-				ColumnOffset: 16,
+			SnippetSpan: &cpb.Span{
+				Start: &cpb.Point{
+					ByteOffset: 36,
+					LineNumber: 4,
+				},
+				End: &cpb.Point{
+					ByteOffset:   52,
+					LineNumber:   4,
+					ColumnOffset: 16,
+				},
 			},
 			Snippet: "some random text",
 		}}},
 
 		Definition: []*xpb.CrossReferencesReply_RelatedAnchor{{Anchor: &xpb.Anchor{
-			Ticket: "kythe://c?lang=otpl?path=/a/path#27-33",
-			Kind:   "/kythe/edge/defines/binding",
-			Parent: "kythe://someCorpus?path=some/path#aFileNode",
+			Ticket:      "kythe://c?lang=otpl?path=/a/path#27-33",
+			Kind:        "/kythe/edge/defines/binding",
+			Parent:      "kythe://c?path=/a/path",
+			BuildConfig: "testConfig",
 
-			Start: &xpb.Location_Point{
-				ByteOffset:   27,
-				LineNumber:   2,
-				ColumnOffset: 10,
-			},
-			End: &xpb.Location_Point{
-				ByteOffset:   33,
-				LineNumber:   3,
-				ColumnOffset: 5,
+			Span: &cpb.Span{
+				Start: &cpb.Point{
+					ByteOffset:   27,
+					LineNumber:   2,
+					ColumnOffset: 10,
+				},
+				End: &cpb.Point{
+					ByteOffset:   33,
+					LineNumber:   3,
+					ColumnOffset: 5,
+				},
 			},
 
-			SnippetStart: &xpb.Location_Point{
-				ByteOffset: 17,
-				LineNumber: 2,
-			},
-			SnippetEnd: &xpb.Location_Point{
-				ByteOffset:   27,
-				LineNumber:   2,
-				ColumnOffset: 10,
+			SnippetSpan: &cpb.Span{
+				Start: &cpb.Point{
+					ByteOffset: 17,
+					LineNumber: 2,
+				},
+				End: &cpb.Point{
+					ByteOffset:   27,
+					LineNumber:   2,
+					ColumnOffset: 10,
+				},
 			},
 			Snippet: "here and  ",
 		}}},
@@ -903,29 +1056,805 @@ func TestCrossReferences(t *testing.T) {
 	}
 }
 
-func nodeInfos(nss ...[]*srvpb.Node) map[string]*xpb.NodeInfo {
-	m := make(map[string]*xpb.NodeInfo)
+func TestCrossReferences_BuildConfigRefs(t *testing.T) {
+	ticket := "kythe://someCorpus?lang=otpl#signature"
+
+	st := tbl.Construct(t)
+	reply, err := st.CrossReferences(ctx, &xpb.CrossReferencesRequest{
+		Ticket:         []string{ticket},
+		DefinitionKind: xpb.CrossReferencesRequest_ALL_DEFINITIONS,
+		ReferenceKind:  xpb.CrossReferencesRequest_ALL_REFERENCES,
+		Snippets:       xpb.SnippetsKind_DEFAULT,
+		BuildConfig:    []string{"testConfig"},
+	})
+	testutil.FatalOnErrT(t, "CrossReferencesRequest error: %v", err)
+
+	expected := &xpb.CrossReferencesReply_CrossReferenceSet{
+		Ticket: ticket,
+
+		Definition: []*xpb.CrossReferencesReply_RelatedAnchor{{Anchor: &xpb.Anchor{
+			Ticket:      "kythe://c?lang=otpl?path=/a/path#27-33",
+			Kind:        "/kythe/edge/defines/binding",
+			Parent:      "kythe://c?path=/a/path",
+			BuildConfig: "testConfig",
+
+			Span: &cpb.Span{
+				Start: &cpb.Point{
+					ByteOffset:   27,
+					LineNumber:   2,
+					ColumnOffset: 10,
+				},
+				End: &cpb.Point{
+					ByteOffset:   33,
+					LineNumber:   3,
+					ColumnOffset: 5,
+				},
+			},
+
+			SnippetSpan: &cpb.Span{
+				Start: &cpb.Point{
+					ByteOffset: 17,
+					LineNumber: 2,
+				},
+				End: &cpb.Point{
+					ByteOffset:   27,
+					LineNumber:   2,
+					ColumnOffset: 10,
+				},
+			},
+			Snippet: "here and  ",
+		}}},
+	}
+
+	if err := testutil.DeepEqual(&xpb.CrossReferencesReply_Total{
+		Definitions: 1,
+	}, reply.Total); err != nil {
+		t.Error(err)
+	}
+
+	xr := reply.CrossReferences[ticket]
+	if xr == nil {
+		t.Fatalf("Missing expected CrossReferences; found: %#v", reply)
+	}
+	sort.Sort(byOffset(xr.Reference))
+
+	if err := testutil.DeepEqual(expected, xr); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCrossReferencesRelatedNodes(t *testing.T) {
+	ticket := "kythe://someCorpus?lang=otpl#withRelated"
+
+	st := tbl.Construct(t)
+	reply, err := st.CrossReferences(ctx, &xpb.CrossReferencesRequest{
+		Ticket: []string{ticket},
+		Filter: []string{"**"},
+	})
+	testutil.FatalOnErrT(t, "CrossReferencesRequest error: %v", err)
+
+	expected := &xpb.CrossReferencesReply_CrossReferenceSet{
+		Ticket: ticket,
+		MarkedSource: &cpb.MarkedSource{
+			Kind:    cpb.MarkedSource_IDENTIFIER,
+			PreText: "id",
+		},
+
+		RelatedNode: []*xpb.CrossReferencesReply_RelatedNode{{
+			Ticket:       "kythe:#someRelatedNode",
+			RelationKind: "/kythe/edge/extends",
+		}, {
+			Ticket:       "kythe:#someParameter0",
+			RelationKind: "/kythe/edge/param",
+			Ordinal:      0,
+		}, {
+			Ticket:       "kythe:#someParameter1",
+			RelationKind: "/kythe/edge/param",
+			Ordinal:      1,
+		}},
+	}
+	expectedNodes := nodeInfos(getNodes(
+		ticket,
+		"kythe:#someRelatedNode",
+		"kythe:#someParameter0",
+		"kythe:#someParameter1"))
+
+	if err := testutil.DeepEqual(&xpb.CrossReferencesReply_Total{
+		RelatedNodesByRelation: map[string]int64{
+			"/kythe/edge/extends": 1,
+			"/kythe/edge/param":   2,
+		},
+	}, reply.Total); err != nil {
+		t.Error(err)
+	}
+
+	xr := reply.CrossReferences[ticket]
+	if xr == nil {
+		t.Fatalf("Missing expected CrossReferences; found: %#v", reply)
+	} else if err := testutil.DeepEqual(expected, xr); err != nil {
+		t.Fatal(err)
+	} else if err := testutil.DeepEqual(expectedNodes, reply.Nodes); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCrossReferencesMarkedSource(t *testing.T) {
+	const ticket = "kythe://someCorpus?lang=otpl#withRelated"
+
+	st := tbl.Construct(t)
+	reply, err := st.CrossReferences(ctx, &xpb.CrossReferencesRequest{
+		Ticket: []string{ticket},
+		Filter: []string{"**"},
+	})
+	testutil.FatalOnErrT(t, "CrossReferencesRequest error: %v", err)
+
+	expected := &xpb.CrossReferencesReply_CrossReferenceSet{
+		Ticket: ticket,
+		MarkedSource: &cpb.MarkedSource{
+			Kind:    cpb.MarkedSource_IDENTIFIER,
+			PreText: "id",
+		},
+
+		RelatedNode: []*xpb.CrossReferencesReply_RelatedNode{{
+			Ticket:       "kythe:#someRelatedNode",
+			RelationKind: "/kythe/edge/extends",
+		}, {
+			Ticket:       "kythe:#someParameter0",
+			RelationKind: "/kythe/edge/param",
+			Ordinal:      0,
+		}, {
+			Ticket:       "kythe:#someParameter1",
+			RelationKind: "/kythe/edge/param",
+			Ordinal:      1,
+		}},
+	}
+
+	if err := testutil.DeepEqual(&xpb.CrossReferencesReply_Total{
+		RelatedNodesByRelation: map[string]int64{
+			"/kythe/edge/extends": 1,
+			"/kythe/edge/param":   2,
+		},
+	}, reply.Total); err != nil {
+		t.Error(err)
+	}
+
+	xr := reply.CrossReferences[ticket]
+	if xr == nil {
+		t.Fatalf("Missing expected CrossReferences; found: %#v", reply)
+	} else if err := testutil.DeepEqual(expected, xr); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCrossReferencesMerge(t *testing.T) {
+	ticket := "kythe://someCorpus?lang=otpl#withMerge"
+
+	st := tbl.Construct(t)
+	reply, err := st.CrossReferences(ctx, &xpb.CrossReferencesRequest{
+		Ticket:     []string{ticket},
+		CallerKind: xpb.CrossReferencesRequest_DIRECT_CALLERS,
+		Filter:     []string{"**"},
+	})
+	testutil.FatalOnErrT(t, "CrossReferencesRequest error: %v", err)
+
+	expected := &xpb.CrossReferencesReply_CrossReferenceSet{
+		Ticket: ticket,
+		MarkedSource: &cpb.MarkedSource{
+			Kind:    cpb.MarkedSource_IDENTIFIER,
+			PreText: "id",
+		},
+
+		Caller: []*xpb.CrossReferencesReply_RelatedAnchor{{
+			Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=someFile#someCallerAnchor",
+				Parent: "kythe:?path=someFile",
+				Span:   arbitrarySpan,
+			},
+			Ticket: "kythe:#someCaller",
+			MarkedSource: &cpb.MarkedSource{
+				Kind:    cpb.MarkedSource_IDENTIFIER,
+				PreText: "id",
+			},
+			Site: []*xpb.Anchor{{
+				Ticket: "kythe:?path=someFile#someCallsiteAnchor",
+				Parent: "kythe:?path=someFile",
+			}},
+		}},
+		RelatedNode: []*xpb.CrossReferencesReply_RelatedNode{{
+			Ticket:       "kythe:#someRelatedNode",
+			RelationKind: "/kythe/edge/extends",
+		}, {
+			Ticket:       "kythe:#someParameter0",
+			RelationKind: "/kythe/edge/param",
+			Ordinal:      0,
+		}, {
+			Ticket:       "kythe:#someParameter1",
+			RelationKind: "/kythe/edge/param",
+			Ordinal:      1,
+		}},
+	}
+
+	if err := testutil.DeepEqual(&xpb.CrossReferencesReply_Total{
+		Callers: 1,
+		RelatedNodesByRelation: map[string]int64{
+			"/kythe/edge/extends": 1,
+			"/kythe/edge/param":   2,
+		},
+	}, reply.Total); err != nil {
+		t.Error(err)
+	}
+
+	xr := reply.CrossReferences[ticket]
+	if xr == nil {
+		t.Fatalf("Missing expected CrossReferences; found: %#v", reply)
+	} else if err := testutil.DeepEqual(expected, xr); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCrossReferencesIndirection(t *testing.T) {
+	ticket := "kythe:#aliasNode"
+	st := tbl.Construct(t)
+
+	t.Run("none", func(t *testing.T) {
+		experimentalCrossReferenceIndirectionKinds = nil
+
+		reply, err := st.CrossReferences(ctx, &xpb.CrossReferencesRequest{
+			Ticket:        []string{ticket},
+			ReferenceKind: xpb.CrossReferencesRequest_ALL_REFERENCES,
+		})
+		testutil.FatalOnErrT(t, "CrossReferencesRequest error: %v", err)
+
+		expected := &xpb.CrossReferencesReply_CrossReferenceSet{
+			Ticket: ticket,
+
+			Reference: []*xpb.CrossReferencesReply_RelatedAnchor{{Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=somewhere#0-9",
+				Kind:   "/kythe/edge/ref",
+				Parent: "kythe:?path=somewhere",
+
+				Span: &cpb.Span{
+					Start: &cpb.Point{LineNumber: 1},
+					End:   &cpb.Point{ByteOffset: 9, LineNumber: 1, ColumnOffset: 9},
+				},
+			}}},
+		}
+
+		if err := testutil.DeepEqual(&xpb.CrossReferencesReply_Total{
+			References: 1,
+		}, reply.Total); err != nil {
+			t.Error(err)
+		}
+
+		xr := reply.CrossReferences[ticket]
+		if xr == nil {
+			t.Fatalf("Missing expected CrossReferences; found: %#v", reply)
+		} else if err := testutil.DeepEqual(expected, xr); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("talias", func(t *testing.T) {
+		// Enable indirection for talias nodes.
+		experimentalCrossReferenceIndirectionKinds = nil
+		experimentalCrossReferenceIndirectionKinds.Set("talias=%/kythe/edge/aliases")
+
+		reply, err := st.CrossReferences(ctx, &xpb.CrossReferencesRequest{
+			Ticket:        []string{ticket},
+			ReferenceKind: xpb.CrossReferencesRequest_ALL_REFERENCES,
+		})
+		testutil.FatalOnErrT(t, "CrossReferencesRequest error: %v", err)
+
+		expected := &xpb.CrossReferencesReply_CrossReferenceSet{
+			Ticket: ticket,
+
+			Reference: []*xpb.CrossReferencesReply_RelatedAnchor{{Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=somewhere#0-9",
+				Kind:   "/kythe/edge/ref",
+				Parent: "kythe:?path=somewhere",
+
+				Span: &cpb.Span{
+					Start: &cpb.Point{LineNumber: 1},
+					End:   &cpb.Point{ByteOffset: 9, LineNumber: 1, ColumnOffset: 9},
+				},
+			}}, {Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=some/utf16/file#0-4",
+				Kind:   "/kythe/edge/ref",
+				Parent: "kythe:?path=some/utf16/file",
+
+				Span: &cpb.Span{
+					Start: &cpb.Point{LineNumber: 1},
+					End:   &cpb.Point{ByteOffset: 4, LineNumber: 1, ColumnOffset: 4},
+				},
+			}}, {Anchor: &xpb.Anchor{
+				Ticket: "kythe://c?lang=otpl?path=/a/path#51-55",
+				Kind:   "/kythe/edge/ref",
+				Parent: "kythe://c?path=/a/path",
+
+				Span: &cpb.Span{
+					Start: &cpb.Point{
+						ByteOffset:   51,
+						LineNumber:   4,
+						ColumnOffset: 15,
+					},
+					End: &cpb.Point{
+						ByteOffset:   55,
+						LineNumber:   5,
+						ColumnOffset: 2,
+					},
+				},
+			}}},
+		}
+
+		if err := testutil.DeepEqual(&xpb.CrossReferencesReply_Total{
+			References: 3,
+		}, reply.Total); err != nil {
+			t.Error(err)
+		}
+
+		xr := reply.CrossReferences[ticket]
+		if xr == nil {
+			t.Fatalf("Missing expected CrossReferences; found: %#v", reply)
+		}
+
+		sort.Sort(byOffset(xr.Reference))
+		if err := testutil.DeepEqual(expected, xr); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("wildcard", func(t *testing.T) {
+		// Enable indirection for any nodes with a reverse aliases edge.
+		experimentalCrossReferenceIndirectionKinds = nil
+		experimentalCrossReferenceIndirectionKinds.Set("*=%/kythe/edge/aliases")
+
+		reply, err := st.CrossReferences(ctx, &xpb.CrossReferencesRequest{
+			Ticket:        []string{ticket},
+			ReferenceKind: xpb.CrossReferencesRequest_ALL_REFERENCES,
+		})
+		testutil.FatalOnErrT(t, "CrossReferencesRequest error: %v", err)
+
+		expected := &xpb.CrossReferencesReply_CrossReferenceSet{
+			Ticket: ticket,
+
+			Reference: []*xpb.CrossReferencesReply_RelatedAnchor{{Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=somewhere#0-9",
+				Kind:   "/kythe/edge/ref",
+				Parent: "kythe:?path=somewhere",
+
+				Span: &cpb.Span{
+					Start: &cpb.Point{LineNumber: 1},
+					End:   &cpb.Point{ByteOffset: 9, LineNumber: 1, ColumnOffset: 9},
+				},
+			}}, {Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=some/utf16/file#0-4",
+				Kind:   "/kythe/edge/ref",
+				Parent: "kythe:?path=some/utf16/file",
+
+				Span: &cpb.Span{
+					Start: &cpb.Point{LineNumber: 1},
+					End:   &cpb.Point{ByteOffset: 4, LineNumber: 1, ColumnOffset: 4},
+				},
+			}}, {Anchor: &xpb.Anchor{
+				Ticket: "kythe://c?lang=otpl?path=/a/path#51-55",
+				Kind:   "/kythe/edge/ref",
+				Parent: "kythe://c?path=/a/path",
+
+				Span: &cpb.Span{
+					Start: &cpb.Point{
+						ByteOffset:   51,
+						LineNumber:   4,
+						ColumnOffset: 15,
+					},
+					End: &cpb.Point{
+						ByteOffset:   55,
+						LineNumber:   5,
+						ColumnOffset: 2,
+					},
+				},
+			}}},
+		}
+
+		if err := testutil.DeepEqual(&xpb.CrossReferencesReply_Total{
+			References: 3,
+		}, reply.Total); err != nil {
+			t.Error(err)
+		}
+
+		xr := reply.CrossReferences[ticket]
+		if xr == nil {
+			t.Fatalf("Missing expected CrossReferences; found: %#v", reply)
+		}
+
+		sort.Sort(byOffset(xr.Reference))
+		if err := testutil.DeepEqual(expected, xr); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("single_indirect", func(t *testing.T) {
+		// Enable single indirection for talias nodes.
+		experimentalCrossReferenceIndirectionKinds = nil
+		experimentalCrossReferenceIndirectionKinds.Set("talias=/kythe/edge/indirect")
+
+		reply, err := st.CrossReferences(ctx, &xpb.CrossReferencesRequest{
+			Ticket:        []string{ticket},
+			ReferenceKind: xpb.CrossReferencesRequest_ALL_REFERENCES,
+		})
+		testutil.FatalOnErrT(t, "CrossReferencesRequest error: %v", err)
+
+		expected := &xpb.CrossReferencesReply_CrossReferenceSet{
+			Ticket: ticket,
+
+			Reference: []*xpb.CrossReferencesReply_RelatedAnchor{{Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=somewhere#0-9",
+				Kind:   "/kythe/edge/ref",
+				Parent: "kythe:?path=somewhere",
+
+				Span: &cpb.Span{
+					Start: &cpb.Point{LineNumber: 1},
+					End:   &cpb.Point{ByteOffset: 9, LineNumber: 1, ColumnOffset: 9},
+				},
+			}}, {Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=somewhereElse#0-9",
+				Kind:   "/kythe/edge/ref",
+				Parent: "kythe:?path=somewhereElse",
+
+				Span: &cpb.Span{
+					Start: &cpb.Point{LineNumber: 1},
+					End:   &cpb.Point{ByteOffset: 9, LineNumber: 1, ColumnOffset: 9},
+				},
+			}}},
+		}
+
+		if err := testutil.DeepEqual(&xpb.CrossReferencesReply_Total{
+			References: 2,
+		}, reply.Total); err != nil {
+			t.Error(err)
+		}
+
+		xr := reply.CrossReferences[ticket]
+		if xr == nil {
+			t.Fatalf("Missing expected CrossReferences; found: %#v", reply)
+		}
+
+		sort.Sort(byOffset(xr.Reference))
+		if err := testutil.DeepEqual(expected, xr); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("double_indirect", func(t *testing.T) {
+		// Enable double indirection for talias nodes.
+		experimentalCrossReferenceIndirectionKinds = nil
+		experimentalCrossReferenceIndirectionKinds.Set("talias=/kythe/edge/indirect,indirect=/kythe/edge/indirect")
+
+		reply, err := st.CrossReferences(ctx, &xpb.CrossReferencesRequest{
+			Ticket:        []string{ticket},
+			ReferenceKind: xpb.CrossReferencesRequest_ALL_REFERENCES,
+		})
+		testutil.FatalOnErrT(t, "CrossReferencesRequest error: %v", err)
+
+		expected := &xpb.CrossReferencesReply_CrossReferenceSet{
+			Ticket: ticket,
+
+			Reference: []*xpb.CrossReferencesReply_RelatedAnchor{{Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=somewhere#0-9",
+				Kind:   "/kythe/edge/ref",
+				Parent: "kythe:?path=somewhere",
+
+				Span: &cpb.Span{
+					Start: &cpb.Point{LineNumber: 1},
+					End:   &cpb.Point{ByteOffset: 9, LineNumber: 1, ColumnOffset: 9},
+				},
+			}}, {Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=somewhereElse#0-9",
+				Kind:   "/kythe/edge/ref",
+				Parent: "kythe:?path=somewhereElse",
+
+				Span: &cpb.Span{
+					Start: &cpb.Point{LineNumber: 1},
+					End:   &cpb.Point{ByteOffset: 9, LineNumber: 1, ColumnOffset: 9},
+				},
+			}}, {Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=some/utf16/file#0-4",
+				Kind:   "/kythe/edge/ref",
+				Parent: "kythe:?path=some/utf16/file",
+
+				Span: &cpb.Span{
+					Start: &cpb.Point{LineNumber: 1},
+					End:   &cpb.Point{ByteOffset: 4, LineNumber: 1, ColumnOffset: 4},
+				},
+			}}, {Anchor: &xpb.Anchor{
+				Ticket: "kythe://c?lang=otpl?path=/a/path#51-55",
+				Kind:   "/kythe/edge/ref",
+				Parent: "kythe://c?path=/a/path",
+
+				Span: &cpb.Span{
+					Start: &cpb.Point{
+						ByteOffset:   51,
+						LineNumber:   4,
+						ColumnOffset: 15,
+					},
+					End: &cpb.Point{
+						ByteOffset:   55,
+						LineNumber:   5,
+						ColumnOffset: 2,
+					},
+				},
+			}}},
+		}
+
+		if err := testutil.DeepEqual(&xpb.CrossReferencesReply_Total{
+			References: 4,
+		}, reply.Total); err != nil {
+			t.Error(err)
+		}
+
+		xr := reply.CrossReferences[ticket]
+		if xr == nil {
+			t.Fatalf("Missing expected CrossReferences; found: %#v", reply)
+		}
+
+		sort.Sort(byOffset(xr.Reference))
+		if err := testutil.DeepEqual(expected, xr); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestCrossReferencesDirectCallers(t *testing.T) {
+	ticket := "kythe://someCorpus?lang=otpl#withCallers"
+
+	st := tbl.Construct(t)
+	reply, err := st.CrossReferences(ctx, &xpb.CrossReferencesRequest{
+		Ticket:     []string{ticket},
+		CallerKind: xpb.CrossReferencesRequest_DIRECT_CALLERS,
+	})
+	testutil.FatalOnErrT(t, "CrossReferencesRequest error: %v", err)
+
+	expected := &xpb.CrossReferencesReply_CrossReferenceSet{
+		Ticket: ticket,
+
+		Caller: []*xpb.CrossReferencesReply_RelatedAnchor{{
+			Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=someFile#someCallerAnchor",
+				Parent: "kythe:?path=someFile",
+				Span:   arbitrarySpan,
+			},
+			Ticket: "kythe:#someCaller",
+			MarkedSource: &cpb.MarkedSource{
+				Kind:    cpb.MarkedSource_IDENTIFIER,
+				PreText: "id",
+			},
+			Site: []*xpb.Anchor{{
+				Ticket: "kythe:?path=someFile#someCallsiteAnchor",
+				Parent: "kythe:?path=someFile",
+			}},
+		}},
+	}
+
+	if err := testutil.DeepEqual(&xpb.CrossReferencesReply_Total{
+		Callers: 1,
+	}, reply.Total); err != nil {
+		t.Error(err)
+	}
+
+	xr := reply.CrossReferences[ticket]
+	if xr == nil {
+		t.Fatalf("Missing expected CrossReferences; found: %#v", reply)
+	} else if err := testutil.DeepEqual(expected, xr); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCrossReferencesOverrideCallers(t *testing.T) {
+	ticket := "kythe://someCorpus?lang=otpl#withCallers"
+
+	st := tbl.Construct(t)
+	reply, err := st.CrossReferences(ctx, &xpb.CrossReferencesRequest{
+		Ticket:     []string{ticket},
+		CallerKind: xpb.CrossReferencesRequest_OVERRIDE_CALLERS,
+	})
+	testutil.FatalOnErrT(t, "CrossReferencesRequest error: %v", err)
+
+	expected := &xpb.CrossReferencesReply_CrossReferenceSet{
+		Ticket: ticket,
+
+		Caller: []*xpb.CrossReferencesReply_RelatedAnchor{{
+			Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=someFile#someCallerAnchor",
+				Parent: "kythe:?path=someFile",
+				Span:   arbitrarySpan,
+			},
+			Ticket: "kythe:#someCaller",
+			MarkedSource: &cpb.MarkedSource{
+				Kind:    cpb.MarkedSource_IDENTIFIER,
+				PreText: "id",
+			},
+			Site: []*xpb.Anchor{{
+				Ticket: "kythe:?path=someFile#someCallsiteAnchor",
+				Parent: "kythe:?path=someFile",
+			}},
+		}, {
+			Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=someFile#someOverrideCallerAnchor1",
+				Parent: "kythe:?path=someFile",
+				Span:   arbitrarySpan,
+			},
+			Site: []*xpb.Anchor{{
+				Ticket: "kythe:?path=someFile#someCallsiteAnchor",
+				Parent: "kythe:?path=someFile",
+				Span:   arbitrarySpan,
+			}},
+		}, {
+			Anchor: &xpb.Anchor{
+				Ticket: "kythe:?path=someFile#someOverrideCallerAnchor2",
+				Parent: "kythe:?path=someFile",
+				Span:   arbitrarySpan,
+			},
+			Site: []*xpb.Anchor{{
+				Ticket: "kythe:?path=someFile#someCallsiteAnchor",
+				Parent: "kythe:?path=someFile",
+			}},
+		}},
+	}
+
+	if err := testutil.DeepEqual(&xpb.CrossReferencesReply_Total{
+		Callers: 3,
+	}, reply.Total); err != nil {
+		t.Error(err)
+	}
+
+	xr := reply.CrossReferences[ticket]
+	if xr == nil {
+		t.Fatalf("Missing expected CrossReferences; found: %#v", reply)
+	} else if err := testutil.DeepEqual(expected, xr); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func nodeInfos(nss ...[]*srvpb.Node) map[string]*cpb.NodeInfo {
+	m := make(map[string]*cpb.NodeInfo)
 	for _, ns := range nss {
 		for _, n := range ns {
-			m[n.Ticket] = nodeInfo(n)
+			if ni := nodeInfo(n); ni != nil {
+				m[n.Ticket] = ni
+			}
 		}
 	}
 	return m
 }
 
-func TestCallers(t *testing.T) {
+func TestDocumentationEmpty(t *testing.T) {
 	st := tbl.Construct(t)
-	reply, err := st.Callers(ctx, &xpb.CallersRequest{})
-	if reply != nil || err == nil {
-		t.Fatalf("Callers expected to fail")
+	reply, err := st.Documentation(ctx, &xpb.DocumentationRequest{
+		Ticket: []string{"kythe:#undocumented"},
+	})
+
+	expected := &xpb.DocumentationReply{}
+
+	if reply == nil || err != nil {
+		t.Fatalf("Documentation call failed: (reply: %v; error: %v)", reply, err)
+	} else if err := testutil.DeepEqual(expected, reply); err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestDocumentation(t *testing.T) {
 	st := tbl.Construct(t)
-	reply, err := st.Documentation(ctx, &xpb.DocumentationRequest{})
-	if reply != nil || err == nil {
-		t.Fatalf("Documentation expected to fail")
+	reply, err := st.Documentation(ctx, &xpb.DocumentationRequest{
+		Ticket: []string{"kythe:#documented"},
+	})
+
+	expected := &xpb.DocumentationReply{
+		Document: []*xpb.DocumentationReply_Document{{
+			Ticket: "kythe:#documented",
+			Text: &xpb.Printable{
+				RawText: "some documentation text",
+			},
+			MarkedSource: &cpb.MarkedSource{
+				Kind:    cpb.MarkedSource_IDENTIFIER,
+				PreText: "DocumentBuilderFactory",
+			},
+		}},
+		Nodes: nodeInfos(getNodes("kythe:#documented")),
+		DefinitionLocations: map[string]*xpb.Anchor{
+			"kythe:?path=def/location#defDoc": &xpb.Anchor{
+				Ticket: "kythe:?path=def/location#defDoc",
+				Parent: "kythe:?path=def/location",
+			},
+		},
+	}
+
+	if reply == nil || err != nil {
+		t.Fatalf("Documentation call failed: (reply: %v; error: %v)", reply, err)
+	} else if diff := compare.ProtoDiff(expected, reply); diff != "" {
+		t.Fatalf("(-expected; +found):\n%s", diff)
+	}
+}
+
+func TestDocumentationChildren(t *testing.T) {
+	st := tbl.Construct(t)
+	reply, err := st.Documentation(ctx, &xpb.DocumentationRequest{
+		Ticket: []string{"kythe:#documented"},
+
+		IncludeChildren: true,
+	})
+
+	expected := &xpb.DocumentationReply{
+		Document: []*xpb.DocumentationReply_Document{{
+			Ticket: "kythe:#documented",
+			Text: &xpb.Printable{
+				RawText: "some documentation text",
+			},
+			MarkedSource: &cpb.MarkedSource{
+				Kind:    cpb.MarkedSource_IDENTIFIER,
+				PreText: "DocumentBuilderFactory",
+			},
+			Children: []*xpb.DocumentationReply_Document{{
+				Ticket: "kythe:#childDoc",
+				Text: &xpb.Printable{
+					RawText: "child document text",
+				},
+			}, {
+				Ticket: "kythe:#childDocBy",
+				Text: &xpb.Printable{
+					RawText: "second child document text",
+				},
+			}},
+		}},
+		Nodes: nodeInfos(getNodes(
+			"kythe:#childDoc",
+			"kythe:#childDocBy",
+			"kythe:#documented",
+			"kythe:#secondChildDoc",
+		)),
+		DefinitionLocations: map[string]*xpb.Anchor{
+			"kythe:?path=def/location#defDoc": &xpb.Anchor{
+				Ticket: "kythe:?path=def/location#defDoc",
+				Parent: "kythe:?path=def/location",
+			},
+		},
+	}
+
+	if reply == nil || err != nil {
+		t.Fatalf("Documentation call failed: (reply: %v; error: %v)", reply, err)
+	} else if diff := compare.ProtoDiff(expected, reply); diff != "" {
+		t.Fatalf("(-expected; +found):\n%s", diff)
+	}
+}
+
+func TestDocumentationIndirection(t *testing.T) {
+	st := tbl.Construct(t)
+	reply, err := st.Documentation(ctx, &xpb.DocumentationRequest{
+		Ticket: []string{"kythe:#documentedBy"},
+	})
+
+	expected := &xpb.DocumentationReply{
+		Document: []*xpb.DocumentationReply_Document{{
+			Ticket: "kythe:#documentedBy",
+			Text: &xpb.Printable{
+				RawText: "some documentation text",
+			},
+			MarkedSource: &cpb.MarkedSource{
+				Kind:    cpb.MarkedSource_IDENTIFIER,
+				PreText: "DocumentBuilderFactory",
+			},
+		}},
+		Nodes: nodeInfos(getNodes("kythe:#documented", "kythe:#documentedBy")),
+		DefinitionLocations: map[string]*xpb.Anchor{
+			"kythe:?path=def/location#defDoc": &xpb.Anchor{
+				Ticket: "kythe:?path=def/location#defDoc",
+				Parent: "kythe:?path=def/location",
+			},
+		},
+	}
+
+	if reply == nil || err != nil {
+		t.Fatalf("Documentation call failed: (reply: %v; error: %v)", reply, err)
+	} else if diff := compare.ProtoDiff(expected, reply); diff != "" {
+		t.Fatalf("(-expected; +found):\n%s", diff)
 	}
 }
 
@@ -936,13 +1865,19 @@ type byOffset []*xpb.CrossReferencesReply_RelatedAnchor
 func (s byOffset) Len() int      { return len(s) }
 func (s byOffset) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 func (s byOffset) Less(i, j int) bool {
-	return s[i].Anchor.Start.ByteOffset < s[j].Anchor.Start.ByteOffset
+	return s[i].Anchor.Span.Start.ByteOffset < s[j].Anchor.Span.Start.ByteOffset
 }
 
-func nodeInfo(n *srvpb.Node) *xpb.NodeInfo {
-	ni := &xpb.NodeInfo{Facts: make(map[string][]byte, len(n.Fact))}
+func nodeInfo(n *srvpb.Node) *cpb.NodeInfo {
+	ni := &cpb.NodeInfo{
+		Facts:      make(map[string][]byte, len(n.Fact)),
+		Definition: n.DefinitionLocation.GetTicket(),
+	}
 	for _, f := range n.Fact {
 		ni.Facts[f.Name] = f.Value
+	}
+	if len(ni.Facts) == 0 && ni.Definition == "" {
+		return nil
 	}
 	return ni
 }
@@ -961,37 +1896,7 @@ func makeFactList(keyVals ...string) []*cpb.Fact {
 	return facts
 }
 
-func mapFacts(n *xpb.NodeInfo, facts map[string]string) {
-	for name := range n.Facts {
-		if val, ok := facts[name]; ok {
-			n.Facts[name] = []byte(val)
-		}
-	}
-}
-
-func edgeSet(kinds []string, pes *srvpb.PagedEdgeSet, pages []*srvpb.EdgePage) *xpb.EdgeSet {
-	set := stringset.New(kinds...)
-
-	es := &xpb.EdgeSet{Groups: make(map[string]*xpb.EdgeSet_Group, len(pes.Group))}
-	for _, g := range pes.Group {
-		if set.Contains(g.Kind) || len(set) == 0 {
-			es.Groups[g.Kind] = &xpb.EdgeSet_Group{
-				Edge: e2e(g.Edge),
-			}
-		}
-	}
-	for _, ep := range pages {
-		g := ep.EdgesGroup
-		if set.Contains(g.Kind) || len(set) == 0 {
-			es.Groups[g.Kind] = &xpb.EdgeSet_Group{
-				Edge: e2e(g.Edge),
-			}
-		}
-	}
-	return es
-}
-
-func refs(norm *xrefs.Normalizer, ds []*srvpb.FileDecorations_Decoration) (refs []*xpb.DecorationsReply_Reference) {
+func refs(norm *span.Normalizer, ds []*srvpb.FileDecorations_Decoration) (refs []*xpb.DecorationsReply_Reference) {
 	for _, d := range ds {
 		refs = append(refs, decorationToReference(norm, d))
 	}
@@ -1000,33 +1905,14 @@ func refs(norm *xrefs.Normalizer, ds []*srvpb.FileDecorations_Decoration) (refs 
 
 type testTable struct {
 	Nodes       []*srvpb.Node
-	EdgePages   []*srvpb.EdgePage
-	EdgeSets    []*srvpb.PagedEdgeSet
 	Decorations []*srvpb.FileDecorations
 	RefSets     []*srvpb.PagedCrossReferences
 	RefPages    []*srvpb.PagedCrossReferences_Page
+	Documents   []*srvpb.Document
 }
 
-func (tbl *testTable) Construct(t *testing.T) xrefs.Service {
+func (tbl *testTable) Construct(t *testing.T) *Table {
 	p := make(testProtoTable)
-	tickets := stringset.New()
-	for _, n := range tbl.Nodes {
-		tickets.Add(n.Ticket)
-	}
-	for _, es := range tbl.EdgeSets {
-		tickets.Remove(es.Source.Ticket)
-		testutil.FatalOnErrT(t, "Error writing edge set: %v", p.Put(ctx, EdgeSetKey(mustFix(t, es.Source.Ticket)), es))
-	}
-	// Fill in EdgeSets for zero-degree nodes
-	for ticket := range tickets {
-		es := &srvpb.PagedEdgeSet{
-			Source: getNode(ticket),
-		}
-		testutil.FatalOnErrT(t, "Error writing edge set: %v", p.Put(ctx, EdgeSetKey(mustFix(t, es.Source.Ticket)), es))
-	}
-	for _, ep := range tbl.EdgePages {
-		testutil.FatalOnErrT(t, "Error writing edge page: %v", p.Put(ctx, EdgePageKey(ep.PageKey), ep))
-	}
 	for _, d := range tbl.Decorations {
 		testutil.FatalOnErrT(t, "Error writing file decorations: %v", p.Put(ctx, DecorationsKey(mustFix(t, d.File.Ticket)), d))
 	}
@@ -1036,7 +1922,10 @@ func (tbl *testTable) Construct(t *testing.T) xrefs.Service {
 	for _, crp := range tbl.RefPages {
 		testutil.FatalOnErrT(t, "Error writing cross-references: %v", p.Put(ctx, CrossReferencesPageKey(crp.PageKey), crp))
 	}
-	return NewCombinedTable(table.ProtoBatchParallel{p})
+	for _, doc := range tbl.Documents {
+		testutil.FatalOnErrT(t, "Error writing documents: %v", p.Put(ctx, DocumentationKey(doc.Ticket), doc))
+	}
+	return NewCombinedTable(p)
 }
 
 func mustFix(t *testing.T, ticket string) string {

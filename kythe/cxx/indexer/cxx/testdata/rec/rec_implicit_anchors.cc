@@ -4,7 +4,6 @@
 //- !{ @Struct defines/binding OtherS
 //-    OtherS.node/kind variable }
 //- CtorC.node/kind anchor
-//- CtorC.subkind implicit
 //- CtorC defines/binding StructSCtor
 //- StructSCtor.node/kind function
 //- StructSCtor.complete definition
@@ -14,9 +13,7 @@ struct Struct {
 
 //- @f defines/binding FnF
 void f() {
-//- Call ref/call StructSCtor
-//- Call.loc/start @^s
-//- Call.loc/end @^s
+//- Call=@s ref/call StructSCtor
   Struct s;
 }
 

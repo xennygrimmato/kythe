@@ -1,4 +1,4 @@
-load("//tools:build_rules/go.bzl", "go_binary")
+load("//tools:build_rules/shims.bzl", "go_binary")
 
 package(default_visibility = ["//kythe:default_visibility"])
 
@@ -7,11 +7,13 @@ go_binary(
     srcs = ["entrystream.go"],
     deps = [
         "//kythe/go/platform/delimited",
-        "//kythe/go/services/graphstore/compare",
+        "//kythe/go/storage/entryset",
         "//kythe/go/storage/stream",
+        "//kythe/go/util/compare",
         "//kythe/go/util/disksort",
         "//kythe/go/util/flagutil",
-        "//kythe/proto:storage_proto_go",
-        "@go_protobuf//:proto",
+        "//kythe/go/util/riegeli",
+        "//kythe/proto:storage_go_proto",
+        "@org_golang_google_protobuf//proto:go_default_library",
     ],
 )

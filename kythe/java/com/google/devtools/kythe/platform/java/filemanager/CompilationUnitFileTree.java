@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ public class CompilationUnitFileTree {
    * Map from a directory path to file entries in that directory. Each file entry is a pair of file
    * name and file's digest.
    */
-  private Map<String, Map<String, String>> dirs = new HashMap<>();
+  private final Map<String, Map<String, String>> dirs = new HashMap<>();
 
   public static final String DIRECTORY_DIGEST = "<dir>";
 
@@ -60,11 +60,7 @@ public class CompilationUnitFileTree {
       dirname = ".";
     }
     String basename = path.getFileName().toString();
-    Map<String, String> dir = dirs.get(dirname);
-    if (dir == null) {
-      dir = new HashMap<>();
-      dirs.put(dirname, dir);
-    }
+    Map<String, String> dir = dirs.computeIfAbsent(dirname, k -> new HashMap<>());
     String existing = dir.get(digest);
     if (existing != null && !existing.equals(digest)) {
       throw new IllegalStateException("Trying to register conflicting digests for the same path");

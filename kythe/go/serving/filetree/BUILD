@@ -1,12 +1,14 @@
-load("//tools:build_rules/go.bzl", "go_package")
+load("//tools:build_rules/shims.bzl", "go_library")
 
 package(default_visibility = ["//kythe:default_visibility"])
 
-go_package(
+go_library(
+    name = "filetree",
+    srcs = ["filetree.go"],
     deps = [
-        "@go_x_net//:context",
         "//kythe/go/storage/table",
-        "//kythe/proto:filetree_proto_go",
-        "//kythe/proto:serving_proto_go",
+        "//kythe/go/util/kytheuri",
+        "//kythe/proto:filetree_go_proto",
+        "//kythe/proto:serving_go_proto",
     ],
 )

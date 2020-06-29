@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,36 +14,42 @@
  * limitations under the License.
  */
 
-// Package api provides a union of the filetree and xrefs interfaces
+// Package api provides a union of the filetree, xrefs, and graph interfaces
 // and a command-line flag parser.
-package api
+package api // import "kythe.io/kythe/go/serving/api"
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 
 	"kythe.io/kythe/go/services/filetree"
+	"kythe.io/kythe/go/services/graph"
 	"kythe.io/kythe/go/services/xrefs"
 	ftsrv "kythe.io/kythe/go/serving/filetree"
+	gsrv "kythe.io/kythe/go/serving/graph"
+	"kythe.io/kythe/go/serving/identifiers"
 	xsrv "kythe.io/kythe/go/serving/xrefs"
 	"kythe.io/kythe/go/storage/leveldb"
 	"kythe.io/kythe/go/storage/table"
 
-	"golang.org/x/net/context"
-	"google.golang.org/grpc"
-
-	ftpb "kythe.io/kythe/proto/filetree_proto"
-	xpb "kythe.io/kythe/proto/xref_proto"
+	ftpb "kythe.io/kythe/proto/filetree_go_proto"
+	gpb "kythe.io/kythe/proto/graph_go_proto"
+	ipb "kythe.io/kythe/proto/identifier_go_proto"
+	xpb "kythe.io/kythe/proto/xref_go_proto"
 )
 
 // Interface is a union of the xrefs and filetree interfaces.
 type Interface interface {
-	io.Closer
 	xrefs.Service
+	graph.Service
 	filetree.Service
+	identifiers.Service
+
+	// Close releases the underlying resources for the API.
+	Close(context.Context) error
 }
 
 const (
@@ -51,7 +57,7 @@ const (
 	CommonDefault = "https://xrefs-dot-kythe-repo.appspot.com"
 
 	// CommonFlagUsage is the common Kythe usage description used for Flag
-	CommonFlagUsage = "Backing API specification (e.g. JSON HTTP server: https://xrefs-dot-kythe-repo.appspot.com or GRPC server: localhost:1003 or local serving table path: /var/kythe_serving)"
+	CommonFlagUsage = "Backing API specification (e.g. JSON HTTP server: https://xrefs-dot-kythe-repo.appspot.com or local serving table path: /var/kythe_serving)"
 )
 
 // Flag defines an api Interface flag with specified name, default value, and
@@ -68,32 +74,29 @@ func Flag(name, value, usage string) *Interface {
 // API Interface.  The following formats are currently supported:
 //   - http:// URL pointed at a JSON web API
 //   - https:// URL pointed at a JSON web API
-//   - host:port pointed at a GRPC API
 //   - local path to a LevelDB serving table
 func ParseSpec(apiSpec string) (Interface, error) {
 	api := &apiCloser{}
 	if strings.HasPrefix(apiSpec, "http://") || strings.HasPrefix(apiSpec, "https://") {
 		api.xs = xrefs.WebClient(apiSpec)
+		api.gs = graph.WebClient(apiSpec)
 		api.ft = filetree.WebClient(apiSpec)
+		api.id = identifiers.WebClient(apiSpec)
 	} else if _, err := os.Stat(apiSpec); err == nil {
 		db, err := leveldb.Open(apiSpec, nil)
 		if err != nil {
 			return nil, fmt.Errorf("error opening local DB at %q: %v", apiSpec, err)
 		}
-		api.closer = func() error { return db.Close() }
+		api.closer = func(ctx context.Context) error { return db.Close(ctx) }
 
-		tbl := table.ProtoBatchParallel{&table.KVProto{db}}
-		api.xs = xsrv.NewCombinedTable(tbl)
+		ctx := context.Background()
+		api.xs = xsrv.NewService(ctx, db)
+		api.gs = gsrv.NewService(ctx, db)
+		tbl := &table.KVProto{db}
 		api.ft = &ftsrv.Table{tbl, true}
+		api.id = &identifiers.Table{tbl}
 	} else {
-		conn, err := grpc.Dial(apiSpec)
-		if err != nil {
-			return nil, fmt.Errorf("error connecting to remote API %q: %v", apiSpec, err)
-		}
-		api.closer = func() error { conn.Close(); return nil }
-
-		api.xs = xrefs.GRPC(xpb.NewXRefServiceClient(conn))
-		api.ft = filetree.GRPC(ftpb.NewFileTreeServiceClient(conn))
+		return nil, fmt.Errorf("unknown API spec format: %q", apiSpec)
 	}
 	return api, nil
 }
@@ -120,27 +123,29 @@ func (f *apiFlag) String() string { return f.spec }
 // apiCloser implements Interface
 type apiCloser struct {
 	xs xrefs.Service
+	gs graph.Service
 	ft filetree.Service
+	id identifiers.Service
 
-	closer func() error
+	closer func(context.Context) error
 }
 
-// Close implements the io.Closer interface.
-func (api apiCloser) Close() error {
+// Close implements part of Interface.
+func (api apiCloser) Close(ctx context.Context) error {
 	if api.closer != nil {
-		return api.closer()
+		return api.closer(ctx)
 	}
 	return nil
 }
 
-// Nodes implements part of the xrefs Service interface.
-func (api apiCloser) Nodes(ctx context.Context, req *xpb.NodesRequest) (*xpb.NodesReply, error) {
-	return api.xs.Nodes(ctx, req)
+// Nodes implements part of the graph Service interface.
+func (api apiCloser) Nodes(ctx context.Context, req *gpb.NodesRequest) (*gpb.NodesReply, error) {
+	return api.gs.Nodes(ctx, req)
 }
 
-// Edges implements part of the xrefs Service interface.
-func (api apiCloser) Edges(ctx context.Context, req *xpb.EdgesRequest) (*xpb.EdgesReply, error) {
-	return api.xs.Edges(ctx, req)
+// Edges implements part of the graph Service interface.
+func (api apiCloser) Edges(ctx context.Context, req *gpb.EdgesRequest) (*gpb.EdgesReply, error) {
+	return api.gs.Edges(ctx, req)
 }
 
 // Decorations implements part of the xrefs Service interface.
@@ -151,11 +156,6 @@ func (api apiCloser) Decorations(ctx context.Context, req *xpb.DecorationsReques
 // CrossReferences implements part of the xrefs Service interface.
 func (api apiCloser) CrossReferences(ctx context.Context, req *xpb.CrossReferencesRequest) (*xpb.CrossReferencesReply, error) {
 	return api.xs.CrossReferences(ctx, req)
-}
-
-// Callers implements part of the xrefs Service interface.
-func (api apiCloser) Callers(ctx context.Context, req *xpb.CallersRequest) (*xpb.CallersReply, error) {
-	return api.xs.Callers(ctx, req)
 }
 
 // Documentation implements part of the xrefs Service interface.
@@ -171,4 +171,9 @@ func (api apiCloser) Directory(ctx context.Context, req *ftpb.DirectoryRequest) 
 // CorpusRoots implements part of the filetree Service interface.
 func (api apiCloser) CorpusRoots(ctx context.Context, req *ftpb.CorpusRootsRequest) (*ftpb.CorpusRootsReply, error) {
 	return api.ft.CorpusRoots(ctx, req)
+}
+
+// Find implements part of the identifiers Service interface.
+func (api apiCloser) Find(ctx context.Context, req *ipb.FindRequest) (*ipb.FindReply, error) {
+	return api.id.Find(ctx, req)
 }

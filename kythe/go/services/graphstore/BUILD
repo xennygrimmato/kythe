@@ -1,11 +1,13 @@
-load("//tools:build_rules/go.bzl", "go_package")
+load("//tools:build_rules/shims.bzl", "go_library")
 
 package(default_visibility = ["//kythe:default_visibility"])
 
-go_package(
+go_library(
+    name = "graphstore",
+    srcs = ["graphstore.go"],
     deps = [
-        "@go_x_net//:context",
-        "//kythe/go/services/graphstore/compare",
-        "//kythe/proto:storage_proto_go",
+        "//kythe/go/util/compare",
+        "//kythe/proto:storage_go_proto",
+        "//kythe/proto:storage_service_go_proto",
     ],
 )

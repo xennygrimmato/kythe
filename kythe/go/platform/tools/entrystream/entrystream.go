@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,11 +20,13 @@
 // Examples:
 //   $ ... | entrystream                      # Passes through proto entry stream unchanged
 //   $ ... | entrystream --sort               # Sorts the entry stream into GraphStore order
-//   $ ... | entrystream --write_json         # Prints entry stream as JSON
-//   $ ... | entrystream --write_json --sort  # Sorts the JSON entry stream into GraphStore order
+//   $ ... | entrystream --write_format=json  # Prints entry stream as JSON
 //   $ ... | entrystream --entrysets          # Prints combined entry sets as JSON
 //   $ ... | entrystream --count              # Prints the number of entries in the incoming stream
-//   $ ... | entrystream --read_json          # Reads entry stream as JSON and prints a proto stream
+//   $ ... | entrystream --read_format=json   # Reads entry stream as JSON and prints a proto stream
+//
+//   $ ... | entrystream --write_format=riegeli # Writes entry stream as a Riegeli file
+//   $ ... | entrystream --read_format=riegeli  # Reads the entry stream from a Riegeli file
 package main
 
 import (
@@ -32,40 +34,61 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"strings"
 
 	"kythe.io/kythe/go/platform/delimited"
-	"kythe.io/kythe/go/services/graphstore/compare"
+	"kythe.io/kythe/go/storage/entryset"
 	"kythe.io/kythe/go/storage/stream"
+	"kythe.io/kythe/go/util/compare"
 	"kythe.io/kythe/go/util/disksort"
 	"kythe.io/kythe/go/util/flagutil"
+	"kythe.io/kythe/go/util/riegeli"
 
-	spb "kythe.io/kythe/proto/storage_proto"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/golang/protobuf/proto"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
-type entrySet struct {
+type entrySet struct { // TODO(schroederc): rename to avoid confusion with EntrySet proto
 	Source   *spb.VName `json:"source"`
 	Target   *spb.VName `json:"target,omitempty"`
 	EdgeKind string     `json:"edge_kind,omitempty"`
 
-	Properties map[string]string `json:"properties"`
+	Properties map[string]json.RawMessage `json:"properties"`
 }
 
+// Accepted --{read,write}_format values
+const (
+	delimitedFormat = "delimited"
+	jsonFormat      = "json"
+	riegeliFormat   = "riegeli"
+)
+
 var (
-	readJSON    = flag.Bool("read_json", false, "Assume stdin is a stream of JSON entries instead of protobufs")
-	writeJSON   = flag.Bool("write_json", false, "Print JSON stream as output")
+	readJSON  = flag.Bool("read_json", false, "Assume stdin is a stream of JSON entries instead of protobufs (deprecated: use --read_format)")
+	writeJSON = flag.Bool("write_json", false, "Print JSON stream as output (deprecated: use --write_format)")
+
+	readFormat  = flag.String("read_format", delimitedFormat, "Format of the input stream (accepted formats: {delimited,json,riegeli})")
+	writeFormat = flag.String("write_format", delimitedFormat, "Format of the output stream (accepted formats: {delimited,json,riegeli})")
+
+	riegeliOptions = flag.String("riegeli_writer_options", "", "Riegeli writer options")
+
 	sortStream  = flag.Bool("sort", false, "Sort entry stream into GraphStore order")
 	uniqEntries = flag.Bool("unique", false, "Print only unique entries (implies --sort)")
-	entrySets   = flag.Bool("entrysets", false, "Print Entry protos as JSON EntrySets (implies --sort and --write_json)")
-	countOnly   = flag.Bool("count", false, "Only print the count of protos streamed")
+
+	aggregateEntrySet = flag.Bool("aggregate_entryset", false, "Output a single aggregate EntrySet proto")
+	entrySets         = flag.Bool("entrysets", false, "Print Entry protos as JSON EntrySets (implies --sort and --write_format=json)")
+	countOnly         = flag.Bool("count", false, "Only print the count of protos streamed")
+
+	structuredFacts = flag.Bool("structured_facts", false, "Encode and/or decode the fact_value for marked source facts")
 )
 
 func init() {
-	flag.Usage = flagutil.SimpleUsage("Manipulate a stream of delimited Entry messages",
-		"[--read_json] [--unique] ([--write_json] [--sort] | [--entrysets] | [--count])")
+	flag.Usage = flagutil.SimpleUsage("Manipulate a stream of Entry messages",
+		"[--read_format=<format>] [--unique] ([--write_format=<format>] [--sort] | [--entrysets] | [--count] | [--aggregate_entryset])")
 }
 
 func main() {
@@ -74,14 +97,52 @@ func main() {
 		flagutil.UsageErrorf("unknown arguments: %v", flag.Args())
 	}
 
+	// Normalize --{read,write}_format values
+	*readFormat = strings.ToLower(*readFormat)
+	*writeFormat = strings.ToLower(*writeFormat)
+
+	if *readJSON {
+		log.Printf("WARNING: --read_json is deprecated; use --read_format=json")
+		*readFormat = jsonFormat
+	}
+	if *writeJSON {
+		log.Printf("WARNING: --write_json is deprecated; use --write_format=json")
+		*writeFormat = jsonFormat
+	}
+
 	in := bufio.NewReaderSize(os.Stdin, 2*4096)
 	out := bufio.NewWriter(os.Stdout)
 
 	var rd stream.EntryReader
-	if *readJSON {
-		rd = stream.NewJSONReader(in)
-	} else {
+	switch *readFormat {
+	case jsonFormat:
+		if *structuredFacts {
+			rd = stream.NewStructuredJSONReader(in)
+		} else {
+			rd = stream.NewJSONReader(in)
+		}
+	case riegeliFormat:
+		rd = func(emit func(*spb.Entry) error) error {
+			r := riegeli.NewReader(in)
+			for {
+				rec, err := r.Next()
+				if err == io.EOF {
+					return nil
+				} else if err != nil {
+					return err
+				}
+				var e spb.Entry
+				if err := proto.Unmarshal(rec, &e); err != nil {
+					return err
+				} else if err := emit(&e); err != nil {
+					return err
+				}
+			}
+		}
+	case delimitedFormat:
 		rd = stream.NewReader(in)
+	default:
+		log.Fatalf("Unsupported --read_format=%s", *readFormat)
 	}
 
 	if *sortStream || *entrySets || *uniqEntries {
@@ -102,6 +163,26 @@ func main() {
 			return nil
 		}))
 		fmt.Println(count)
+	case *aggregateEntrySet:
+		es := entryset.New(nil)
+		failOnErr(rd(es.Add))
+		pb := es.Encode()
+		switch *writeFormat {
+		case jsonFormat:
+			encoder := json.NewEncoder(out)
+			failOnErr(encoder.Encode(pb))
+		case riegeliFormat:
+			opts, err := riegeli.ParseOptions(*riegeliOptions)
+			failOnErr(err)
+			wr := riegeli.NewWriter(out, opts)
+			failOnErr(wr.PutProto(pb))
+			failOnErr(wr.Flush())
+		case delimitedFormat:
+			wr := delimited.NewWriter(out)
+			failOnErr(wr.PutProto(pb))
+		default:
+			log.Fatalf("Unsupported --write_format=%s", *writeFormat)
+		}
 	case *entrySets:
 		encoder := json.NewEncoder(out)
 		var set entrySet
@@ -115,28 +196,45 @@ func main() {
 				set.Source = entry.Source
 				set.EdgeKind = entry.EdgeKind
 				set.Target = entry.Target
-				set.Properties = make(map[string]string)
+				set.Properties = make(map[string]json.RawMessage)
 			}
-			set.Properties[entry.FactName] = string(entry.FactValue)
-			return nil
+			var err error
+			if *structuredFacts {
+				set.Properties[entry.FactName], err = stream.StructuredFactValueJSON(entry)
+			} else {
+				set.Properties[entry.FactName], err = json.Marshal(entry)
+			}
+			return err
 		}))
 		if len(set.Properties) != 0 {
 			failOnErr(encoder.Encode(set))
 		}
-	case *writeJSON:
-		encoder := json.NewEncoder(out)
-		failOnErr(rd(func(entry *spb.Entry) error {
-			return encoder.Encode(entry)
-		}))
 	default:
-		wr := delimited.NewWriter(out)
-		failOnErr(rd(func(entry *spb.Entry) error {
-			rec, err := proto.Marshal(entry)
-			if err != nil {
-				return err
-			}
-			return wr.Put(rec)
-		}))
+		switch *writeFormat {
+		case jsonFormat:
+			encoder := json.NewEncoder(out)
+			failOnErr(rd(func(entry *spb.Entry) error {
+				if *structuredFacts {
+					return encoder.Encode(stream.Structured(entry))
+				}
+				return encoder.Encode(entry)
+			}))
+		case riegeliFormat:
+			opts, err := riegeli.ParseOptions(*riegeliOptions)
+			failOnErr(err)
+			wr := riegeli.NewWriter(out, opts)
+			failOnErr(rd(func(entry *spb.Entry) error {
+				return wr.PutProto(entry)
+			}))
+			failOnErr(wr.Flush())
+		case delimitedFormat:
+			wr := delimited.NewWriter(out)
+			failOnErr(rd(func(entry *spb.Entry) error {
+				return wr.PutProto(entry)
+			}))
+		default:
+			log.Fatalf("Unsupported --write_format=%s", *writeFormat)
+		}
 	}
 	failOnErr(out.Flush())
 }

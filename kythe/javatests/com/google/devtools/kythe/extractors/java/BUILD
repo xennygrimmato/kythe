@@ -1,26 +1,26 @@
+load("@rules_java//java:defs.bzl", "java_binary", "java_test")
+
 java_test(
     name = "java_extractor_test",
     size = "small",
     srcs = ["JavaExtractorTest.java"],
     data = glob(["testdata/**"]) + [
         ":SillyProcessor_deploy.jar",
-        "@bazel_tools//third_party/java/jdk/langtools:javac_jar",
     ],
     javacopts = ["-Xlint:all"],
-    # TODO(schroederc): fix bootclasspath to use $(location ...) syntax
-    jvm_flags = ["-Xbootclasspath/p:$$JAVA_RUNFILES/bazel_tools/third_party/java/jdk/langtools/javac.jar"],
     test_class = "com.google.devtools.kythe.extractors.java.JavaExtractorTest",
     deps = [
-        "@bazel_tools//third_party/java/jdk/langtools:javac",
-        "//external:guava",
-        "//external:junit4",
-        "//external:proto/protobuf_java",
-        "//external:truth",
         "//kythe/java/com/google/devtools/kythe/extractors/java",
         "//kythe/java/com/google/devtools/kythe/extractors/shared",
-        "//kythe/proto:analysis_proto_java",
-        "//kythe/proto:java_proto_java",
-        "//kythe/proto:storage_proto_java",
+        "//kythe/java/com/google/devtools/kythe/extractors/shared:file_vnames",
+        "//kythe/proto:analysis_java_proto",
+        "//kythe/proto:java_java_proto",
+        "//kythe/proto:storage_java_proto",
+        "//third_party/guava",
+        "//third_party/truth",
+        "@com_google_protobuf//:any_proto",
+        "@com_google_protobuf//:protobuf_java",
+        "@maven//:junit_junit",
     ],
 )
 
@@ -31,5 +31,5 @@ java_binary(
         "testdata/processor/SillyProcessor.java",
     ],
     create_executable = 0,
-    deps = ["@bazel_tools//tools/jdk:langtools-neverlink"],
+    deps = ["//third_party/javac"],
 )

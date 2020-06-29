@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 // Package disksort implements sorting algorithms for sets of data too large to
 // fit fully in-memory.  If the number of elements becomes to large, data are
 // paged onto the disk.
-package disksort
+package disksort // import "kythe.io/kythe/go/util/disksort"
 
 import (
 	"bufio"
@@ -29,6 +29,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"kythe.io/kythe/go/platform/delimited"
 	"kythe.io/kythe/go/util/sortutil"
@@ -87,6 +88,8 @@ type mergeSorter struct {
 	workDir string
 	shards  []string
 
+	bufferSize int
+
 	finalized bool
 }
 
@@ -94,12 +97,15 @@ type mergeSorter struct {
 // a merge sort.
 const DefaultMaxInMemory = 32000
 
-// DefaultIOBufferSize is the default size of the reading/writing buffers for
-// the temporary file shards.
-const DefaultIOBufferSize = 2 << 13
+// DefaultMaxBytesInMemory is the default maximum total size of elements to keep
+// in-memory during a merge sort.
+const DefaultMaxBytesInMemory = 1024 * 1024 * 256
 
 // MergeOptions specifies how to sort elements.
 type MergeOptions struct {
+	// Name is optionally used as part of the path for temporary file shards.
+	Name string
+
 	// Lesser is the comparison function for sorting the given elements.
 	Lesser sortutil.Lesser
 	// Marshaler is used for encoding/decoding elements in temporary file shards.
@@ -114,14 +120,18 @@ type MergeOptions struct {
 	// is used.
 	MaxInMemory int
 
+	// MaxBytesInMemory is the maximum total size of elements to keep in-memory
+	// before paging them to a temporary file shard.  An element's size is
+	// determined by its `Size() int` method. If non-positive,
+	// DefaultMaxBytesInMemory is used.
+	MaxBytesInMemory int
+
 	// CompressShards determines whether the temporary file shards should be
 	// compressed.
 	CompressShards bool
-
-	// IOBufferSize is the size of the reading/writing buffers for the temporary
-	// file shards.  If non-positive, DefaultIOBufferSize is used.
-	IOBufferSize int
 }
+
+type sizer interface{ Size() int }
 
 // NewMergeSorter returns a new disk sorter using a mergesort algorithm.
 func NewMergeSorter(opts MergeOptions) (Interface, error) {
@@ -131,7 +141,11 @@ func NewMergeSorter(opts MergeOptions) (Interface, error) {
 		return nil, errors.New("missing Marshaler")
 	}
 
-	dir, err := ioutil.TempDir(opts.WorkDir, "external.merge.sort")
+	name := strings.Replace(opts.Name, string(filepath.Separator), ".", -1)
+	if name == "" {
+		name = "external.merge.sort"
+	}
+	dir, err := ioutil.TempDir(opts.WorkDir, name)
 	if err != nil {
 		return nil, fmt.Errorf("error creating temporary work directory: %v", err)
 	}
@@ -139,8 +153,8 @@ func NewMergeSorter(opts MergeOptions) (Interface, error) {
 	if opts.MaxInMemory <= 0 {
 		opts.MaxInMemory = DefaultMaxInMemory
 	}
-	if opts.IOBufferSize <= 0 {
-		opts.IOBufferSize = DefaultIOBufferSize
+	if opts.MaxBytesInMemory <= 0 {
+		opts.MaxBytesInMemory = DefaultMaxBytesInMemory
 	}
 
 	return &mergeSorter{
@@ -163,7 +177,11 @@ func (m *mergeSorter) Add(i interface{}) error {
 	}
 
 	m.buffer = append(m.buffer, i)
-	if len(m.buffer) >= m.opts.MaxInMemory {
+	if sizer, ok := i.(sizer); ok {
+		m.bufferSize += sizer.Size()
+	}
+
+	if len(m.buffer) >= m.opts.MaxInMemory || m.bufferSize >= m.opts.MaxBytesInMemory {
 		return m.dumpShard()
 	}
 	return nil
@@ -176,6 +194,8 @@ type mergeIterator struct {
 	marshaler Marshaler
 	workDir   string
 }
+
+const ioBufferSize = 2 << 15
 
 // Iterator implements part of the Interface interface.
 func (m *mergeSorter) Iterator() (iter Iterator, err error) {
@@ -208,12 +228,9 @@ func (m *mergeSorter) Iterator() (iter Iterator, err error) {
 		}
 	}()
 
-	if len(m.buffer) != 0 {
-		// To make the merging algorithm simpler, dump the last shard to disk.
-		if err := m.dumpShard(); err != nil {
-			m.buffer = nil
-			return nil, fmt.Errorf("error dumping final shard: %v", err)
-		}
+	// Push all of the in-memory elements into the merger heap.
+	for _, el := range m.buffer {
+		heap.Push(merger, &mergeElement{el: el})
 	}
 	m.buffer = nil
 
@@ -224,12 +241,14 @@ func (m *mergeSorter) Iterator() (iter Iterator, err error) {
 			return nil, fmt.Errorf("error opening shard %q: %v", shard, err)
 		}
 
-		r := io.Reader(f)
+		var r io.Reader
 		if m.opts.CompressShards {
-			r = snappy.NewReader(r)
+			r = snappy.NewReader(f)
+		} else {
+			r = bufio.NewReaderSize(f, ioBufferSize)
 		}
 
-		rd := delimited.NewReader(bufio.NewReaderSize(r, m.opts.IOBufferSize))
+		rd := delimited.NewReader(r)
 		first, err := rd.Next()
 		if err != nil {
 			f.Close()
@@ -264,29 +283,34 @@ func (i *mergeIterator) Next() (interface{}, error) {
 	}
 
 	// While the merger heap is non-empty:
-	//   el := pop the head of the heap
-	//   pass it to the user-specific function
-	//   push the next element el.rd to the merger heap
-	x := heap.Pop(i.merger).(*mergeElement)
+	//   x := peek the head of the heap
+	//   pass x.el to the user-specific function
+	//   read the next element in x.rd; fix the merger heap order
+	x := i.merger.Slice[0].(*mergeElement)
 	el := x.el
 
-	// Read and parse the next value on the same shard
-	rec, err := x.rd.Next()
-	if err != nil {
-		_ = x.f.Close()           // ignore errors (file is only open for reading)
-		_ = os.Remove(x.f.Name()) // ignore errors (os.RemoveAll used in Close)
-		if err != io.EOF {
-			return nil, fmt.Errorf("error reading shard: %v", err)
-		}
+	if x.rd == nil {
+		heap.Pop(i.merger)
 	} else {
-		next, err := i.marshaler.Unmarshal(rec)
+		// Read and parse the next value on the same shard
+		rec, err := x.rd.Next()
 		if err != nil {
-			return nil, fmt.Errorf("error unmarshaling element: %v", err)
-		}
+			_ = x.f.Close()           // ignore errors (file is only open for reading)
+			_ = os.Remove(x.f.Name()) // ignore errors (os.RemoveAll used in Close)
+			heap.Pop(i.merger)
+			if err != io.EOF {
+				return nil, fmt.Errorf("error reading shard: %v", err)
+			}
+		} else {
+			next, err := i.marshaler.Unmarshal(rec)
+			if err != nil {
+				return nil, fmt.Errorf("error unmarshaling element: %v", err)
+			}
 
-		// Reuse mergeElement, push it back onto the merger heap with the next value
-		x.el = next
-		heap.Push(i.merger, x)
+			// Reuse mergeElement, reorder it in the merger heap with the next value
+			x.el = next
+			heap.Fix(i.merger, 0)
+		}
 	}
 
 	return el, nil
@@ -296,10 +320,13 @@ func (i *mergeIterator) Next() (interface{}, error) {
 func (i *mergeIterator) Close() error {
 	i.buffer = nil
 	if i.merger != nil {
-		for i.merger.Len() != 0 {
-			x := heap.Pop(i.merger).(*mergeElement)
-			_ = x.f.Close() // ignore errors (file is only open for reading)
+		for _, x := range i.merger.Slice {
+			el := x.(*mergeElement)
+			if el.f != nil {
+				el.f.Close() // ignore errors (file is only open for reading)
+			}
 		}
+		i.merger = nil
 	}
 	if rmErr := os.RemoveAll(i.workDir); rmErr != nil {
 		return fmt.Errorf("error removing temporary directory %q: %v", i.workDir, rmErr)
@@ -340,6 +367,7 @@ const shardFileMode = 0600 | os.ModeExclusive | os.ModeAppend | os.ModeTemporary
 func (m *mergeSorter) dumpShard() (err error) {
 	defer func() {
 		m.buffer = make([]interface{}, 0, m.opts.MaxInMemory)
+		m.bufferSize = 0
 	}()
 
 	// Create a new shard file
@@ -352,13 +380,17 @@ func (m *mergeSorter) dumpShard() (err error) {
 		replaceErrIfNil(&err, "error closing shard: %v", file.Close())
 	}()
 
-	w := io.Writer(file)
+	// Buffer writing to the shard
+	var buf interface {
+		io.Writer
+		Flush() error
+	}
 	if m.opts.CompressShards {
-		w = snappy.NewWriter(w)
+		buf = snappy.NewBufferedWriter(file)
+	} else {
+		buf = bufio.NewWriterSize(file, ioBufferSize)
 	}
 
-	// Buffer writing to the shard
-	buf := bufio.NewWriterSize(w, m.opts.IOBufferSize)
 	defer func() {
 		replaceErrIfNil(&err, "error flushing shard: %v", buf.Flush())
 	}()
@@ -373,7 +405,7 @@ func (m *mergeSorter) dumpShard() (err error) {
 		if err != nil {
 			return fmt.Errorf("marshaling error: %v", err)
 		}
-		if _, err := wr.Write(rec); err != nil {
+		if _, err := wr.WriteRecord(rec); err != nil {
 			return fmt.Errorf("writing error: %v", err)
 		}
 		m.buffer = m.buffer[1:]
@@ -391,7 +423,7 @@ func replaceErrIfNil(err *error, s string, newError error) {
 
 type mergeElement struct {
 	el interface{}
-	rd delimited.Reader
+	rd *delimited.Reader
 	f  *os.File
 }
 

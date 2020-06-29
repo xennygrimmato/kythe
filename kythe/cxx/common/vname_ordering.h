@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,8 +22,8 @@ namespace kythe {
 
 /// \brief Defines equality on VNames by pairwise comparison of each vector
 /// component.
-static inline bool VNameEquals(const proto::VName &lhs,
-                               const proto::VName &rhs) {
+template <typename VName>
+bool VNameEquals(const VName& lhs, const VName& rhs) {
   return lhs.signature() == rhs.signature() && lhs.corpus() == rhs.corpus() &&
          lhs.root() == rhs.root() && lhs.path() == rhs.path() &&
          lhs.language() == rhs.language();
@@ -32,7 +32,8 @@ static inline bool VNameEquals(const proto::VName &lhs,
 /// \brief Defines less-than on VNames as a lexicographic ordering on each
 /// vector component.
 struct VNameLess {
-  bool operator()(const proto::VName &lhs, const proto::VName &rhs) const {
+  template <typename VName>
+  bool operator()(const VName& lhs, const VName& rhs) const {
     if (lhs.signature() < rhs.signature()) return true;
     if (lhs.signature() != rhs.signature()) return false;
     if (lhs.corpus() < rhs.corpus()) return true;
@@ -44,6 +45,6 @@ struct VNameLess {
     return lhs.language() < rhs.language();
   }
 };
-}
+}  // namespace kythe
 
 #endif

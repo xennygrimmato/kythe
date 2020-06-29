@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,16 +17,15 @@
 // Package pager implements a generic SetPager that splits a stream of Groups
 // into a single Set and one-or-more associated Pages.  Useful for constructing
 // paged serving data.
-package pager
+package pager // import "kythe.io/kythe/go/util/pager"
 
 import (
 	"container/heap"
+	"context"
 	"errors"
 	"fmt"
 
 	"kythe.io/kythe/go/util/sortutil"
-
-	"golang.org/x/net/context"
 )
 
 // A Head signals the start of a new Set.

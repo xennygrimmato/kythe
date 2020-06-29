@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,9 +15,10 @@
  */
 
 // Package gsutil is collection of helper functions for storage tools.
-package gsutil
+package gsutil // import "kythe.io/kythe/go/storage/gsutil"
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -28,8 +29,6 @@ import (
 
 	"kythe.io/kythe/go/services/graphstore"
 	"kythe.io/kythe/go/storage/inmemory"
-
-	"golang.org/x/net/context"
 )
 
 // Handler returns a graphstore.Service based on the given specification.
@@ -38,7 +37,9 @@ type Handler func(spec string) (graphstore.Service, error)
 
 var (
 	handlers = map[string]Handler{
-		"in-memory": func(_ string) (graphstore.Service, error) { return inmemory.Create(), nil },
+		"in-memory": func(_ string) (graphstore.Service, error) {
+			return new(inmemory.GraphStore), nil
+		},
 	}
 	defaultHandlerKind string
 )
@@ -67,7 +68,17 @@ type gsFlag struct {
 }
 
 // String implements part of the flag.Value interface.
-func (f *gsFlag) String() string { return fmt.Sprintf("%T", *f.gs) }
+func (f *gsFlag) String() string {
+	if f.gs == nil {
+		return "<graphstore>"
+	}
+	return fmt.Sprintf("%T", *f.gs)
+}
+
+// Get implements part of the flag.Getter interface.
+func (f *gsFlag) Get() interface{} {
+	return *f.gs
+}
 
 // Set implements part of the flag.Value interface.
 func (f *gsFlag) Set(str string) (err error) {
@@ -120,7 +131,6 @@ func EnsureGracefulExit(gs ...graphstore.Service) {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	signal.Notify(c, syscall.SIGTERM)
-	signal.Notify(c, os.Kill)
 	go func() {
 		sig := <-c
 		log.Printf("graphstore: signal %v", sig)

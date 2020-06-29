@@ -1,12 +1,16 @@
-load("//tools:build_rules/go.bzl", "go_package")
+load("//tools:build_rules/shims.bzl", "go_library")
 
 package(default_visibility = ["//kythe:default_visibility"])
 
-go_package(
+go_library(
+    name = "local",
+    srcs = ["local.go"],
     deps = [
-        "@go_x_net//:context",
         "//kythe/go/platform/analysis",
         "//kythe/go/platform/analysis/driver",
         "//kythe/go/platform/kindex",
+        "//kythe/go/platform/kzip",
+        "//kythe/go/platform/vfs",
+        "//kythe/proto:analysis_go_proto",
     ],
 )

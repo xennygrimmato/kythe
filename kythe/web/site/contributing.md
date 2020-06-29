@@ -20,64 +20,58 @@ submitted (or if you already submitted one for another Google project), make a
 commit adding yourself to the
 [AUTHORS]({{site.data.development.source_browser}}/AUTHORS) and
 [CONTRIBUTORS]({{site.data.development.source_browser}}/CONTRIBUTORS)
-files. This commit can be part of your first Differential code review.
+files. This commit can be part of your first Pull Request.
 
-The Kythe team has chosen to use a [Phabricator](http://phabricator.org/)
-instance located at
-[{{site.url}}/phabricator]({{site.url}}{{site.data.development.phabricator}})
-for code reviews.  This requires some local setup for each developer:
+The Kythe team has chosen to use GitHub [Pull Requests](https://guides.github.com/activities/forking/)
+for code review.
 
-### Installing arcanist
+## Linting and Testing
 
-{% highlight bash %}
-ARC_PATH=~/apps/arc # path to install arcanist/libphutil
+Run `./tools/git/setup_hooks.sh` to initialize the standard Git hooks used by
+the Kythe developers.  This ensures that each commit passes all unit/lint tests
+and that commit descriptions follow the [Conventional
+Commits](https://www.conventionalcommits.org/en/v1.0.0-beta.2/) specification
+*before* a requesting code review.  If necessary, use `git commit --no-verify`
+to bypass these checks.  In addition to the tools necessary to build Kythe, the
+following are necessary to run the installed hooks:
 
-sudo apt-get install php5 php5-curl
-mkdir -p "$ARC_PATH"
-pushd "$ARC_PATH"
-git clone https://github.com/phacility/libphutil.git
-git clone https://github.com/phacility/arcanist.git
-popd
+- arcanist
+- buildifier
+- clang-format
+- gofmt
+- google-java-format
+- jq
+- shellcheck
 
-# add arc to your PATH
-echo "export PATH=\"${ARC_PATH}/arcanist/bin:\$PATH\"" >> ~/.bashrc
-source ~/.bashrc
+Each Pull Request will also require a gambit of tests run by Kythe's instance of
+[Buildbot](https://buildbot-dot-kythe-repo.appspot.com).  All non-maintainers
+will require a Kythe team member to add the `buildbot` label to each Pull
+Request to verify the PR should be checked by Buildbot.
 
-arc install-certificate # in Kythe repository root
-{% endhighlight %}
+### Style formatting
 
-### Using arcanist
-
-{% highlight bash %}
-git checkout master
-arc feature feature-name # OR git checkout -b feature-name
-# do some changes
-git add ...                    # add the changes
-git commit -m "Commit message" # commit the changes
-arc diff --browse              # send the commit for review
-# go through code review in Phabricator UI...
-# get change accepted
-
-arc land                       # merge the change into master
-{% endhighlight %}
-
-For core contributors with write access to the Kythe repository, `arc land` will
-merge the change into master and push it to Github.  Others should request that
-someone else land their change for them once the change has been reviewed and
-accepted.
+Kythe C++ code follows the Google style guide. You can run `clang-format` to do
+this automatically:
 
 {% highlight bash %}
-# Land a reviewed change
-arc patch D1234
-arc land
+clang-format -i --style=file <filename>
 {% endhighlight %}
 
+If you forgot to do this for a commit, you can amend it easily:
+
+{% highlight bash %}
+clang-format i --style=file $(git show --pretty="" --name-only <SHA1>)
+git commit --amend
+{% endhighlight %}
+
+Likewise, all Java code should be formatted by the latest version of
+`google-java-format` and Go code should pass through `gofmt`.
 
 ## Contribution Ideas
 
 Along with working off of our [tasks
-list]({{site.data.development.phabricator}}/maniphest) (and, in particular, the
-[Wishlist]({{site.data.development.phabricator}}/maniphest/query/uFWarCNL9v7z/)),
+list]({{site.data.development.issue_tracker}}) (and, in particular, the
+[Wishlist]({{site.data.development.github}}/labels/wishlist)),
 there are many ways to contribute to Kythe.
 
 ### New Extractors and Indexers

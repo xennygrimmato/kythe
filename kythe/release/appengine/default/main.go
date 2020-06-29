@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,23 +14,25 @@
  * limitations under the License.
  */
 
-package server
+package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 )
 
 const (
 	phabricatorURL = "https://phabricator-dot-kythe-repo.appspot.com"
-	repoURL        = phabricatorURL + "/diffusion/K/browse/master"
+	repoURL        = "https://github.com/kythe/kythe/tree/master"
 	staticRoot     = "site"
 
 	goGetHTML = `<html>
   <head>
     <meta charset="utf-8">
-    <meta name="go-import" content="kythe.io git https://github.com/google/kythe">
+    <meta name="go-import" content="kythe.io git https://github.com/kythe/kythe">
     <meta name="go-source" content="kythe.io https://kythe.io https://kythe.io/repo{/dir} https://kythe.io/repo{/dir}/{file}${line}">
   </head>
   <body>
@@ -39,12 +41,17 @@ const (
 </html>`
 )
 
-func init() {
+func main() {
 	http.Handle("/phabricator/", http.StripPrefix("/phabricator", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, phabricatorURL+r.URL.Path, http.StatusTemporaryRedirect)
 	})))
 	http.Handle("/repo/", http.StripPrefix("/repo", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, repoURL+r.URL.Path, http.StatusTemporaryRedirect)
+	})))
+	// This redirect is put in place to handle the case when a user fails to include a trailing slash, which causes
+	// images within docs/schema to not be properly served.
+	http.Handle("/docs/schema", http.StripPrefix("/docs/schema", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/docs/schema/", http.StatusTemporaryRedirect)
 	})))
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := r.URL.Query()["go-get"]; ok {
@@ -55,4 +62,12 @@ func init() {
 			http.ServeFile(w, r, filepath.Join(staticRoot, r.URL.Path))
 		}
 	})
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+		log.Printf("Defaulting to port %s", port)
+	}
+
+	log.Printf("Listening on port %s", port)
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), nil))
 }

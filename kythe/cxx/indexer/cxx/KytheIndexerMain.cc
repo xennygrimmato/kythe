@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,67 +23,114 @@
 //       indexer -i foo.cc | verifier foo.cc
 //       indexer some/index.kindex
 
-#include "gflags/gflags.h"
+#include "absl/flags/flag.h"
+#include "absl/flags/parse.h"
+#include "absl/flags/usage.h"
+#include "absl/memory/memory.h"
+#include "absl/strings/str_format.h"
 #include "google/protobuf/stubs/common.h"
-#include "kythe/cxx/common/indexing/frontend.h"
+#include "kythe/cxx/common/protobuf_metadata_file.h"
+#include "kythe/cxx/indexer/cxx/GoogleFlagsLibrarySupport.h"
+#include "kythe/cxx/indexer/cxx/ImputedConstructorSupport.h"
 #include "kythe/cxx/indexer/cxx/IndexerFrontendAction.h"
+#include "kythe/cxx/indexer/cxx/ProtoLibrarySupport.h"
+#include "kythe/cxx/indexer/cxx/frontend.h"
+#include "kythe/cxx/indexer/cxx/indexer_worklist.h"
 
-DEFINE_bool(index_template_instantiations, true,
-            "Index template instantiations.");
-DEFINE_bool(experimental_drop_instantiation_independent_data, false,
-            "Don't emit template nodes and edges found to be "
-            "instantiation-independent.");
-DEFINE_bool(report_profiling_events, false,
-            "Write profiling events to standard error.");
-DEFINE_bool(experimental_index_lite, false,
-            "Drop uncommonly-used data from the index.");
+ABSL_FLAG(bool, index_template_instantiations, true,
+          "Index template instantiations.");
+ABSL_FLAG(bool, experimental_drop_instantiation_independent_data, false,
+          "Don't emit template nodes and edges found to be "
+          "instantiation-independent.");
+ABSL_FLAG(bool, report_profiling_events, false,
+          "Write profiling events to standard error.");
+ABSL_FLAG(bool, experimental_index_lite, false,
+          "Drop uncommonly-used data from the index.");
+ABSL_FLAG(bool, experimental_drop_objc_fwd_class_docs, false,
+          "Drop comments for Objective-C forward class declarations.");
+ABSL_FLAG(bool, experimental_drop_cpp_fwd_decl_docs, false,
+          "Drop comments for C++ forward declarations.");
+ABSL_FLAG(int, experimental_usr_byte_size, 0,
+          "Use this many bytes to represent a USR (or don't at all if 0).");
+ABSL_FLAG(bool, use_compilation_corpus_as_default, false,
+          "Use the CompilationUnit VName corpus as the default.");
 
 namespace kythe {
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
   google::InitGoogleLogging(argv[0]);
-  google::SetVersionString("0.1");
-  google::SetUsageMessage(
+  absl::SetProgramUsageMessage(
       IndexerContext::UsageMessage("the Kythe C++ indexer", "indexer"));
-  google::ParseCommandLineFlags(&argc, &argv, true);
-  std::vector<std::string> final_args(argv, argv + argc);
+  std::vector<char*> remain = absl::ParseCommandLine(argc, argv);
+  std::vector<std::string> final_args(remain.begin(), remain.end());
   IndexerContext context(final_args, "stdin.cc");
   IndexerOptions options;
-  options.TemplateBehavior = FLAGS_index_template_instantiations
+  options.TemplateBehavior = absl::GetFlag(FLAGS_index_template_instantiations)
                                  ? BehaviorOnTemplates::VisitInstantiations
                                  : BehaviorOnTemplates::SkipInstantiations;
   options.UnimplementedBehavior = context.ignore_unimplemented()
                                       ? kythe::BehaviorOnUnimplemented::Continue
                                       : kythe::BehaviorOnUnimplemented::Abort;
-  options.Verbosity = FLAGS_experimental_index_lite ? kythe::Verbosity::Lite
-                                                    : kythe::Verbosity::Classic;
+  options.Verbosity = absl::GetFlag(FLAGS_experimental_index_lite)
+                          ? kythe::Verbosity::Lite
+                          : kythe::Verbosity::Classic;
+  options.ObjCFwdDocs =
+      absl::GetFlag(FLAGS_experimental_drop_objc_fwd_class_docs)
+          ? kythe::BehaviorOnFwdDeclComments::Ignore
+          : kythe::BehaviorOnFwdDeclComments::Emit;
+  options.CppFwdDocs = absl::GetFlag(FLAGS_experimental_drop_cpp_fwd_decl_docs)
+                           ? kythe::BehaviorOnFwdDeclComments::Ignore
+                           : kythe::BehaviorOnFwdDeclComments::Emit;
+  options.UsrByteSize = absl::GetFlag(FLAGS_experimental_usr_byte_size) <= 0
+                            ? 0
+                            : absl::GetFlag(FLAGS_experimental_usr_byte_size);
+  options.UseCompilationCorpusAsDefault =
+      absl::GetFlag(FLAGS_use_compilation_corpus_as_default);
   options.DropInstantiationIndependentData =
-      FLAGS_experimental_drop_instantiation_independent_data;
+      absl::GetFlag(FLAGS_experimental_drop_instantiation_independent_data);
   options.AllowFSAccess = context.allow_filesystem_access();
-  options.EnableLossyClaiming = context.enable_lossy_claiming();
-  options.EffectiveWorkingDirectory = context.working_directory();
-  if (FLAGS_report_profiling_events) {
-    options.ReportProfileEvent = [](const char *counter, ProfilingEvent event) {
-      fprintf(stderr, "%s: %s\n", counter,
-              event == ProfilingEvent::Enter ? "enter" : "exit");
+  if (absl::GetFlag(FLAGS_report_profiling_events)) {
+    options.ReportProfileEvent = [](const char* counter, ProfilingEvent event) {
+      absl::FPrintF(stderr, "%s: %s\n", counter,
+                    event == ProfilingEvent::Enter ? "enter" : "exit");
     };
   }
 
-  kythe::MetadataSupports meta_supports;
-  meta_supports.push_back(llvm::make_unique<KytheMetadataSupport>());
+  bool had_errors = false;
+  NullOutputStream null_stream;
 
-  std::string result = IndexCompilationUnit(
-      context.unit(), *context.virtual_files(), *context.claim_client(),
-      context.hash_cache(), *context.output(), options, &meta_supports);
+  context.EnumerateCompilations([&](IndexerJob& job) {
+    options.EffectiveWorkingDirectory = job.unit.working_directory();
 
-  if (!result.empty()) {
-    fprintf(stderr, "Error: %s\n", result.c_str());
-  }
+    kythe::MetadataSupports meta_supports;
+    meta_supports.Add(absl::make_unique<ProtobufMetadataSupport>());
+    meta_supports.Add(absl::make_unique<KytheMetadataSupport>());
 
-  return !result.empty();
+    kythe::LibrarySupports library_supports;
+    library_supports.push_back(absl::make_unique<GoogleFlagsLibrarySupport>());
+    library_supports.push_back(absl::make_unique<GoogleProtoLibrarySupport>());
+    library_supports.push_back(absl::make_unique<ImputedConstructorSupport>());
+
+    std::string result = IndexCompilationUnit(
+        job.unit, job.virtual_files, *context.claim_client(),
+        context.hash_cache(),
+        job.silent ? static_cast<KytheCachingOutput&>(null_stream)
+                   : static_cast<KytheCachingOutput&>(*context.output()),
+        options, &meta_supports, &library_supports,
+        [](IndexerASTVisitor* indexer) {
+          return IndexerWorklist::CreateDefaultWorklist(indexer);
+        });
+
+    if (!result.empty()) {
+      absl::FPrintF(stderr, "Error: %s\n", result);
+      had_errors = true;
+    }
+  });
+
+  return (had_errors ? 1 : 0);
 }
 
 }  // namespace kythe
 
-int main(int argc, char *argv[]) { return kythe::main(argc, argv); }
+int main(int argc, char* argv[]) { return kythe::main(argc, argv); }

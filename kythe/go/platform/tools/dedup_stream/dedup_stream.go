@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ import (
 	"os"
 
 	"kythe.io/kythe/go/platform/delimited"
+	"kythe.io/kythe/go/platform/delimited/dedup"
 	"kythe.io/kythe/go/util/datasize"
 	"kythe.io/kythe/go/util/flagutil"
 )
@@ -41,7 +42,7 @@ func main() {
 		flagutil.UsageErrorf("unknown arguments: %v", flag.Args())
 	}
 
-	rd, err := delimited.NewUniqReader(delimited.NewReader(os.Stdin), int(cacheSize.Bytes()))
+	rd, err := dedup.NewReader(os.Stdin, int(cacheSize.Bytes()))
 	if err != nil {
 		log.Fatalf("Error creating UniqReader: %v", err)
 	}

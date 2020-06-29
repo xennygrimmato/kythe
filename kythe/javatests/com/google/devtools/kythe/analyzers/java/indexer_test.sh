@@ -1,6 +1,6 @@
-#!/bin/bash -e
-set -o pipefail
-# Copyright 2015 Google Inc. All rights reserved.
+#!/bin/bash
+set -eo pipefail
+# Copyright 2015 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,18 +16,9 @@ set -o pipefail
 #
 # This script tests the java indexer's CLI.
 
-indexer="kythe/java/com/google/devtools/kythe/analyzers/java/indexer"
-indexpack="kythe/go/platform/tools/indexpack/indexpack"
-entrystream="kythe/go/platform/tools/entrystream/entrystream"
-test_kindex="$PWD/kythe/testdata/test.kindex"
+: ${indexer?:missing indexer}
+: ${entrystream?:missing entrystream}
+test_kzip="$PWD/kythe/testdata/test.kzip"
 
-# Test indexing a .kindex file
-$indexer $test_kindex | $entrystream >/dev/null
-
-tmp="$(mktemp -d 2>/dev/null || mktemp -d -t 'kythetest')"
-trap 'rm -rf "$tmp"' EXIT ERR INT
-
-UNIT="$($indexpack --to_archive "$tmp/archive" $test_kindex 2>/dev/null)"
-
-# Test indexing compilation in an indexpack
-$indexer --index_pack="$tmp/archive" $UNIT | $entrystream >/dev/null
+# Test indexing a .kzip file
+$indexer $test_kzip | $entrystream >/dev/null

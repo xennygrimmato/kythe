@@ -1,6 +1,6 @@
 #!/bin/bash -e
 set -o pipefail
-# Copyright 2016 Google Inc. All rights reserved.
+# Copyright 2016 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,11 +45,15 @@ drive_indexer_kindex() {
       analyzer() {
         "$INDEXERS/cxx_indexer" "$@"
       } ;;
+    go)
+      analyzer() {
+        "$INDEXERS/go_indexer" "$@"
+      } ;;
     *)
       if [[ -n "$IGNORE_UNHANDLED" ]]; then
         return 0
       fi
-      echo "ERROR: no indexer found for language $lang"
+      echo "ERROR: no indexer found for language $lang" >&2
       exit 1
   esac
   echo "Indexing $*" >&2
@@ -58,6 +62,5 @@ drive_indexer_kindex() {
 export -f drive_indexer_kindex
 export SHELL=bash
 
-cd /tmp # TODO(T70): the java indexer cannot run in the repository root
 find "$COMPILATIONS" -name '*.kindex' | sort -R | \
     { parallel --gnu -L1 drive_indexer_kindex || echo "$? analysis failures" >&2; }

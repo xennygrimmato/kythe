@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,6 @@
 /// \file IndexerFrontendAction.h
 /// \brief Defines a tool that passes notifications to a `GraphObserver`.
 
-// This file uses the Clang style conventions.
-
 #ifndef KYTHE_CXX_INDEXER_CXX_INDEXER_FRONTEND_ACTION_H_
 #define KYTHE_CXX_INDEXER_CXX_INDEXER_FRONTEND_ACTION_H_
 
@@ -26,37 +24,38 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <functional>
 #include <memory>
 #include <set>
 #include <string>
 #include <utility>
 
-#include "glog/logging.h"
-#include "kythe/cxx/common/cxx_details.h"
-#include "kythe/cxx/common/kythe_metadata_file.h"
+#include "GraphObserver.h"
+#include "IndexerASTHooks.h"
+#include "IndexerPPCallbacks.h"
+#include "absl/memory/memory.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Tooling/Tooling.h"
+#include "glog/logging.h"
+#include "kythe/cxx/common/kythe_metadata_file.h"
+#include "kythe/cxx/extractor/cxx_details.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
-
-#include "GraphObserver.h"
-#include "IndexerASTHooks.h"
-#include "IndexerPPCallbacks.h"
 
 namespace kythe {
 namespace proto {
 class CompilationUnit;
 class FileData;
-} // namespace proto
+}  // namespace proto
 class KytheClaimClient;
 
 /// \brief Runs a given tool on a piece of code with a given assumed filename.
 /// \returns true on success, false on failure.
 bool RunToolOnCode(std::unique_ptr<clang::FrontendAction> tool_action,
-                   llvm::Twine code, const std::string &filename);
+                   llvm::Twine code, const std::string& filename);
 
 // A FrontendAction that extracts information about a translation unit both
 // from its AST (using an ASTConsumer) and from preprocessing (with a
@@ -66,13 +65,21 @@ bool RunToolOnCode(std::unique_ptr<clang::FrontendAction> tool_action,
 //
 // TODO(jdennett): Consider moving/renaming this to kythe::ExtractIndexAction.
 class IndexerFrontendAction : public clang::ASTFrontendAction {
-public:
-  IndexerFrontendAction(GraphObserver *GO, const HeaderSearchInfo *Info)
-      : Observer(CHECK_NOTNULL(GO)), HeaderConfigValid(Info != nullptr) {
+ public:
+  IndexerFrontendAction(
+      GraphObserver* GO, const HeaderSearchInfo* Info,
+      std::function<bool()> ShouldStopIndexing,
+      std::function<std::unique_ptr<IndexerWorklist>(IndexerASTVisitor*)>
+          CreateWorklist,
+      const LibrarySupports* LibrarySupports)
+      : Observer(CHECK_NOTNULL(GO)),
+        HeaderConfigValid(Info != nullptr),
+        Supports(*CHECK_NOTNULL(LibrarySupports)),
+        ShouldStopIndexing(std::move(ShouldStopIndexing)),
+        CreateWorklist(std::move(CreateWorklist)) {
     if (HeaderConfigValid) {
       HeaderConfig = *Info;
     }
-    Supports.push_back(llvm::make_unique<GoogleFlagsLibrarySupport>());
   }
 
   /// \brief Barrel through even if we don't understand part of a program?
@@ -81,29 +88,38 @@ public:
     IgnoreUnimplemented = B;
   }
 
-  /// \param Visit template instantiations?
+  /// \brief Visit template instantiations?
   /// \param T The behavior to use for template instantiations.
   void setTemplateMode(BehaviorOnTemplates T) { TemplateMode = T; }
 
-  /// \param Emit all data?
+  /// \brief Emit all data?
   /// \param V Degree of verbosity.
   void setVerbosity(Verbosity V) { Verbosity = V; }
 
-private:
-  std::unique_ptr<clang::ASTConsumer>
-  CreateASTConsumer(clang::CompilerInstance &CI,
-                    llvm::StringRef Filename) override {
+  /// \brief Emit comments for forward declared classes as documentation?
+  /// \param B Behavior to use.
+  void setObjCFwdDeclEmitDocs(BehaviorOnFwdDeclComments B) { ObjCFwdDocs = B; }
+
+  /// \brief Emit comments for forward declarations as documentation?
+  /// \param B Behavior to use.
+  void setCppFwdDeclEmitDocs(BehaviorOnFwdDeclComments B) { CppFwdDocs = B; }
+
+  /// \brief Use this many raw bytes for USRs.
+  void setUsrByteSize(int S) { UsrByteSize = S; }
+
+ private:
+  std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(
+      clang::CompilerInstance& CI, llvm::StringRef Filename) override {
     if (HeaderConfigValid) {
-      auto &HeaderSearch = CI.getPreprocessor().getHeaderSearchInfo();
-      auto &FileManager = CI.getFileManager();
+      auto& HeaderSearch = CI.getPreprocessor().getHeaderSearchInfo();
+      auto& FileManager = CI.getFileManager();
       std::vector<clang::DirectoryLookup> Lookups;
       unsigned CurrentIdx = 0;
-      for (const auto &Path : HeaderConfig.paths) {
-        const clang::DirectoryEntry *DirEnt =
-            FileManager.getDirectory(Path.path);
-        if (DirEnt != nullptr) {
+      for (const auto& Path : HeaderConfig.paths) {
+        auto DirEnt = FileManager.getDirectoryRef(Path.path);
+        if (DirEnt) {
           Lookups.push_back(clang::DirectoryLookup(
-              DirEnt, Path.characteristic_kind, Path.is_framework));
+              DirEnt.get(), Path.characteristic_kind, Path.is_framework));
           ++CurrentIdx;
         } else {
           // This can happen if a path was included in the HeaderSearchInfo,
@@ -127,15 +143,15 @@ private:
       Observer->setLangOptions(&CI.getLangOpts());
       Observer->setPreprocessor(&CI.getPreprocessor());
     }
-    return llvm::make_unique<IndexerASTConsumer>(
-        Observer, IgnoreUnimplemented, TemplateMode, Verbosity, Supports);
+    return absl::make_unique<IndexerASTConsumer>(
+        Observer, IgnoreUnimplemented, TemplateMode, Verbosity, ObjCFwdDocs,
+        CppFwdDocs, Supports, ShouldStopIndexing, CreateWorklist, UsrByteSize);
   }
 
-  bool BeginSourceFileAction(clang::CompilerInstance &CI,
-                             llvm::StringRef Filename) override {
+  bool BeginSourceFileAction(clang::CompilerInstance& CI) override {
     if (Observer) {
-      CI.getPreprocessor().addPPCallbacks(llvm::make_unique<IndexerPPCallbacks>(
-          CI.getPreprocessor(), *Observer, Verbosity));
+      CI.getPreprocessor().addPPCallbacks(absl::make_unique<IndexerPPCallbacks>(
+          CI.getPreprocessor(), *Observer, Verbosity, UsrByteSize));
     }
     CI.getLangOpts().CommentOpts.ParseAllComments = true;
     CI.getLangOpts().RetainCommentsFromSystemHeaders = true;
@@ -145,19 +161,31 @@ private:
   bool usesPreprocessorOnly() const override { return false; }
 
   /// The `GraphObserver` used for reporting information.
-  GraphObserver *Observer;
+  GraphObserver* Observer;
   /// Whether to die on missing cases or to continue onward.
   BehaviorOnUnimplemented IgnoreUnimplemented = BehaviorOnUnimplemented::Abort;
   /// Whether to visit template instantiations.
   BehaviorOnTemplates TemplateMode = BehaviorOnTemplates::VisitInstantiations;
   /// Whether to emit all data.
   enum Verbosity Verbosity = kythe::Verbosity::Classic;
+  /// Should we emit documentation for forward class decls in ObjC?
+  BehaviorOnFwdDeclComments ObjCFwdDocs = BehaviorOnFwdDeclComments::Emit;
+  /// Should we emit documentation for forward decls in C++?
+  BehaviorOnFwdDeclComments CppFwdDocs = BehaviorOnFwdDeclComments::Emit;
   /// Configuration information for header search.
   HeaderSearchInfo HeaderConfig;
   /// Whether to use HeaderConfig.
   bool HeaderConfigValid;
   /// Library-specific callbacks.
-  LibrarySupports Supports;
+  const LibrarySupports& Supports;
+  /// \return true if indexing should be cancelled.
+  std::function<bool()> ShouldStopIndexing = [] { return false; };
+  /// \return a new worklist for the given visitor.
+  std::function<std::unique_ptr<IndexerWorklist>(IndexerASTVisitor*)>
+      CreateWorklist;
+  /// \brief The number of (raw) bytes to use to represent a USR. If 0,
+  /// no USRs will be recorded.
+  int UsrByteSize = 0;
 };
 
 /// \brief Allows stdin to be replaced with a mapped file.
@@ -171,31 +199,39 @@ class StdinAdjustSingleFrontendActionFactory
     : public clang::tooling::FrontendActionFactory {
   std::unique_ptr<clang::FrontendAction> Action;
 
-public:
+ public:
   /// \param Action The single FrontendAction to run once. Takes ownership.
   StdinAdjustSingleFrontendActionFactory(
       std::unique_ptr<clang::FrontendAction> Action)
       : Action(std::move(Action)) {}
 
-  bool
-  runInvocation(clang::CompilerInvocation *Invocation,
-                clang::FileManager *Files,
-                std::shared_ptr<clang::PCHContainerOperations> PCHContainerOps,
-                clang::DiagnosticConsumer *DiagConsumer) override {
-    auto &FEOpts = Invocation->getFrontendOpts();
-    for (auto &Input : FEOpts.Inputs) {
+  bool runInvocation(
+      std::shared_ptr<clang::CompilerInvocation> Invocation,
+      clang::FileManager* Files,
+      std::shared_ptr<clang::PCHContainerOperations> PCHContainerOps,
+      clang::DiagnosticConsumer* DiagConsumer) override {
+    auto& FEOpts = Invocation->getFrontendOpts();
+    for (auto& Input : FEOpts.Inputs) {
       if (Input.isFile() && Input.getFile() == "-") {
         Input = clang::FrontendInputFile("<stdin>", Input.getKind(),
                                          Input.isSystem());
       }
     }
+    // Disable dependency outputs. The indexer should not write to arbitrary
+    // files on its host (as dictated by -MD-style flags).
+    Invocation->getDependencyOutputOpts().OutputFile.clear();
+    Invocation->getDependencyOutputOpts().HeaderIncludeOutputFile.clear();
+    Invocation->getDependencyOutputOpts().DOTOutputFile.clear();
+    Invocation->getDependencyOutputOpts().ModuleDependencyOutputDir.clear();
     return clang::tooling::FrontendActionFactory::runInvocation(
         Invocation, Files, PCHContainerOps, DiagConsumer);
   }
 
   /// Note that FrontendActionFactory::create() specifies that the
   /// returned action is owned by the caller.
-  clang::FrontendAction *create() override { return Action.release(); }
+  std::unique_ptr<clang::FrontendAction> create() override {
+    return std::move(Action);
+  }
 };
 
 /// \brief Options that control how the indexer behaves.
@@ -210,8 +246,10 @@ struct IndexerOptions {
       BehaviorOnUnimplemented::Abort;
   /// \brief Whether to emit all data.
   enum Verbosity Verbosity = kythe::Verbosity::Classic;
-  /// \brief Enable experimental lossy claiming if true.
-  bool EnableLossyClaiming = false;
+  /// \brief Should we emit documentation for forward class decls in ObjC?
+  BehaviorOnFwdDeclComments ObjCFwdDocs = BehaviorOnFwdDeclComments::Emit;
+  /// \brief Should we emit documentation for forward decls in C++?
+  BehaviorOnFwdDeclComments CppFwdDocs = BehaviorOnFwdDeclComments::Emit;
   /// \brief Whether to allow access to the raw filesystem.
   bool AllowFSAccess = false;
   /// \brief Whether to drop data found to be template instantiation
@@ -219,7 +257,17 @@ struct IndexerOptions {
   bool DropInstantiationIndependentData = false;
   /// \brief A function that is called as the indexer enters and exits various
   /// phases of execution (in strict LIFO order).
-  ProfilingCallback ReportProfileEvent = [](const char *, ProfilingEvent) {};
+  ProfilingCallback ReportProfileEvent = [](const char*, ProfilingEvent) {};
+  /// \brief A callback to determine whether to cancel indexing as quickly
+  /// as possible.
+  /// \return true if indexing should be cancelled.
+  std::function<bool()> ShouldStopIndexing = [] { return false; };
+  /// \brief The number of (raw) bytes to use to represent a USR. If 0,
+  /// no USRs will be recorded.
+  int UsrByteSize = 0;
+  /// \brief Whether or not to use the CompilationUnit VName corpus as the
+  /// default corpus.
+  bool UseCompilationCorpusAsDefault = false;
 };
 
 /// \brief Indexes `Unit`, reading from `Files` in the assumed and writing
@@ -232,14 +280,18 @@ struct IndexerOptions {
 /// \param Output The output stream to use.
 /// \param Options Configuration settings for this run.
 /// \param MetaSupports Metadata support for this run.
+/// \param LibrarySupports Library support for this run.
+/// \param Worklist A function that generates a new worklist for the given
+/// visitor.
 /// \return empty if OK; otherwise, an error description.
-std::string IndexCompilationUnit(const proto::CompilationUnit &Unit,
-                                 std::vector<proto::FileData> &Files,
-                                 KytheClaimClient &ClaimClient,
-                                 HashCache *Cache, KytheOutputStream &Output,
-                                 const IndexerOptions &Options,
-                                 const MetadataSupports *MetaSupports);
+std::string IndexCompilationUnit(
+    const proto::CompilationUnit& Unit, std::vector<proto::FileData>& Files,
+    KytheClaimClient& ClaimClient, HashCache* Cache, KytheCachingOutput& Output,
+    const IndexerOptions& Options, const MetadataSupports* MetaSupports,
+    const LibrarySupports* LibrarySupports,
+    std::function<std::unique_ptr<IndexerWorklist>(IndexerASTVisitor*)>
+        CreateWorklist);
 
-} // namespace kythe
+}  // namespace kythe
 
-#endif // KYTHE_CXX_INDEXER_CXX_INDEXER_FRONTEND_ACTION_H_
+#endif  // KYTHE_CXX_INDEXER_CXX_INDEXER_FRONTEND_ACTION_H_

@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"os"
@@ -43,11 +44,8 @@ import (
 	"kythe.io/kythe/go/util/flagutil"
 	"kythe.io/kythe/go/util/profile"
 
-	"golang.org/x/net/context"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 
-	spb "kythe.io/kythe/proto/storage_proto"
-
-	_ "kythe.io/kythe/go/services/graphstore/grpc"
 	_ "kythe.io/kythe/go/services/graphstore/proxy"
 	_ "kythe.io/kythe/go/storage/leveldb"
 )

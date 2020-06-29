@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,6 @@
 
 // A simple unit test for KytheIndexer.
 
-#include "IndexerFrontendAction.h"
-
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,27 +25,25 @@
 #include <string>
 #include <utility>
 
+#include "IndexerFrontendAction.h"
+#include "absl/memory/memory.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Tooling/Tooling.h"
-
-#include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/Twine.h"
-
 #include "google/protobuf/stubs/common.h"
 #include "gtest/gtest.h"
-
 #include "kythe/cxx/common/indexing/KytheGraphRecorder.h"
 #include "kythe/cxx/common/indexing/RecordingOutputStream.h"
 #include "kythe/cxx/indexer/cxx/IndexerASTHooks.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
 
 namespace kythe {
 namespace {
 
 using clang::SourceLocation;
-using llvm::StringRef;
 
 class AnchorMarkTest : public ::testing::Test {
  protected:
@@ -59,8 +55,9 @@ class AnchorMarkTest : public ::testing::Test {
     bool operator!=(const ClaimToken&) const override { return true; }
   };
   MiniAnchor MakeMini(size_t begin, size_t end, const std::string& id) {
-    return MiniAnchor{begin, end, GraphObserver::NodeId::CreateUncompressed(
-                                      &empty_token_, id)};
+    return MiniAnchor{
+        begin, end,
+        GraphObserver::NodeId::CreateUncompressed(&empty_token_, id)};
   }
   EmptyToken empty_token_;
 };
@@ -280,13 +277,13 @@ TEST(KytheIndexerUnitTest, GraphRecorderEdgeOrdinal) {
   EXPECT_EQ(vname_target.DebugString(), entry.target().DebugString());
 }
 
-static void WriteStringToStackAndBuffer(const google::protobuf::string& string,
+static void WriteStringToStackAndBuffer(const google::protobuf::string& value,
                                         kythe::BufferStack* stack,
                                         google::protobuf::string* buffer) {
-  unsigned char* bytes = stack->WriteToTop(string.size());
-  memcpy(bytes, string.data(), string.size());
+  unsigned char* bytes = stack->WriteToTop(value.size());
+  memcpy(bytes, value.data(), value.size());
   if (buffer) {
-    buffer->append(string);
+    buffer->append(value);
   }
 }
 
@@ -382,8 +379,14 @@ TEST(KytheIndexerUnitTest, BufferStackMergeFailures) {
 
 TEST(KytheIndexerUnitTest, TrivialHappyCase) {
   NullGraphObserver observer;
-  std::unique_ptr<clang::FrontendAction> Action(
-      new IndexerFrontendAction(&observer, nullptr));
+  LibrarySupports no_supports;
+  std::unique_ptr<clang::FrontendAction> Action =
+      absl::make_unique<IndexerFrontendAction>(
+          &observer, nullptr, []() { return false; },
+          [](IndexerASTVisitor* visitor) {
+            return IndexerWorklist::CreateDefaultWorklist(visitor);
+          },
+          &no_supports);
   ASSERT_TRUE(
       RunToolOnCode(std::move(Action), "int main() {}", "valid_main.cc"));
 }
@@ -409,7 +412,7 @@ class PushPopLintingGraphObserver : public NullGraphObserver {
     }
     if (const clang::FileEntry* file_entry =
             SourceManager->getFileEntryForID(File)) {
-      FileNames.push(file_entry->getName());
+      FileNames.push(std::string(file_entry->getName()));
     } else {
       FileNames.push("null-file");
     }
@@ -438,8 +441,14 @@ class PushPopLintingGraphObserver : public NullGraphObserver {
 
 TEST(KytheIndexerUnitTest, PushFilePopFileTracking) {
   PushPopLintingGraphObserver Observer;
-  std::unique_ptr<clang::FrontendAction> Action(
-      new IndexerFrontendAction(&Observer, nullptr));
+  LibrarySupports no_supports;
+  std::unique_ptr<clang::FrontendAction> Action =
+      absl::make_unique<IndexerFrontendAction>(
+          &Observer, nullptr, []() { return false; },
+          [](IndexerASTVisitor* visitor) {
+            return IndexerWorklist::CreateDefaultWorklist(visitor);
+          },
+          &no_supports);
   ASSERT_TRUE(RunToolOnCode(std::move(Action), "int i;", "main.cc"));
   ASSERT_FALSE(Observer.hadUnderrun());
   ASSERT_EQ(0, Observer.getFileNameStackSize());

@@ -11,10 +11,17 @@ public interface Interfaces {
             || (ordering.lessThan(y, x) && ordering.moreThan(x, y));
   }
 
-  //- @Ordered defines/binding OrderedInterface
-  //- @"Ordered<T>" defines/binding OrderedTAbs
+  class X {
+    //- @obj defines/binding V
+    //- V typed Obj
+    Object obj;
+  }
+
+  //- @Ordered defines/binding OrderedTAbs
+  //- OrderedInterface childof OrderedTAbs
   //- @Interfaces ref Inter
   //- OrderedInterface extends Inter
+  //- !{ OrderedInterface extends Obj }
   public static interface Ordered<T> extends Interfaces {
     //- @lessThan defines/binding OrderedLessThan
     //- OrderedLessThan childof OrderedInterface
@@ -36,15 +43,15 @@ public interface Interfaces {
     }
   }
 
-  //- @Deredro defines/binding DeredroInterface
-  //- @"Deredro<T>" defines/binding DeredroTAbs
+  //- @Deredro defines/binding DeredroTAbs
+  //- DeredroInterface childof DeredroTAbs
   //- @T defines/binding TypeVariable
   //- DeredroTAbs param.0 TypeVariable
   public static interface Deredro<T>
-      //- @Ordered ref OrderedInterface
+      //- @Ordered ref OrderedTAbs
       //- @T ref TypeVariable
       //- OrderedTApp.node/kind tapp
-      //- OrderedTApp param.0 OrderedInterface
+      //- OrderedTApp param.0 OrderedTAbs
       //- OrderedTApp param.1 TypeVariable
       //- DeredroInterface extends OrderedTApp
       extends Ordered<T> {
@@ -65,7 +72,7 @@ public interface Interfaces {
   //- @IntComparison defines/binding IntComparisonClass
   //- @Integer ref IntegerClass
   //- DeredroTApp.node/kind tapp
-  //- DeredroTApp param.0 DeredroInterface
+  //- DeredroTApp param.0 DeredroTAbs
   //- DeredroTApp param.1 IntegerClass
   //- IntComparisonClass extends DeredroTApp
   public static class IntComparison implements Deredro<Integer> {
@@ -76,11 +83,8 @@ public interface Interfaces {
       return x < y;
     }
 
-    // TODO(mazurak) "overrides/transitive" is what the Java indexer currently outputs here, but
-    // maybe it shouldn't. We need a more rigorous definition for the various "overrides" edges.
-    //
     //- @equalTo defines/binding IntegerEqualTo
-    //- IntegerEqualTo overrides/transitive OrderedEqualTo
+    //- IntegerEqualTo overrides OrderedEqualTo
     //- IntegerEqualTo childof IntComparisonClass
     @Override public boolean equalTo(Integer x, Integer y) {
       return x.equals(y);
@@ -108,7 +112,8 @@ public interface Interfaces {
 
   // TODO(mazurak): should @FunctionalInterface classes interact with calleables in some way?
   //- @FunctionalInterface ref FunctionalAnnotation
-  //- @Reducer defines/binding ReducerInterface
+  //- @Reducer defines/binding ReducerInterfaceAbs
+  //- ReducerInterface childof ReducerInterfaceAbs
   //- ReducerInterface annotatedby FunctionalAnnotation
   @FunctionalInterface public static interface Reducer<T, S> {
     //- @reduce defines/binding ReduceMethod

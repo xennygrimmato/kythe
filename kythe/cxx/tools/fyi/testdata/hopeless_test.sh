@@ -1,5 +1,5 @@
-#!/bin/bash -e
-# Copyright 2015 Google Inc. All rights reserved.
+#!/bin/bash
+# Copyright 2015 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,4 +14,5 @@
 # limitations under the License.
 
 # This source file can't be repaired.
-./kythe/cxx/tools/fyi/testdata/test_case.sh hopeless.cc
+set -e
+. ./kythe/cxx/tools/fyi/testdata/test_case.sh hopeless.cc

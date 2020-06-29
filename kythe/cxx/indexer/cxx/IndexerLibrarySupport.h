@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,11 +19,10 @@
 #ifndef KYTHE_CXX_INDEXER_CXX_INDEXER_LIBRARY_SUPPORT_H_
 #define KYTHE_CXX_INDEXER_CXX_INDEXER_LIBRARY_SUPPORT_H_
 
-#include "clang/AST/Decl.h"
-
-#include "kythe/cxx/common/indexing/KytheGraphRecorder.h"
-
 #include "GraphObserver.h"
+#include "clang/AST/Decl.h"
+#include "clang/AST/Expr.h"
+#include "kythe/cxx/common/indexing/KytheGraphRecorder.h"
 
 namespace kythe {
 
@@ -36,13 +35,13 @@ class IndexerASTVisitor;
 /// language-level objects. LibrarySupport plugins can use additional knowledge
 /// about particular libraries to emit further semantic information.
 class LibrarySupport {
-public:
+ public:
   virtual ~LibrarySupport() {}
 
   /// \brief A single completed declaration (in the Kythe `completes` sense).
   struct Completion {
     /// The Decl being completed.
-    const clang::Decl *Decl;
+    const clang::Decl* Decl;
     /// The corresponding NodeId. If `Decl` is underneath a template, this will
     /// point to the `Abs` node of that template.
     GraphObserver::NodeId DeclId;
@@ -63,12 +62,12 @@ public:
   /// \param Decl The VarDecl in question.
   /// \param Compl Whether the Decl was complete.
   /// \param Compls If the Decl is complete, the decls that it completes.
-  virtual void InspectVariable(IndexerASTVisitor &V,
-                               GraphObserver::NodeId &DeclNodeId,
-                               GraphObserver::NodeId &DeclBodyNodeId,
-                               const clang::VarDecl *Decl,
+  virtual void InspectVariable(IndexerASTVisitor& V,
+                               GraphObserver::NodeId& DeclNodeId,
+                               GraphObserver::NodeId& DeclBodyNodeId,
+                               const clang::VarDecl* Decl,
                                GraphObserver::Completeness Compl,
-                               const std::vector<Completion> &Compls) {}
+                               const std::vector<Completion>& Compls) {}
 
   /// \brief Called on any DeclRef.
   /// \param V The active IndexerASTVisitor.
@@ -76,38 +75,26 @@ public:
   /// \param Ref The range of the reference.
   /// \param RefId The NodeId of the referent (TargetDecl).
   /// \param TargetDecl The NamedDecl being referenced.
-  virtual void InspectDeclRef(IndexerASTVisitor &V,
+  virtual void InspectDeclRef(IndexerASTVisitor& V,
                               clang::SourceLocation DeclRefLocation,
-                              const GraphObserver::Range &Ref,
-                              GraphObserver::NodeId &RefId,
-                              const clang::NamedDecl *TargetDecl) {}
+                              const GraphObserver::Range& Ref,
+                              GraphObserver::NodeId& RefId,
+                              const clang::NamedDecl* TargetDecl) {}
+
+  /// \brief Called on any CallExpr.
+  /// \param V The active IndexerASTVisitor.
+  /// \param CallExpr The call expr.
+  /// \param Range The range of the call expr.
+  /// \param CalleeId The NodeId of the callee.
+  virtual void InspectCallExpr(IndexerASTVisitor& V,
+                               const clang::CallExpr* CallExpr,
+                               const GraphObserver::Range& Range,
+                               GraphObserver::NodeId& CalleeId) {}
 };
 
 /// \brief A collection of library support implementations.
 using LibrarySupports = std::vector<std::unique_ptr<LibrarySupport>>;
 
-/// \brief Snoops on variable declarations and references to see if they
-/// are flags.
-class GoogleFlagsLibrarySupport : public LibrarySupport {
-public:
-  GoogleFlagsLibrarySupport() {}
+}  // namespace kythe
 
-  /// \brief Emits a google/gflag node if `Decl` is a flag.
-  void InspectVariable(IndexerASTVisitor &V, GraphObserver::NodeId &DeclNodeId,
-                       GraphObserver::NodeId &DeclBodyNodeId,
-                       const clang::VarDecl *Decl,
-                       GraphObserver::Completeness Compl,
-                       const std::vector<Completion> &Compls) override;
-
-  /// \brief Checks whether this DeclRef refers to a flag. If so, it emits an
-  /// additional ref edge to the correspondng google/gflag node.
-  void InspectDeclRef(IndexerASTVisitor &V,
-                      clang::SourceLocation DeclRefLocation,
-                      const GraphObserver::Range &Ref,
-                      GraphObserver::NodeId &RefId,
-                      const clang::NamedDecl *TargetDecl) override;
-};
-
-} // namespace kythe
-
-#endif // KYTHE_CXX_INDEXER_CXX_INDEXER_LIBRARY_SUPPORT_H_
+#endif  // KYTHE_CXX_INDEXER_CXX_INDEXER_LIBRARY_SUPPORT_H_

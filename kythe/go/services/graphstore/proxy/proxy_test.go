@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -24,10 +25,9 @@ import (
 
 	"kythe.io/kythe/go/services/graphstore"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
-	spb "kythe.io/kythe/proto/storage_proto"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
 var ctx = context.Background()

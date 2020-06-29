@@ -1,3 +1,5 @@
+load("@rules_java//java:defs.bzl", "java_test")
+
 package(default_visibility = ["//kythe:default_visibility"])
 
 java_test(
@@ -6,9 +8,11 @@ java_test(
     srcs = ["CompilationUnitFileTreeTest.java"],
     test_class = "com.google.devtools.kythe.platform.java.filemanager.CompilationUnitFileTreeTest",
     deps = [
-        "//external:guava",
-        "//external:junit4",
         "//kythe/java/com/google/devtools/kythe/platform/java/filemanager",
-        "//kythe/proto:analysis_proto_java",
+        "//kythe/java/com/google/devtools/kythe/platform/java/filemanager:filetree",
+        "//kythe/proto:analysis_java_proto",
+        "//third_party/guava",
+        "//third_party/truth",
+        "@maven//:junit_junit",
     ],
 )

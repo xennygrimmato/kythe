@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -32,14 +33,14 @@ import (
 	"os"
 
 	"kythe.io/kythe/go/services/filetree"
+	"kythe.io/kythe/go/services/graph"
 	"kythe.io/kythe/go/services/web"
 	"kythe.io/kythe/go/services/xrefs"
 	ftsrv "kythe.io/kythe/go/serving/filetree"
+	gsrv "kythe.io/kythe/go/serving/graph"
 	xsrv "kythe.io/kythe/go/serving/xrefs"
 	"kythe.io/kythe/go/storage/leveldb"
 	"kythe.io/kythe/go/storage/table"
-
-	"golang.org/x/net/context"
 )
 
 var (
@@ -55,17 +56,19 @@ func main() {
 		log.Fatal("Missing --port_file argument")
 	}
 
+	ctx := context.Background()
 	db, err := leveldb.Open(*servingTable, nil)
 	if err != nil {
 		log.Fatalf("Error opening db at %q: %v", *servingTable, err)
 	}
-	defer db.Close()
-	tbl := table.ProtoBatchParallel{&table.KVProto{db}}
-	xs := xsrv.NewCombinedTable(tbl)
+	defer db.Close(ctx)
+	xs := xsrv.NewService(ctx, db)
+	tbl := &table.KVProto{db}
+	gs := gsrv.NewCombinedTable(tbl)
 	ft := &ftsrv.Table{Proto: tbl, PrefixedKeys: true}
 
-	ctx := context.Background()
 	xrefs.RegisterHTTPHandlers(ctx, xs, http.DefaultServeMux)
+	graph.RegisterHTTPHandlers(ctx, gs, http.DefaultServeMux)
 	filetree.RegisterHTTPHandlers(ctx, ft, http.DefaultServeMux)
 	web.RegisterQuitHandler(http.DefaultServeMux)
 	http.HandleFunc("/alive", func(w http.ResponseWriter, r *http.Request) {

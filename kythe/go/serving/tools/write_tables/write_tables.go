@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,30 +19,37 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"log"
+	"time"
 
 	"kythe.io/kythe/go/platform/vfs"
 	"kythe.io/kythe/go/services/graphstore"
 	"kythe.io/kythe/go/serving/pipeline"
+	"kythe.io/kythe/go/serving/pipeline/beamio"
+	"kythe.io/kythe/go/serving/xrefs"
 	"kythe.io/kythe/go/storage/gsutil"
 	"kythe.io/kythe/go/storage/leveldb"
 	"kythe.io/kythe/go/storage/stream"
-	"kythe.io/kythe/go/util/datasize"
 	"kythe.io/kythe/go/util/flagutil"
 	"kythe.io/kythe/go/util/profile"
 
-	"golang.org/x/net/context"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 
-	spb "kythe.io/kythe/proto/storage_proto"
+	"github.com/apache/beam/sdks/go/pkg/beam"
+	"github.com/apache/beam/sdks/go/pkg/beam/x/beamx"
 
-	_ "kythe.io/kythe/go/services/graphstore/grpc"
 	_ "kythe.io/kythe/go/services/graphstore/proxy"
+	_ "kythe.io/third_party/beam/sdks/go/pkg/beam/runners/disksort"
 )
 
 var (
 	gs          graphstore.Service
-	entriesFile = flag.String("entries", "", "Path to GraphStore-ordered entries file (mutually exclusive with --graphstore)")
+	entriesFile = flag.String("entries", "",
+		"In non-beam mode: path to GraphStore-ordered entries file (mutually exclusive with --graphstore).\n"+
+			"In beam mode: path to an unordered entries file, or if ending with slash, a directory containing such files.")
 
 	tablePath = flag.String("out", "", "Directory path to output serving table")
 
@@ -52,10 +59,13 @@ var (
 		"Determines whether intermediate data written to disk should be compressed.")
 	maxShardSize = flag.Int("max_shard_size", 32000,
 		"Maximum number of elements (edges, decoration fragments, etc.) to keep in-memory before flushing an intermediary data shard to disk.")
-	shardIOBufferSize = datasize.Flag("shard_io_buffer", "16KiB",
-		"Size of the reading/writing buffers for the intermediary data shards.")
 
 	verbose = flag.Bool("verbose", false, "Whether to emit extra, and possibly excessive, log messages")
+
+	experimentalBeamPipeline = flag.Bool("experimental_beam_pipeline", false, "Whether to use the Beam experimental pipeline implementation")
+	beamShards               = flag.Int("beam_shards", 0, "Number of shards for beam processing. If non-positive, a reasonable default will be chosen.")
+	experimentalColumnarData = flag.Bool("experimental_beam_columnar_data", false, "Whether to emit columnar data from the Beam pipeline implementation")
+	compactTable             = flag.Bool("compact_table", false, "Whether to compact the output LevelDB after its creation")
 )
 
 func init() {
@@ -64,8 +74,23 @@ func init() {
 		"Creates a combined xrefs/filetree/search serving table based on a given GraphStore or stream of GraphStore-ordered entries",
 		"(--graphstore spec | --entries path) --out path")
 }
+
 func main() {
 	flag.Parse()
+	beam.Init()
+	ctx := context.Background()
+	if *experimentalBeamPipeline {
+		if err := runExperimentalBeamPipeline(ctx); err != nil {
+			log.Fatalf("Pipeline error: %v", err)
+		}
+		if *compactTable {
+			if err := compactLevelDB(*tablePath); err != nil {
+				log.Fatalf("Error compacting LevelDB: %v", err)
+			}
+		}
+		return
+	}
+
 	if gs == nil && *entriesFile == "" {
 		flagutil.UsageError("missing --graphstore or --entries")
 	} else if gs != nil && *entriesFile != "" {
@@ -78,9 +103,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
-
-	ctx := context.Background()
+	defer db.Close(ctx)
 
 	if err := profile.Start(ctx); err != nil {
 		log.Fatal(err)
@@ -107,8 +130,78 @@ func main() {
 		MaxPageSize:    *maxPageSize,
 		CompressShards: *compressShards,
 		MaxShardSize:   *maxShardSize,
-		IOBufferSize:   int(shardIOBufferSize.Bytes()),
 	}); err != nil {
 		log.Fatal("FATAL ERROR: ", err)
 	}
+
+	if *compactTable {
+		if err := compactLevelDB(*tablePath); err != nil {
+			log.Fatalf("Error compacting LevelDB: %v", err)
+		}
+	}
 }
+
+func compactLevelDB(path string) error {
+	defer func(start time.Time) { log.Printf("Compaction completed in %s", time.Since(start)) }(time.Now())
+	return leveldb.CompactRange(*tablePath, nil)
+}
+
+func runExperimentalBeamPipeline(ctx context.Context) error {
+	if runnerFlag := flag.Lookup("runner"); runnerFlag.Value.String() == "direct" {
+		runnerFlag.Value.Set("disksort")
+	}
+
+	if gs != nil {
+		return errors.New("--graphstore input not supported with --experimental_beam_pipeline")
+	} else if *entriesFile == "" {
+		return errors.New("--entries file path required")
+	} else if *tablePath == "" {
+		return errors.New("--out table path required")
+	}
+
+	p, s := beam.NewPipelineWithRoot()
+	entries, err := beamio.ReadEntries(ctx, s, *entriesFile)
+	if err != nil {
+		log.Fatal("Error reading entries: ", err)
+	}
+	k := pipeline.FromEntries(s, entries)
+	shards := *beamShards
+	if shards <= 0 {
+		// TODO(schroederc): better determine number of shards
+		shards = 128
+	}
+	if *experimentalColumnarData {
+		beamio.WriteLevelDB(s, *tablePath, shards,
+			createColumnarMetadata(s),
+			k.SplitCrossReferences(),
+			k.SplitDecorations(),
+			k.CorpusRoots(),
+			k.Directories(),
+			k.Documents(),
+			k.SplitEdges(),
+		)
+	} else {
+		edgeSets, edgePages := k.Edges()
+		xrefSets, xrefPages := k.CrossReferences()
+		beamio.WriteLevelDB(s, *tablePath, shards,
+			k.CorpusRoots(),
+			k.Decorations(),
+			k.Directories(),
+			k.Documents(),
+			xrefSets, xrefPages,
+			edgeSets, edgePages,
+		)
+	}
+
+	return beamx.Run(ctx, p)
+}
+
+func init() {
+	beam.RegisterFunction(emitColumnarMetadata)
+}
+
+func createColumnarMetadata(s beam.Scope) beam.PCollection {
+	return beam.ParDo(s, emitColumnarMetadata, beam.Impulse(s))
+}
+
+func emitColumnarMetadata(_ []byte) (string, string) { return xrefs.ColumnarTableKeyMarker, "v1" }

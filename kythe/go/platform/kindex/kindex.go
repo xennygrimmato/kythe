@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,11 +33,12 @@
 // of the required inputs for the CompilationUnit.
 //
 // These proto messages are defined in //kythe/proto:analysis_proto
-package kindex
+package kindex // import "kythe.io/kythe/go/platform/kindex"
 
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -48,11 +49,12 @@ import (
 	"kythe.io/kythe/go/platform/analysis"
 	"kythe.io/kythe/go/platform/delimited"
 	"kythe.io/kythe/go/platform/vfs"
-
-	apb "kythe.io/kythe/proto/analysis_proto"
+	"kythe.io/kythe/go/util/ptypes"
 
 	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+
+	apb "kythe.io/kythe/proto/analysis_go_proto"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
 // Extension is the standard file extension for Kythe compilation index files.
@@ -140,7 +142,7 @@ func (c *Compilation) WriteTo(w io.Writer) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	w = delimited.NewWriter(gz)
+	dw := delimited.NewWriter(gz)
 
 	buf := proto.NewBuffer(nil)
 	if err := buf.Marshal(c.Proto); err != nil {
@@ -150,7 +152,7 @@ func (c *Compilation) WriteTo(w io.Writer) (int64, error) {
 
 	var total int64
 
-	nw, err := w.Write(buf.Bytes())
+	nw, err := dw.WriteRecord(buf.Bytes())
 	total += int64(nw)
 	if err != nil {
 		gz.Close()
@@ -163,7 +165,7 @@ func (c *Compilation) WriteTo(w io.Writer) (int64, error) {
 			gz.Close()
 			return total, fmt.Errorf("marshaling file data: %v", err)
 		}
-		nw, err := w.Write(buf.Bytes())
+		nw, err := dw.WriteRecord(buf.Bytes())
 		total += int64(nw)
 		if err != nil {
 			gz.Close()
@@ -216,6 +218,53 @@ func FromUnit(unit *apb.CompilationUnit, f analysis.Fetcher) (*Compilation, erro
 		Proto: unit,
 		Files: inputs,
 	}, nil
+}
+
+// Unit returns the CompilationUnit associated with c, creating a new empty one
+// if necessary.
+func (c *Compilation) Unit() *apb.CompilationUnit {
+	if c.Proto == nil {
+		c.Proto = new(apb.CompilationUnit)
+	}
+	return c.Proto
+}
+
+// AddFile adds an input file to the compilation by fully reading r.  The file
+// is added to the required inputs, attributed to the designated path, and also
+// to the file data slice.  If v != nil it is used as the vname of the input
+// added.
+func (c *Compilation) AddFile(path string, r io.Reader, v *spb.VName, details ...proto.Message) error {
+	var anys []*ptypes.Any
+	for _, d := range details {
+		any, err := ptypes.MarshalAny(d)
+		if err != nil {
+			return fmt.Errorf("unable to marshal %T to Any: %v", d, err)
+		}
+		anys = append(anys, any)
+	}
+	fd, err := FileData(path, r)
+	if err != nil {
+		return err
+	}
+	c.Files = append(c.Files, fd)
+	unit := c.Unit()
+	unit.RequiredInput = append(unit.RequiredInput, &apb.CompilationUnit_FileInput{
+		VName:   v,
+		Info:    fd.Info,
+		Details: anys,
+	})
+	return nil
+}
+
+// AddDetails adds the specified details message to the compilation.
+func (c *Compilation) AddDetails(msg proto.Message) error {
+	details, err := ptypes.MarshalAny(msg)
+	if err != nil {
+		return err
+	}
+	unit := c.Unit()
+	unit.Details = append(unit.Details, details)
+	return nil
 }
 
 // FileData creates a file data protobuf message by fully reading the contents

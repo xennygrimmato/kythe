@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,11 @@
 
 // Package proxy defines a proxy graphstore.Service that delegates requests to
 // other service implementations.
-package proxy
+package proxy // import "kythe.io/kythe/go/services/graphstore/proxy"
 
 import (
 	"container/heap"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -27,12 +28,10 @@ import (
 	"sync"
 
 	"kythe.io/kythe/go/services/graphstore"
-	"kythe.io/kythe/go/services/graphstore/compare"
 	"kythe.io/kythe/go/storage/gsutil"
+	"kythe.io/kythe/go/util/compare"
 
-	spb "kythe.io/kythe/proto/storage_proto"
-
-	"golang.org/x/net/context"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
 func init() {

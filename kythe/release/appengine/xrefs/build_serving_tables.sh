@@ -1,6 +1,6 @@
 #!/bin/bash -e
 set -o pipefail
-# Copyright 2015 Google Inc. All rights reserved.
+# Copyright 2015 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +25,8 @@ set -o pipefail
 
 : "${INDEXERS:=/opt/kythe/indexers}"
 : "${TOOLS:=/opt/kythe/tools}"
+
+SCRIPTS="$(realpath "$(dirname "$0")")"
 
 echo "TOOLS=$TOOLS"
 echo "INDEXERS=$INDEXERS"
@@ -54,7 +56,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-cd "$(dirname "$0")/../../../.."
+cd "$SCRIPTS/../../../.."
 
 if [[ -z "$GRAPHSTORE" ]]; then
   GRAPHSTORE="$(mktemp -d --suffix=.kythe_graphstore)"
@@ -75,7 +77,7 @@ if [[ -n "$(find "$GRAPHSTORE" -maxdepth 0 -empty)" ]]; then
   fi
 
   echo "Writing to GraphStore at $GRAPHSTORE" >&2
-  "$(dirname "$0")/run_indexers.sh" "$COMPILATIONS" | \
+  "$SCRIPTS/run_indexers.sh" "$COMPILATIONS" | \
     "$TOOLS/dedup_stream" | \
     "$TOOLS/write_entries" --graphstore "$GRAPHSTORE"
 

@@ -1,6 +1,6 @@
 #!/bin/bash -e
 
-# Copyright 2014 Google Inc. All rights reserved.
+# Copyright 2014 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,6 @@
 
 cd "$(dirname "$0")"
 
-bundle install --quiet --path _vendor/bundle
+bundle install --path _vendor/bundle
 ./sync_docs.sh
 bundle exec jekyll build "$@"

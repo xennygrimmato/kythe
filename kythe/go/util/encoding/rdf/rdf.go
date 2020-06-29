@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 // Package rdf implements encoding of RDF triples, as described in
 // http://www.w3.org/TR/2014/REC-n-triples-20140225/.
-package rdf
+package rdf // import "kythe.io/kythe/go/util/encoding/rdf"
 
 import (
 	"bytes"

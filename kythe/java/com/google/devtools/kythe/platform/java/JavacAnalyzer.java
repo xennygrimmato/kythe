@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.devtools.kythe.platform.shared.AnalysisException;
 import com.google.devtools.kythe.platform.shared.StatisticsCollector;
-import com.google.devtools.kythe.proto.Analysis.CompilationUnit;
 import com.sun.source.tree.CompilationUnitTree;
 import java.io.Serializable;
 import java.net.URI;
@@ -58,19 +57,9 @@ public abstract class JavacAnalyzer implements Serializable {
         if (!uri.getScheme().equals("file")) {
           fullPath = fullPath.substring(1);
         }
-        String compilationUnitPath = fullPath;
-
-        for (String sourceFile : compilationDetails.getCompilationUnit().getSourceFileList()) {
-          if (fullPath.endsWith(sourceFile)) {
-            compilationUnitPath = sourceFile;
-            break;
-          }
-        }
-
-        if (Strings.isNullOrEmpty(compilationUnitPath)) {
+        if (Strings.isNullOrEmpty(fullPath)) {
           continue;
         }
-
         analyzeFile(compilationDetails, file);
         getStatisticsCollector().incrementCounter("files-analyzed");
       }

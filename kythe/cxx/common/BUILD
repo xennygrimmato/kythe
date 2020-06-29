@@ -1,6 +1,22 @@
+package(default_visibility = ["//kythe:default_visibility"])
+
 licenses(["notice"])
 
-package(default_visibility = ["//kythe:default_visibility"])
+load("//:visibility.bzl", "PUBLIC_VISIBILITY")
+
+cc_library(
+    name = "scope_guard",
+    hdrs = ["scope_guard.h"],
+)
+
+cc_test(
+    name = "scope_guard_test",
+    srcs = ["scope_guard_test.cc"],
+    deps = [
+        ":scope_guard",
+        "//third_party:gtest_main",
+    ],
+)
 
 cc_library(
     name = "json_proto",
@@ -15,56 +31,85 @@ cc_library(
         "-Wno-unused-variable",
         "-Wno-implicit-fallthrough",
     ],
+    visibility = [PUBLIC_VISIBILITY],
     deps = [
-        "//external:gflags",
-        "//external:glog",
-        "//external:libcrypto",
-        "//external:proto/any_proto_cc",
-        "//external:proto/protobuf",
-        "//external:rapidjson",
+        ":status_or",
+        "@com_github_google_glog//:glog",
+        "@com_github_tencent_rapidjson//:rapidjson",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_protobuf//:cc_wkt_protos",
+        "@com_google_protobuf//:protobuf",
     ],
 )
 
 cc_library(
-    name = "index_pack",
-    srcs = ["index_pack.cc"],
-    hdrs = ["index_pack.h"],
-    copts = [
-        "-Wno-non-virtual-dtor",
-        "-Wno-unused-variable",
-        "-Wno-implicit-fallthrough",
-    ],
-    visibility = [
-        "//kythe:default_visibility",
-        "//third_party/llvm/src:__pkg__",
-    ],
+    name = "kythe_uri",
+    srcs = ["kythe_uri.cc"],
+    hdrs = ["kythe_uri.h"],
+    visibility = [PUBLIC_VISIBILITY],
     deps = [
-        ":lib",
-        "//external:libuuid",
-        "//external:proto/protobuf",
-        "//external:zlib",
-        "//kythe/proto:analysis_proto_cc",
+        ":path_utils",
+        ":vname_ordering",
+        "//kythe/proto:storage_cc_proto",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
+    name = "path_utils",
+    srcs = ["path_utils.cc"],
+    hdrs = ["path_utils.h"],
+    visibility = [PUBLIC_VISIBILITY],
+    deps = [
+        ":status",
+        ":status_or",
+        "@com_github_google_glog//:glog",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+    ],
+)
+
+cc_test(
+    name = "path_utils_test",
+    srcs = ["path_utils_test.cc"],
+    deps = [
+        ":path_utils",
+        "//third_party:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "file_utils",
+    srcs = ["file_utils.cc"],
+    hdrs = ["file_utils.h"],
+    deps = [
+        "@com_github_google_glog//:glog",
+    ],
+)
+
+cc_library(
+    name = "vname_ordering",
+    hdrs = ["vname_ordering.h"],
+    visibility = [PUBLIC_VISIBILITY],
+    deps = [
+        "//kythe/proto:storage_cc_proto",
     ],
 )
 
 cc_library(
     name = "lib",
     srcs = [
-        "CommandLineUtils.cc",
-        "cxx_details.cc",
         "file_vname_generator.cc",
         "kythe_metadata_file.cc",
-        "kythe_uri.cc",
-        "path_utils.cc",
+        "protobuf_metadata_file.cc",
     ],
     hdrs = [
-        "CommandLineUtils.h",
-        "cxx_details.h",
         "file_vname_generator.h",
         "kythe_metadata_file.h",
-        "kythe_uri.h",
-        "path_utils.h",
-        "proto_conversions.h",
+        "protobuf_metadata_file.h",
         "vname_ordering.h",
     ],
     copts = [
@@ -72,22 +117,22 @@ cc_library(
         "-Wno-unused-variable",
         "-Wno-implicit-fallthrough",
     ],
-    visibility = [
-        "//kythe:default_visibility",
-        "//third_party/llvm/src:__pkg__",
-    ],
+    visibility = [PUBLIC_VISIBILITY],
     deps = [
         ":json_proto",
-        "//external:gflags",
-        "//external:glog",
-        "//external:proto/protobuf",
-        "//external:rapidjson",
-        "//external:re2",
         "//external:zlib",
-        "//kythe/proto:analysis_proto_cc",
-        "//kythe/proto:cxx_proto_cc",
-        "//kythe/proto:storage_proto_cc",
-        "//third_party/llvm",
+        "//kythe/cxx/common/schema:edges",
+        "//kythe/proto:analysis_cc_proto",
+        "//kythe/proto:metadata_cc_proto",
+        "//kythe/proto:storage_cc_proto",
+        "@com_github_google_glog//:glog",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:optional",
+        "@com_google_protobuf//:cc_wkt_protos",
+        "@com_google_protobuf//:protobuf",
+        "@com_googlesource_code_re2//:re2",
     ],
 )
 
@@ -106,40 +151,14 @@ cc_library(
     ],
     deps = [
         ":lib",
-        "//external:gflags",
-        "//external:glog",
-        "//external:libcurl",
-        "//external:proto/protobuf",
-        "//external:rapidjson",
         "//external:zlib",
-        "//kythe/proto:storage_proto_cc",
-        "//kythe/proto:xref_proto_cc",
-    ],
-)
-
-cc_library(
-    name = "commandline_testlib",
-    testonly = 1,
-    srcs = [
-        "CommandLineUtilsTest.cc",
-    ],
-    copts = [
-        "-Wno-non-virtual-dtor",
-        "-Wno-unused-variable",
-        "-Wno-implicit-fallthrough",
-    ],
-    deps = [
-        ":lib",
-        "//external:googletest",
-        "//third_party/llvm",
-    ],
-)
-
-cc_test(
-    name = "commandline_test",
-    size = "small",
-    deps = [
-        ":commandline_testlib",
+        "//kythe/proto:graph_cc_proto",
+        "//kythe/proto:storage_cc_proto",
+        "//kythe/proto:xref_cc_proto",
+        "@com_github_google_glog//:glog",
+        "@com_github_tencent_rapidjson//:rapidjson",
+        "@com_google_protobuf//:protobuf",
+        "@se_haxx_curl//:curl",
     ],
 )
 
@@ -156,9 +175,9 @@ cc_library(
     ],
     deps = [
         ":lib",
-        "//external:googletest",
-        "//external:proto/protobuf",
-        "//external:re2",
+        "//third_party:gtest",
+        "@com_google_protobuf//:protobuf",
+        "@com_googlesource_code_re2//:re2",
     ],
 )
 
@@ -167,63 +186,6 @@ cc_test(
     size = "small",
     deps = [
         ":file_vname_generator_testlib",
-    ],
-)
-
-cc_library(
-    name = "path_utils_testlib",
-    testonly = 1,
-    srcs = [
-        "path_utils_test.cc",
-    ],
-    copts = [
-        "-Wno-non-virtual-dtor",
-        "-Wno-unused-variable",
-        "-Wno-implicit-fallthrough",
-    ],
-    deps = [
-        ":lib",
-        "//external:googletest",
-        "//third_party/llvm",
-    ],
-)
-
-cc_test(
-    name = "path_utils_test",
-    size = "small",
-    deps = [
-        ":path_utils_testlib",
-    ],
-)
-
-cc_library(
-    name = "index_pack_testlib",
-    testonly = 1,
-    srcs = [
-        "index_pack_test.cc",
-    ],
-    copts = [
-        "-Wno-non-virtual-dtor",
-        "-Wno-unused-variable",
-        "-Wno-implicit-fallthrough",
-    ],
-    deps = [
-        ":index_pack",
-        "//external:gflags",
-        "//external:glog",
-        "//external:googletest",
-        "//external:proto/protobuf",
-        "//external:rapidjson",
-        "//external:zlib",
-        "//third_party/llvm",
-    ],
-)
-
-cc_test(
-    name = "index_pack_test",
-    size = "small",
-    deps = [
-        ":index_pack_testlib",
     ],
 )
 
@@ -240,19 +202,17 @@ cc_library(
     ],
     deps = [
         ":json_proto",
-        "//external:googletest",
-        "//external:proto/protobuf",
-        "//external:re2",
-        "//kythe/proto:analysis_proto_cc",
+        "//kythe/proto:analysis_cc_proto",
+        "//third_party:gtest",
+        "@com_google_protobuf//:protobuf",
+        "@com_googlesource_code_re2//:re2",
     ],
 )
 
 cc_test(
     name = "json_proto_test",
     size = "small",
-    deps = [
-        ":json_proto_testlib",
-    ],
+    deps = [":json_proto_testlib"],
 )
 
 cc_library(
@@ -268,45 +228,230 @@ cc_library(
     ],
     deps = [
         ":net_client",
-        "//external:gflags",
-        "//external:glog",
-        "//external:proto/protobuf",
         "//external:zlib",
+        "@com_github_google_glog//:glog",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/memory",
+        "@com_google_protobuf//:protobuf",
     ],
 )
 
 cc_binary(
     name = "net_client_test",
     testonly = 1,
-    deps = [
-        ":net_client_testlib",
-    ],
+    deps = [":net_client_testlib"],
 )
 
 cc_library(
     name = "kythe_uri_testlib",
     testonly = 1,
-    srcs = [
-        "kythe_uri_test.cc",
-    ],
+    srcs = ["kythe_uri_test.cc"],
     copts = [
         "-Wno-non-virtual-dtor",
         "-Wno-unused-variable",
         "-Wno-implicit-fallthrough",
     ],
     deps = [
-        ":lib",
-        "//external:gflags",
-        "//external:glog",
-        "//external:googletest",
-        "//external:proto/protobuf",
+        ":kythe_uri",
+        "//third_party:gtest",
+        "@com_github_google_glog//:glog",
+        "@com_google_protobuf//:protobuf",
     ],
 )
 
 cc_test(
     name = "kythe_uri_test",
     size = "small",
+    deps = [":kythe_uri_testlib"],
+)
+
+cc_library(
+    name = "index_writer",
+    srcs = ["index_writer.cc"],
+    hdrs = ["index_writer.h"],
+    visibility = [PUBLIC_VISIBILITY],
     deps = [
-        ":kythe_uri_testlib",
+        ":status_or",
+        "//kythe/proto:analysis_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
+    name = "index_reader",
+    srcs = ["index_reader.cc"],
+    hdrs = ["index_reader.h"],
+    deps = [
+        ":status_or",
+        "//kythe/proto:analysis_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
+    name = "kzip_encoding",
+    hdrs = ["kzip_encoding.h"],
+    visibility = [
+        "//visibility:private",
+    ],
+)
+
+cc_library(
+    name = "kzip_reader",
+    srcs = ["kzip_reader.cc"],
+    hdrs = ["kzip_reader.h"],
+    visibility = [
+        "//visibility:public",
+    ],
+    deps = [
+        ":index_reader",
+        ":json_proto",
+        ":kzip_encoding",
+        ":libzip/error",
+        ":status_or",
+        "//kythe/proto:analysis_cc_proto",
+        "@boringssl//:crypto",
+        "@com_github_google_glog//:glog",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_protobuf//:protobuf",
+        "@org_libzip//:zip",
+    ],
+)
+
+cc_test(
+    name = "kzip_reader_test",
+    srcs = ["kzip_reader_test.cc"],
+    data = [
+        "//kythe/testdata/platform:empty.kzip",
+        "//kythe/testdata/platform:malformed.kzip",
+        "//kythe/testdata/platform:missing-pbunit.kzip",
+        "//kythe/testdata/platform:missing-unit.kzip",
+        "//kythe/testdata/platform:stringset.kzip",
+    ],
+    deps = [
+        ":kzip_reader",
+        ":libzip/error",
+        ":testutil",
+        "//kythe/proto:go_cc_proto",  # Used in stringset.kzip.
+        "//third_party:gtest_main",
+        "@com_google_absl//absl/status",
+    ],
+)
+
+cc_library(
+    name = "kzip_writer",
+    srcs = ["kzip_writer.cc"],
+    hdrs = ["kzip_writer.h"],
+    visibility = [
+        "//visibility:public",
+    ],
+    deps = [
+        ":index_writer",
+        ":json_proto",
+        ":kzip_encoding",
+        ":libzip/error",
+        "//kythe/proto:analysis_cc_proto",
+        "@boringssl//:crypto",
+        "@com_github_google_glog//:glog",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_protobuf//:protobuf",
+        "@org_libzip//:zip",
+    ],
+)
+
+cc_test(
+    name = "kzip_writer_test",
+    srcs = ["kzip_writer_test.cc"],
+    data = [
+        "//kythe/testdata/platform:stringset.kzip",
+    ],
+    deps = [
+        ":kzip_reader",
+        ":kzip_writer",
+        ":libzip/error",
+        ":testutil",
+        "//kythe/proto:go_cc_proto",  # Used in stringset.kzip.
+        "//third_party:gtest_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
+    name = "status",
+    srcs = ["status.cc"],
+    hdrs = ["status.h"],
+    visibility = [PUBLIC_VISIBILITY],
+    deps = [
+        "@com_github_google_glog//:glog",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
+    name = "status_or",
+    hdrs = ["status_or.h"],
+    visibility = [PUBLIC_VISIBILITY],
+    deps = [
+        "@com_github_google_glog//:glog",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:optional",
+    ],
+)
+
+cc_library(
+    name = "libzip/error",
+    srcs = ["libzip/error.cc"],
+    hdrs = ["libzip/error.h"],
+    deps = [
+        ":status",
+        "@com_google_absl//absl/status",
+        "@org_libzip//:zip",
+    ],
+)
+
+cc_library(
+    name = "testutil",
+    testonly = 1,
+    srcs = ["testutil.cc"],
+    hdrs = ["testutil.h"],
+    deps = [
+        "@com_github_google_glog//:glog",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
+    name = "utf8_line_index",
+    srcs = ["utf8_line_index.cc"],
+    hdrs = ["utf8_line_index.h"],
+    visibility = [PUBLIC_VISIBILITY],
+    deps = [
+        "@com_github_google_glog//:glog",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "utf8_line_index_test",
+    size = "small",
+    srcs = ["utf8_line_index_test.cc"],
+    deps = [
+        ":utf8_line_index",
+        "//third_party:gtest_main",
+        "@com_google_absl//absl/strings",
     ],
 )

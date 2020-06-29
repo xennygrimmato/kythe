@@ -1,0 +1,233 @@
+/*
+ * Copyright 2018 The Kythe Authors. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+package kythe.proto.schema;
+
+option go_package = "schema_go_proto";
+option java_package = "com.google.devtools.kythe.proto";
+
+import "google/protobuf/descriptor.proto";
+import "kythe/proto/storage.proto";
+
+// Metadata about a Kythe schema entity.
+message Metadata {
+  // String label of the schema entity.
+  string label = 1;
+}
+
+extend google.protobuf.EnumValueOptions {
+  Metadata metadata = 69945;
+}
+
+enum NodeKind {
+  UNKNOWN_NODE_KIND = 0;
+
+  ABS = 1 [(metadata).label = "abs"];
+  ABSVAR = 2 [(metadata).label = "absvar"];
+  ANCHOR = 3 [(metadata).label = "anchor"];
+  CONSTANT = 4 [(metadata).label = "constant"];
+  DIAGNOSTIC = 5 [(metadata).label = "diagnostic"];
+  DOC = 6 [(metadata).label = "doc"];
+  FILE = 7 [(metadata).label = "file"];
+  INTERFACE = 8 [(metadata).label = "interface"];
+  FUNCTION = 9 [(metadata).label = "function"];
+  LOOKUP = 10 [(metadata).label = "lookup"];
+  MACRO = 11 [(metadata).label = "macro"];
+  META = 12 [(metadata).label = "meta"];
+  NAME = 13 [(metadata).label = "name"];
+  PACKAGE = 14 [(metadata).label = "package"];
+  PROCESS = 15 [(metadata).label = "process"];
+  RECORD = 16 [(metadata).label = "record"];
+  SUM = 17 [(metadata).label = "sum"];
+  SYMBOL = 18 [(metadata).label = "symbol"];
+  TALIAS = 19 [(metadata).label = "talias"];
+  TAPP = 20 [(metadata).label = "tapp"];
+  TBUILTIN = 21 [(metadata).label = "tbuiltin"];
+  TNOMINAL = 22 [(metadata).label = "tnominal"];
+  TSIGMA = 23 [(metadata).label = "tsigma"];
+  VARIABLE = 24 [(metadata).label = "variable"];
+  VCS = 25 [(metadata).label = "vcs"];
+}
+
+enum Subkind {
+  UNKNOWN_SUBKIND = 0;
+
+  CATEGORY = 1 [(metadata).label = "category"];
+  CLASS = 2 [(metadata).label = "class"];
+  CONSTRUCTOR = 3 [(metadata).label = "constructor"];
+  DESTRUCTOR = 4 [(metadata).label = "destructor"];
+  ENUM = 5 [(metadata).label = "enum"];
+  ENUM_CLASS = 6 [(metadata).label = "enumClass"];
+  FIELD = 7 [(metadata).label = "field"];
+  IMPLICIT = 8 [(metadata).label = "implicit"];
+  IMPORT = 9 [(metadata).label = "import"];
+  INITIALIZER = 10 [(metadata).label = "initializer"];
+  LOCAL = 11 [(metadata).label = "local"];
+  LOCAL_PARAMETER = 12 [(metadata).label = "local/parameter"];
+  METHOD = 13 [(metadata).label = "method"];
+  NAMESPACE = 14 [(metadata).label = "namespace"];
+  STRUCT = 15 [(metadata).label = "struct"];
+  TYPE = 16 [(metadata).label = "type"];
+  UNION = 17 [(metadata).label = "union"];
+}
+
+enum FactName {
+  UNKNOWN_FACT_NAME = 0;
+
+  CODE = 1 [(metadata).label = "/kythe/code"];
+  COMPLETE = 2 [(metadata).label = "/kythe/complete"];
+  CONTEXT_URL = 3 [(metadata).label = "/kythe/context/url"];
+  DETAILS = 4 [(metadata).label = "/kythe/details"];
+  DOC_URI = 5 [(metadata).label = "/kythe/doc/uri"];
+  LABEL = 6 [(metadata).label = "/kythe/label"];
+  LOC_END = 7 [(metadata).label = "/kythe/loc/end"];
+  LOC_START = 8 [(metadata).label = "/kythe/loc/start"];
+  MESSAGE = 9 [(metadata).label = "/kythe/message"];
+  NODE_KIND = 10 [(metadata).label = "/kythe/node/kind"];
+  PARAM_DEFAULT = 11 [(metadata).label = "/kythe/param/default"];
+  RULE_CLASS = 12 [(metadata).label = "/kythe/ruleclass"];
+  SNIPPET_END = 13 [(metadata).label = "/kythe/snippet/end"];
+  SNIPPET_START = 14 [(metadata).label = "/kythe/snippet/start"];
+  SUBKIND = 15 [(metadata).label = "/kythe/subkind"];
+  TEXT = 16 [(metadata).label = "/kythe/text"];
+  TEXT_ENCODING = 17 [(metadata).label = "/kythe/text/encoding"];
+  VISIBILITY = 18 [(metadata).label = "/kythe/visibility"];
+  BUILD_CONFIG = 19 [(metadata).label = "/kythe/build/config"];
+  TAG_DEPRECATED = 20 [(metadata).label = "/kythe/tag/deprecated"];
+}
+
+enum EdgeKind {
+  UNKNOWN_EDGE_KIND = 0;
+
+  ALIASES = 1 [(metadata).label = "/kythe/edge/aliases"];
+  ALIASES_ROOT = 2 [(metadata).label = "/kythe/edge/aliases/root"];
+  ANNOTATED_BY = 3 [(metadata).label = "/kythe/edge/annotatedby"];
+  BOUNDED_LOWER = 4 [(metadata).label = "/kythe/edge/bounded/lower"];
+  BOUNDED_UPPER = 5 [(metadata).label = "/kythe/edge/bounded/upper"];
+  CHILD_OF = 6 [(metadata).label = "/kythe/edge/childof"];
+  CHILD_OF_CONTEXT = 7 [(metadata).label = "/kythe/edge/childof/context"];
+  COMPLETES = 8 [(metadata).label = "/kythe/edge/completes"];
+  COMPLETES_UNIQUELY = 9 [(metadata).label = "/kythe/edge/completes/uniquely"];
+  DEFINES = 10 [(metadata).label = "/kythe/edge/defines"];
+  DEFINES_BINDING = 11 [(metadata).label = "/kythe/edge/defines/binding"];
+  DEPENDS = 12 [(metadata).label = "/kythe/edge/depends"];
+  DOCUMENTS = 13 [(metadata).label = "/kythe/edge/documents"];
+  EXPORTS = 14 [(metadata).label = "/kythe/edge/exports"];
+  EXTENDS = 15 [(metadata).label = "/kythe/edge/extends"];
+  GENERATES = 16 [(metadata).label = "/kythe/edge/generates"];
+  IMPUTES = 17 [(metadata).label = "/kythe/edge/imputes"];
+  INSTANTIATES = 18 [(metadata).label = "/kythe/edge/instantiates"];
+  INSTANTIATES_SPECULATIVE = 19
+      [(metadata).label = "/kythe/edge/instantiates/speculative"];
+  NAMED = 20 [(metadata).label = "/kythe/edge/named"];
+  OVERRIDES = 21 [(metadata).label = "/kythe/edge/overrides"];
+  OVERRIDES_ROOT = 22 [(metadata).label = "/kythe/edge/overrides/root"];
+  OVERRIDES_TRANSITIVE = 23
+      [(metadata).label = "/kythe/edge/overrides/transitive"];
+  PARAM = 24 [(metadata).label = "/kythe/edge/param"];
+  PROPERTY_READS = 44 [(metadata).label = "/kythe/edge/property/reads"];
+  PROPERTY_WRITES = 45 [(metadata).label = "/kythe/edge/property/writes"];
+  REF = 25 [(metadata).label = "/kythe/edge/ref"];
+  REF_CALL = 26 [(metadata).label = "/kythe/edge/ref/call"];
+  REF_CALL_IMPLICIT = 27 [(metadata).label = "/kythe/edge/ref/call/implicit"];
+  REF_DOC = 28 [(metadata).label = "/kythe/edge/ref/doc"];
+  REF_EXPANDS = 29 [(metadata).label = "/kythe/edge/ref/expands"];
+  REF_EXPANDS_TRANSITIVE = 30
+      [(metadata).label = "/kythe/edge/ref/expands/transitive"];
+  REF_FILE = 31 [(metadata).label = "/kythe/edge/ref/file"];
+  REF_IMPLICIT = 32 [(metadata).label = "/kythe/edge/ref/implicit"];
+  REF_IMPORTS = 33 [(metadata).label = "/kythe/edge/ref/imports"];
+  REF_INCLUDES = 34 [(metadata).label = "/kythe/edge/ref/includes"];
+  REF_INIT = 35 [(metadata).label = "/kythe/edge/ref/init"];
+  REF_INIT_IMPLICIT = 36 [(metadata).label = "/kythe/edge/ref/init/implicit"];
+  REF_QUERIES = 37 [(metadata).label = "/kythe/edge/ref/queries"];
+  SATISFIES = 38 [(metadata).label = "/kythe/edge/satisfies"];
+  SPECIALIZES = 39 [(metadata).label = "/kythe/edge/specializes"];
+  SPECIALIZES_SPECULATIVE = 40
+      [(metadata).label = "/kythe/edge/specializes/speculative"];
+  TAGGED = 41 [(metadata).label = "/kythe/edge/tagged"];
+  TYPED = 42 [(metadata).label = "/kythe/edge/typed"];
+  UNDEFINES = 43 [(metadata).label = "/kythe/edge/undefines"];
+}
+
+// A Node represents a Kythe graph node with all its known facts and edges.
+message Node {
+  kythe.proto.VName source = 1;
+
+  // Facts associated with the source VName (making exception for a small number
+  // of special-cases below).
+  repeated Fact fact = 2;
+
+  // Edges associated with the source VName.
+  repeated Edge edge = 3;
+
+  // Special-case for the ubiquitous /kythe/node/kind fact.  This fact will not
+  // appear in the fact list above.
+  oneof kind {
+    NodeKind kythe_kind = 4;
+    string generic_kind = 5;
+  }
+
+  // Special-case for the ubiquitous /kythe/subkind fact.  This fact will not
+  // appear in the fact list above.
+  oneof subkind {
+    Subkind kythe_subkind = 6;
+    string generic_subkind = 7;
+  }
+}
+
+// A Fact represents a single Kythe graph node fact.
+message Fact {
+  kythe.proto.VName source = 1;
+
+  // The fact's name.  If standard, a Kythe FactName enum is used.  Otherwise,
+  // the fact name will be represented as a string (as encoded in an
+  // Entry.fact_name).
+  oneof name {
+    FactName kythe_name = 2;
+    string generic_name = 3;
+  }
+
+  bytes value = 4;
+}
+
+// An Edge represents a single Kythe graph edge.
+message Edge {
+  kythe.proto.VName source = 1;
+  kythe.proto.VName target = 2;
+
+  // The edge's kind.  If standard, a Kythe EdgeKind enum is used.  Otherwise,
+  // the edge kind will be represented as a string (as encoded in an
+  // Entry.edge_kind without its ordinal).
+  oneof kind {
+    EdgeKind kythe_kind = 3;
+    string generic_kind = 4;
+  }
+  int32 ordinal = 5;
+
+  Node source_node = 6;
+  Node target_node = 7;
+}
+
+// A Kythe Entry represents a single graph node fact or edge.
+message Entry {
+  oneof entry {
+    Fact fact = 1;
+    Edge edge = 2;
+  }
+}

@@ -1,20 +1,23 @@
-licenses(["notice"])
-
 package(default_visibility = ["//kythe:default_visibility"])
+
+licenses(["notice"])
 
 cc_library(
     name = "markup_handler",
     srcs = [
+        "html_markup_handler.cc",
         "javadoxygen_markup_handler.cc",
         "markup_handler.cc",
     ],
     hdrs = [
+        "html_markup_handler.h",
         "javadoxygen_markup_handler.h",
         "markup_handler.h",
     ],
     deps = [
-        "//external:glog",
-        "//kythe/proto:xref_proto_cc",
+        "//kythe/proto:common_cc_proto",
+        "//kythe/proto:xref_cc_proto",
+        "@com_github_google_glog//:glog",
     ],
 )
 
@@ -26,7 +29,7 @@ cc_library(
     ],
     deps = [
         ":markup_handler",
-        "//external:googletest",
+        "//third_party:gtest",
     ],
 )
 
@@ -48,8 +51,11 @@ cc_library(
     ],
     deps = [
         ":markup_handler",
-        "//external:glog",
-        "//kythe/proto:xref_proto_cc",
+        "//kythe/cxx/common:kythe_uri",
+        "//kythe/cxx/common:lib",
+        "//kythe/proto:common_cc_proto",
+        "//kythe/proto:xref_cc_proto",
+        "@com_github_google_glog//:glog",
     ],
 )
 
@@ -61,7 +67,9 @@ cc_library(
     ],
     deps = [
         ":html_renderer",
-        "//external:googletest",
+        ":markup_handler",
+        "//kythe/proto:common_cc_proto",
+        "//third_party:gtest",
     ],
 )
 
@@ -73,24 +81,24 @@ cc_test(
     ],
 )
 
-cc_library(
-    name = "doclib",
+cc_binary(
+    name = "doc",
     srcs = [
         "doc.cc",
     ],
     deps = [
         ":html_renderer",
         ":markup_handler",
-        "//external:gflags",
-        "//external:glog",
+        "//kythe/cxx/common:kythe_uri",
         "//kythe/cxx/common:lib",
         "//kythe/cxx/common:net_client",
-    ],
-)
-
-cc_binary(
-    name = "doc",
-    deps = [
-        ":doclib",
+        "//kythe/cxx/common/schema:edges",
+        "//kythe/cxx/common/schema:facts",
+        "@com_github_google_glog//:glog",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/flags:usage",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/strings:str_format",
     ],
 )

@@ -1,0 +1,24 @@
+{
+  "name": "kythe-typescript-indexer",
+  "bin": "./indexer.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "browse": "node indexer.js tsconfig.json | ./browse",
+    "test": "yarn build && yarn runtest",
+    "runtest": "yarn unit_test && yarn e2e_test",
+    "e2e_test": "node test.js",
+    "unit_test": "jasmine utf8_test.js",
+    "fmt": "clang-format -i *.ts"
+  },
+  "dependencies": {
+    "source-map-support": "^0.4.11",
+    "typescript": "~3.5.3"
+  },
+  "devDependencies": {
+    "@types/jasmine": "^2.8.8",
+    "@types/node": "^10.15.3",
+    "jasmine": "^3.1.0"
+  },
+  "license": "Apache-2.0"
+}

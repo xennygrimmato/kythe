@@ -1,18 +1,23 @@
-load("//tools:build_rules/go.bzl", "go_package")
+load("//tools:build_rules/shims.bzl", "go_library")
 
 package(default_visibility = ["//kythe:default_visibility"])
 
-go_package(
+go_library(
+    name = "api",
+    srcs = ["api.go"],
     deps = [
-        "@go_grpc//:grpc",
-        "@go_x_net//:context",
         "//kythe/go/services/filetree",
+        "//kythe/go/services/graph",
         "//kythe/go/services/xrefs",
         "//kythe/go/serving/filetree",
+        "//kythe/go/serving/graph",
+        "//kythe/go/serving/identifiers",
         "//kythe/go/serving/xrefs",
         "//kythe/go/storage/leveldb",
         "//kythe/go/storage/table",
-        "//kythe/proto:filetree_proto_go",
-        "//kythe/proto:xref_proto_go",
+        "//kythe/proto:filetree_go_proto",
+        "//kythe/proto:graph_go_proto",
+        "//kythe/proto:identifier_go_proto",
+        "//kythe/proto:xref_go_proto",
     ],
 )

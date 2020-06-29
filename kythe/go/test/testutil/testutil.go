@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,28 +15,44 @@
  */
 
 // Package testutil contains common utilities to test Kythe libraries.
-package testutil
+package testutil // import "kythe.io/kythe/go/test/testutil"
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
+	"strings"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	"google.golang.org/protobuf/proto"
+	"sigs.k8s.io/yaml"
 )
 
-func caller(up int) (file string, line int) {
-	_, file, line, ok := runtime.Caller(up + 2)
-	if !ok {
-		panic("could not get runtime.Caller")
-	}
-	return filepath.Base(file), line
-}
-
-// DeepEqual determines if expected is deeply equal to got, returning a detailed
-// error if not.
+// DeepEqual determines if expected is deeply equal to got, returning a
+// detailed error if not. It is okay for expected and got to be protobuf
+// message values.
 func DeepEqual(expected, got interface{}) error {
+	// Check for proto.Message types specifically; because protobuf generated
+	// types have complex conditions for equality, only do the reflective step
+	// if they are known not to be equivalent. This avoids spurious errors that
+	// may arise from messages that are equivalent but have different internal
+	// states (e.g., due to unrecognized fields, caching, etc.).
+	if epb, ok := expected.(proto.Message); ok {
+		if gpb, ok := got.(proto.Message); ok {
+			if proto.Equal(epb, gpb) {
+				return nil
+			}
+		}
+	}
+
+	// At this point, we either have non-protobuf values, or we know that the
+	// two are unequal.
 	et, gt := reflect.TypeOf(expected), reflect.TypeOf(got)
 	ev, gv := reflect.ValueOf(expected), reflect.ValueOf(got)
 
@@ -123,12 +139,67 @@ func expectMapEqual(expected, got reflect.Value) error {
 	for _, key := range expected.MapKeys() {
 		ev, gv := expected.MapIndex(key), got.MapIndex(key)
 
-		if err := DeepEqual(ev.Interface(), gv.Interface()); err != nil {
+		if ev.IsValid() != gv.IsValid() {
+			return expectError(expected.Interface(), got.Interface(), "%#v key values not both valid", key.Interface())
+		} else if err := DeepEqual(ev.Interface(), gv.Interface()); err != nil {
 			return expectError(expected.Interface(), got.Interface(), "%#v key values differ: %s", key.Interface(), err)
 		}
 	}
 
 	return nil
+}
+
+var multipleNewLines = regexp.MustCompile("\n{2,}")
+
+// TrimmedEqual compares two strings after collapsing irrelevant whitespace at
+// the beginning or end of lines. It returns both a boolean indicating equality,
+// as well as any relevant diff.
+func TrimmedEqual(got, want []byte) (bool, string) {
+	// remove superfluous whitespace
+	gotStr := strings.Trim(string(got[:]), " \n")
+	wantStr := strings.Trim(string(want[:]), " \n")
+	gotStr = multipleNewLines.ReplaceAllString(gotStr, "\n")
+	wantStr = multipleNewLines.ReplaceAllString(wantStr, "\n")
+
+	// diff want vs got
+	diff := cmp.Diff(gotStr, wantStr)
+	return diff == "", diff
+}
+
+// YAMLEqual compares two bytes assuming they are yaml, by converting to json
+// and doing an ordering-agnostic comparison.  Note this carries some
+// restrictions because yaml->json conversion fails for nil or binary map keys.
+func YAMLEqual(expected, got []byte) error {
+	e, err := yaml.YAMLToJSON(expected)
+	if err != nil {
+		return fmt.Errorf("yaml->json failure for expected: %v", err)
+	}
+	g, err := yaml.YAMLToJSON(got)
+	if err != nil {
+		return fmt.Errorf("yaml->json failure for got: %v", err)
+	}
+	return JSONEqual(e, g)
+}
+
+// JSONEqual compares two bytes assuming they are json, using encoding/json
+// and DeepEqual.
+func JSONEqual(expected, got []byte) error {
+	var e, g interface{}
+	if err := json.Unmarshal(expected, &e); err != nil {
+		return fmt.Errorf("decoding expected json: %v", err)
+	}
+	if err := json.Unmarshal(got, &g); err != nil {
+		return fmt.Errorf("decoding got json: %v", err)
+	}
+	return DeepEqual(e, g)
+}
+
+func caller(up int) (file string, line int) {
+	_, file, line, ok := runtime.Caller(up + 2)
+	if !ok {
+		panic("could not get runtime.Caller")
+	}
+	return filepath.Base(file), line
 }
 
 // FatalOnErr calls b.Fatalf(msg, err, args...) if err != nil
@@ -158,7 +229,7 @@ func Errorf(t *testing.T, msg string, err error, args ...interface{}) {
 // RandStr returns a random string of the given length
 func RandStr(size int) string {
 	const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-	buf := make([]byte, size, size)
+	buf := make([]byte, size)
 	RandBytes(buf)
 	for i, b := range buf {
 		buf[i] = chars[b%byte(len(chars))]
@@ -180,4 +251,15 @@ func RandBytes(bytes []byte) {
 			n >>= 8
 		}
 	}
+}
+
+// TestFilePath takes a path and resolves it based on the testdir.  If it
+// cannot successfully do so, it calls t.Fatal and abandons.
+func TestFilePath(t *testing.T, path string) string {
+	t.Helper()
+	pwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to resolve path %s: %v", path, err)
+	}
+	return filepath.Join(pwd, filepath.FromSlash(path))
 }

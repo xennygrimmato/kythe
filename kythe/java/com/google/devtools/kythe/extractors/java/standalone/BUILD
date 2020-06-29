@@ -1,41 +1,49 @@
-package(default_visibility = ["//kythe:default_visibility"])
+load("@rules_java//java:defs.bzl", "java_binary", "java_library")
 
-load("//tools:build_rules/docker.bzl", "docker_build")
+package(default_visibility = ["//kythe:default_visibility"])
 
 exports_files(["javac-wrapper.sh"])
 
 java_binary(
     name = "javac_extractor",
-    srcs = [
-        "AbstractJavacWrapper.java",
-        "Javac8Wrapper.java",
-    ],
-    data = ["@bazel_tools//third_party/java/jdk/langtools:javac_jar"],
-    # TODO(schroederc): fix bootclasspath to use $(location ...) syntax
-    jvm_flags = ["-Xbootclasspath/p:$$JAVA_RUNFILES/bazel_tools/third_party/java/jdk/langtools/javac.jar"],
+    srcs = ["Javac8Wrapper.java"],
     main_class = "com.google.devtools.kythe.extractors.java.standalone.Javac8Wrapper",
+    visibility = ["//visibility:public"],
     deps = [
-        "@bazel_tools//third_party/java/jdk/langtools:javac",
-        "//external:guava",
-        "//external:proto/protobuf_java",
-        "//kythe/java/com/google/devtools/kythe/common",
+        ":abstract_javac_wrapper",
         "//kythe/java/com/google/devtools/kythe/extractors/java",
         "//kythe/java/com/google/devtools/kythe/extractors/shared",
-        "//kythe/java/com/google/devtools/kythe/extractors/shared:file_vnames",
-        "//kythe/java/com/google/devtools/kythe/platform/indexpack",
-        "//kythe/proto:analysis_proto_java",
-        "//kythe/proto:storage_proto_java",
+        "//kythe/proto:storage_java_proto",
+        "//third_party/guava",
+        "//third_party/javac",
     ],
 )
 
-docker_build(
-    name = "docker",
-    src = "Dockerfile",
-    data = [
-        "javac-wrapper.sh",
-        ":javac_extractor_deploy.jar",
+java_binary(
+    name = "javac9_extractor",
+    srcs = ["Javac9Wrapper.java"],
+    main_class = "com.google.devtools.kythe.extractors.java.standalone.Javac9Wrapper",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":abstract_javac_wrapper",
+        "//kythe/java/com/google/devtools/kythe/extractors/java",
+        "//kythe/java/com/google/devtools/kythe/extractors/shared",
+        "//kythe/proto:storage_java_proto",
+        "//third_party/guava",
+        "//third_party/javac:javac9",
     ],
-    image_name = "gcr.io/kythe_repo/kythe-javac-extractor",
-    tags = ["manual"],
-    use_cache = True,
+)
+
+java_library(
+    name = "abstract_javac_wrapper",
+    srcs = ["AbstractJavacWrapper.java"],
+    deps = [
+        "//kythe/java/com/google/devtools/kythe/extractors/java",
+        "//kythe/java/com/google/devtools/kythe/extractors/shared",
+        "//kythe/java/com/google/devtools/kythe/extractors/shared:file_vnames",
+        "//kythe/java/com/google/devtools/kythe/util:json",
+        "//kythe/proto:analysis_java_proto",
+        "//third_party/guava",
+        "//third_party/javac",
+    ],
 )

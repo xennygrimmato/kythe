@@ -1,4 +1,4 @@
-;; Copyright 2014 Google Inc. All rights reserved.
+;; Copyright 2014 The Kythe Authors. All rights reserved.
 ;;
 ;; Licensed under the Apache License, Version 2.0 (the "License");
 ;; you may not use this file except in compliance with the License.
@@ -65,17 +65,18 @@
 (defn- collect-anchors [anchors]
   (into {}
     (for [[file anchors] (group-by :parent anchors)]
-      [file (sort-by (comp :byte_offset :start) anchors)])))
+      [file (sort-by (comp :byte_offset :start :span) anchors)])))
 
 (defn- display-anchor [file anchor file-to-view]
-  (let [line (:line_number (:snippet_start anchor))
-        snippet (:snippet anchor)]
+  (let [line (:line_number (:start (:snippet_span anchor)))
+        snippet (:snippet anchor)
+        span (:span anchor)]
     (when (and line snippet)
      (dom/p #js {:className "snippet"}
        (dom/a #js {:href "#"
                    :title (gstring/format "[%d:%d-%d:%d) %s %s"
-                            line (:column_offset (:start anchor))
-                            (:line_number (:end anchor)) (:column_offset (:end anchor))
+                            line (:column_offset (:start span))
+                            (:line_number (:end span)) (:column_offset (:end span))
                             (:kind anchor)
                             (:text anchor))
                    :onClick (fn [e]
@@ -124,6 +125,8 @@
            (display-related-anchors "Definitions:" (:definition (:cross-references state)) file-to-view)
            (display-related-anchors "Declarations:" (:declaration (:cross-references state)) file-to-view)
            (display-related-anchors "Documentation:" (:documentation (:cross-references state)) file-to-view)
+           ;; TODO(schroederc): list callsites within each caller
+           (display-related-anchors "Callers:" (:caller (:cross-references state)) file-to-view)
            (display-related-anchors "References:" (:reference (:cross-references state)) file-to-view)
            (when (:related_node (:cross-references state))
              (dom/ul nil
@@ -135,7 +138,7 @@
                             (dom/strong nil relation) " "
                             (apply dom/ul nil
                               (map (fn [{:keys [ticket]}]
-                                     (dom/li nil
+                                     (apply dom/li nil
                                        (str
                                          (or
                                            (get-in (:nodes @state) [(keyword ticket)
@@ -147,7 +150,18 @@
                                                    :onClick (fn [e]
                                                               (.preventDefault e)
                                                               (put! xrefs-to-view ticket))}
-                                         ticket)))
+                                         ticket)
+                                       (when-let [defTicket (get-in (:nodes @state) [(keyword ticket) :definition])]
+                                         (when-let [def (get-in (:definition_locations @state) [(keyword defTicket)])]
+                                           [" "
+                                            (dom/a #js {:href "#"
+                                                        :onClick (fn [e]
+                                                                   (.preventDefault e)
+                                                                   (put! file-to-view
+                                                                         {:ticket (:parent def)
+                                                                          :anchor defTicket
+                                                                          :line (get-in def [:span :start :line_number])}))}
+                                                   "[def]")]))))
                                 nodes))))
                      (group-by :relation_kind (:related_node (:cross-references state))))))))
            (page-navigation xrefs-to-view (cons "" (:pages state)) (or (:current-page-token state) "") (:ticket (:cross-references state)))])))))

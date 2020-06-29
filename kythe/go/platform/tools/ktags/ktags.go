@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,21 +19,25 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
 
+	"kythe.io/kythe/go/services/graph"
 	"kythe.io/kythe/go/services/xrefs"
 	"kythe.io/kythe/go/util/flagutil"
 	"kythe.io/kythe/go/util/kytheuri"
-	"kythe.io/kythe/go/util/schema"
-	"kythe.io/kythe/go/util/stringset"
+	"kythe.io/kythe/go/util/schema/edges"
+	"kythe.io/kythe/go/util/schema/facts"
+	"kythe.io/kythe/go/util/schema/nodes"
 
-	"golang.org/x/net/context"
+	"bitbucket.org/creachadair/stringset"
 
-	xpb "kythe.io/kythe/proto/xref_proto"
+	gpb "kythe.io/kythe/proto/graph_go_proto"
+	xpb "kythe.io/kythe/proto/xref_go_proto"
 )
 
 var (
@@ -59,6 +63,7 @@ func main() {
 	}
 
 	xs := xrefs.WebClient(*remoteAPI)
+	gs := graph.WebClient(*remoteAPI)
 
 	for _, file := range flag.Args() {
 		ticket := (&kytheuri.URI{Corpus: *corpus, Path: file}).String()
@@ -71,42 +76,36 @@ func main() {
 			log.Fatalf("Failed to get decorations for file %q", file)
 		}
 
-		nodes := xrefs.NodesMap(decor.Nodes)
-		emitted := stringset.New()
+		nmap := graph.NodesMap(decor.Nodes)
+		var emitted stringset.Set
 
 		for _, r := range decor.Reference {
-			if r.Kind != schema.DefinesBindingEdge || emitted.Contains(r.TargetTicket) {
+			if r.Kind != edges.DefinesBinding || emitted.Contains(r.TargetTicket) {
 				continue
 			}
 
-			ident := string(nodes[r.TargetTicket][identifierFact])
+			ident := string(nmap[r.TargetTicket][identifierFact])
 			if ident == "" {
 				continue
 			}
 
-			offset, err := strconv.Atoi(string(nodes[r.SourceTicket][schema.AnchorStartFact]))
-			if err != nil {
-				log.Printf("Invalid start offset for anchor %q", r.SourceTicket)
-				continue
-			}
-
-			fields, err := getTagFields(xs, r.TargetTicket)
+			fields, err := getTagFields(gs, r.TargetTicket)
 			if err != nil {
 				log.Printf("Failed to get tagfields for %q: %v", r.TargetTicket, err)
 			}
 
 			fmt.Printf("%s\t%s\t%d;\"\t%s\n",
-				ident, file, offsetLine(decor.SourceText, offset), strings.Join(fields, "\t"))
+				ident, file, offsetLine(decor.SourceText, int(r.Span.Start.ByteOffset)), strings.Join(fields, "\t"))
 			emitted.Add(r.TargetTicket)
 		}
 	}
 }
 
-func getTagFields(xs xrefs.Service, ticket string) ([]string, error) {
-	reply, err := xs.Edges(ctx, &xpb.EdgesRequest{
+func getTagFields(gs graph.Service, ticket string) ([]string, error) {
+	reply, err := gs.Edges(ctx, &gpb.EdgesRequest{
 		Ticket: []string{ticket},
-		Kind:   []string{schema.ChildOfEdge, schema.ParamEdge},
-		Filter: []string{schema.NodeKindFact, schema.SubkindFact, identifierFact},
+		Kind:   []string{edges.ChildOf, edges.Param},
+		Filter: []string{facts.NodeKind, facts.Subkind, identifierFact},
 	})
 	if err != nil || len(reply.EdgeSets) == 0 {
 		return nil, err
@@ -114,34 +113,34 @@ func getTagFields(xs xrefs.Service, ticket string) ([]string, error) {
 
 	var fields []string
 
-	nodes := xrefs.NodesMap(reply.Nodes)
-	edges := xrefs.EdgesMap(reply.EdgeSets)
+	nmap := graph.NodesMap(reply.Nodes)
+	emap := graph.EdgesMap(reply.EdgeSets)
 
-	switch string(nodes[ticket][schema.NodeKindFact]) + "|" + string(nodes[ticket][schema.SubkindFact]) {
-	case schema.FunctionKind + "|":
+	switch string(nmap[ticket][facts.NodeKind]) + "|" + string(nmap[ticket][facts.Subkind]) {
+	case nodes.Function + "|":
 		fields = append(fields, "f")
-		fields = append(fields, "arity:"+strconv.Itoa(len(edges[ticket][schema.ParamEdge])))
-	case schema.EnumKind + "|" + schema.EnumClassSubkind:
+		fields = append(fields, "arity:"+strconv.Itoa(len(emap[ticket][edges.Param])))
+	case nodes.Enum + "|" + nodes.EnumClass:
 		fields = append(fields, "g")
-	case schema.PackageKind + "|":
+	case nodes.Package + "|":
 		fields = append(fields, "p")
-	case schema.RecordKind + "|" + schema.ClassSubkind:
+	case nodes.Record + "|" + nodes.Class:
 		fields = append(fields, "c")
-	case schema.VariableKind + "|":
+	case nodes.Variable + "|":
 		fields = append(fields, "v")
 	}
 
-	for parent := range edges[ticket][schema.ChildOfEdge] {
-		parentIdent := string(nodes[parent][identifierFact])
+	for parent := range emap[ticket][edges.ChildOf] {
+		parentIdent := string(nmap[parent][identifierFact])
 		if parentIdent == "" {
 			continue
 		}
-		switch string(nodes[parent][schema.NodeKindFact]) + "|" + string(nodes[parent][schema.SubkindFact]) {
-		case schema.FunctionKind + "|":
+		switch string(nmap[parent][facts.NodeKind]) + "|" + string(nmap[parent][facts.Subkind]) {
+		case nodes.Function + "|":
 			fields = append(fields, "function:"+parentIdent)
-		case schema.RecordKind + "|" + schema.ClassSubkind:
+		case nodes.Record + "|" + nodes.Class:
 			fields = append(fields, "class:"+parentIdent)
-		case schema.EnumKind + "|" + schema.EnumClassSubkind:
+		case nodes.Enum + "|" + nodes.EnumClass:
 			fields = append(fields, "enum:"+parentIdent)
 		}
 	}

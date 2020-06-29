@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /** {@link StatisticsCollector} backed by an in-memory map that can be printed. */
 public class MemoryStatisticsCollector implements StatisticsCollector {
-  private final Map<String, AtomicLong> counters = new HashMap<String, AtomicLong>();
+  private final Map<String, AtomicLong> counters = new HashMap<>();
 
   /** Prints the current statistics to the given {@link PrintStream}. */
   public synchronized void printStatistics(PrintStream out) {

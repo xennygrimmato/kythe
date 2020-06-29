@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,9 +20,9 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
-	spb "kythe.io/kythe/proto/storage_proto"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
 func TestParse(t *testing.T) {
@@ -35,11 +35,18 @@ func TestParse(t *testing.T) {
 		{"kythe:", new(URI)},
 		{"kythe://", new(URI)},
 
+		// Corpus labels are not normalized, even if they "look like" paths.
+		// See #1479 for discussion.
+		{"kythe://..", &URI{Corpus: ".."}},
+		{"kythe://../", &URI{Corpus: "../"}},
+		{"kythe://../..", &URI{Corpus: "../.."}},
+		{"kythe://a/../b//c", &URI{Corpus: "a/../b//c"}},
+
 		// Individual components.
 		{"#sig", &URI{Signature: "sig"}},
 		{"kythe:#sig", &URI{Signature: "sig"}},
 		{"kythe://corpus", &URI{Corpus: "corpus"}},
-		{"kythe://corpus/", &URI{Corpus: "corpus"}},
+		{"kythe://corpus/", &URI{Corpus: "corpus/"}},
 		{"kythe://corpus/with/path", &URI{Corpus: "corpus/with/path"}},
 		{"//corpus/with/path", &URI{Corpus: "corpus/with/path"}},
 		{"kythe:?root=R", &URI{Root: "R"}},
@@ -112,9 +119,13 @@ func TestEqual(t *testing.T) {
 		{"kythe:?lang=%4c?path=%50", "kythe://?lang=L?path=P"},
 
 		// Paths are cleaned.
-		{"kythe://a/b/../c#sig", "kythe://a/c#sig"},
-		{"kythe://a/b/../d/./e/../../c#sig", "kythe://a/c#sig"},
-		{"//a/b/c/../d?lang=%67%6F", "kythe://a/b/d?lang=go"},
+		{"kythe://a?path=b/../c#sig", "kythe://a?path=c#sig"},
+		{"kythe://a?path=b/../d/./e/../../c#sig", "kythe://a?path=c#sig"},
+		{"//a?path=b/c/../d?lang=%67%6F", "kythe://a?path=b/d?lang=go"},
+
+		// Corpus labels are not cleaned.
+		{"//a//?path=b/c/..?lang=foo", "kythe://a//?path=b?lang=foo"},
+		{"kythe://a/./b/..//c/#sig", "kythe://a/./b/..//c/#sig"},
 	}
 	for _, test := range eq {
 		if !Equal(test.a, test.b) {
@@ -190,6 +201,7 @@ func TestRoundTripVName(t *testing.T) {
 		{}, // empty
 		{Corpus: "//Users/foo", Path: "/Users/foo/bar", Language: "go", Signature: "∴"},
 		{Corpus: "//////", Root: "←", Language: "c++"},
+		{Corpus: "kythe//branch", Path: "source.ext"},
 	}
 	for _, test := range tests {
 		uri := FromVName(test)
@@ -201,10 +213,18 @@ func TestRoundTripVName(t *testing.T) {
 	}
 }
 
+func TestUnicode(t *testing.T) {
+	const expected = "kythe:#%E5%BA%83"
+	uri := &URI{Signature: "広"}
+	if found := uri.String(); found != expected {
+		t.Errorf("Expected: %q; found: %q", expected, found)
+	}
+}
+
 func TestString(t *testing.T) {
 	const empty = "kythe:"
 	const canonical = "kythe:?lang=L?path=P?root=R"
-	const cleaned = "kythe://a/c#sig"
+	const cleaned = "kythe://a?path=c#sig"
 	tests := []struct {
 		input, want string
 	}{
@@ -228,9 +248,12 @@ func TestString(t *testing.T) {
 		{"kythe://?path=%20", "kythe:?path=%20"},
 		{"kythe://?path=a/b", "kythe:?path=a/b"},
 
+		// Support branch embedding
+		{"kythe://kythe//branch", "kythe://kythe//branch"},
+
 		// Path cleaning
-		{"kythe://a/b/../c#sig", cleaned},
-		{"kythe://a/./d/.././c#sig", cleaned},
+		{"kythe://a?path=b/../c#sig", cleaned},
+		{"kythe://a?path=./d/.././c#sig", cleaned},
 
 		// Regression: Escape sequences in the corpus specification.
 		{"kythe://libstdc%2B%2B?path=bits/basic_string.h?lang=c%2B%2B?root=/usr/include/c%2B%2B/4.8",

@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,10 @@
 
 package com.google.devtools.kythe.extractors.java;
 
+import static com.google.common.base.Preconditions.checkNotNull;
+
+import java.util.Optional;
+import javax.tools.JavaFileManager.Location;
 import javax.tools.JavaFileObject;
 
 /**
@@ -26,13 +30,14 @@ import javax.tools.JavaFileObject;
 public class InputUsageRecord {
 
   private final JavaFileObject fileObject;
+  private Optional<Location> location;
+
   private boolean isUsed = false;
 
-  public InputUsageRecord(JavaFileObject fileObject) {
-    if (fileObject == null) {
-      throw new IllegalStateException();
-    }
-    this.fileObject = fileObject;
+  /** @param location of a java file object, if known. */
+  public InputUsageRecord(JavaFileObject fileObject, Optional<Location> location) {
+    this.fileObject = checkNotNull(fileObject);
+    this.location = checkNotNull(location);
   }
 
   /** Record that the compiler used this file as input. */
@@ -48,5 +53,17 @@ public class InputUsageRecord {
   /** Returns the first file object created for this file. */
   public JavaFileObject fileObject() {
     return fileObject;
+  }
+
+  /** Return the file's {@link Optional<Location>}. */
+  public Optional<Location> location() {
+    return location;
+  }
+
+  /** Update the location, preferring a non-empty location. */
+  public void updateLocation(Optional<Location> value) {
+    if (value.isPresent()) {
+      location = value;
+    }
   }
 }

@@ -1,7 +1,7 @@
-#!/bin/bash -e
-set -o pipefail
+#!/bin/bash
+set -eo pipefail
 
-# Copyright 2015 Google Inc. All rights reserved.
+# Copyright 2015 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,12 +18,16 @@ set -o pipefail
 # Test the Kythe release package for basic functionality.
 
 export TMPDIR=${TEST_TMPDIR:?}
+SHASUM_TOOL="$PWD/$1"
+shift
+
+JAVA_LANGTOOLS="$PWD/$(ls third_party/javac/javac*.jar)"
 
 TEST_PORT=9898
 ADDR=localhost:$TEST_PORT
 TEST_REPOSRCDIR="$PWD"
 
-jq() { "$TEST_REPOSRCDIR/third_party/jq/jq" "$@"; }
+jq() { "$TEST_REPOSRCDIR/external/com_github_stedolan_jq/jq" "$@"; }
 
 if ! command -v curl >/dev/null; then
   echo "Test requires curl command" >&2
@@ -32,7 +36,12 @@ fi
 
 cd kythe/release
 
-md5sum -c kythe-*.tar.gz.md5
+EXPECTED_SUM=$(cat kythe-*.tar.gz.sha256)
+SUM=$("$SHASUM_TOOL" kythe-*.tar.gz)
+if [[ "$SUM" != "$EXPECTED_SUM" ]]; then
+  echo "Expected digest \"$EXPECTED_SUM\" but got \"$SUM\"."
+  exit 1
+fi
 
 rm -rf "$TMPDIR/release"
 mkdir "$TMPDIR/release"
@@ -42,29 +51,36 @@ cd "$TMPDIR/release"
 cd kythe-*
 
 # Ensure the various tools work on test inputs
-tools/viewindex "$TEST_REPOSRCDIR/kythe/testdata/test.kindex" | \
+tools/kzip view "$TEST_REPOSRCDIR/kythe/testdata/test.kzip" | \
   jq . >/dev/null
-tools/indexpack --to_archive indexpack.test "$TEST_REPOSRCDIR/kythe/testdata/test.kindex"
 tools/entrystream < "$TEST_REPOSRCDIR/kythe/testdata/test.entries" | \
-  tools/entrystream --write_json | \
-  tools/entrystream --read_json --entrysets >/dev/null
+  tools/entrystream --write_format=json | \
+  tools/entrystream --read_format=json --entrysets >/dev/null
 tools/triples < "$TEST_REPOSRCDIR/kythe/testdata/test.entries" >/dev/null
 
 # TODO(zarko): add cxx extractor tests
+
 rm -rf "$TMPDIR/java_compilation"
-REAL_JAVAC="$(which java)" \
-  JAVAC_EXTRACTOR_JAR=$PWD/extractors/javac_extractor.jar \
+export KYTHE_OUTPUT_FILE="$TMPDIR/java_compilation/util.kzip"
+if (java -version |& head -1 | grep 1.8 >/dev/null);
+then
+  export KYTHE_JAVA_RUNTIME_OPTIONS="-Xbootclasspath/p:$JAVA_LANGTOOLS"
+else
+  export KYTHE_JAVA_RUNTIME_OPTIONS="-Xbootclasspath/a:$JAVA_LANGTOOLS"
+fi
+JAVAC_EXTRACTOR_JAR=$PWD/extractors/javac_extractor.jar \
   KYTHE_ROOT_DIRECTORY="$TEST_REPOSRCDIR" \
-  KYTHE_OUTPUT_DIRECTORY="$TMPDIR/java_compilation" \
   KYTHE_EXTRACT_ONLY=1 \
-  extractors/javac-wrapper.sh -cp "$TEST_REPOSRCDIR/third_party/guava"/*.jar \
-  "$TEST_REPOSRCDIR/kythe/java/com/google/devtools/kythe/common"/*.java
-cat "$TMPDIR"/javac-extractor.{out,err}
-java -jar indexers/java_indexer.jar "$TMPDIR/java_compilation"/*.kindex | \
+  extractors/javac-wrapper.sh \
+  "$TEST_REPOSRCDIR/kythe/java/com/google/devtools/kythe/util"/*.java
+test -r "$KYTHE_OUTPUT_FILE"
+java "${KYTHE_JAVA_RUNTIME_OPTIONS[@]}" \
+  -jar indexers/java_indexer.jar "$KYTHE_OUTPUT_FILE" | \
   tools/entrystream --count
 
 # Ensure the Java indexer works on a curated test compilation
-java -jar indexers/java_indexer.jar "$TEST_REPOSRCDIR/kythe/testdata/test.kindex" > entries
+java "${KYTHE_JAVA_RUNTIME_OPTIONS[@]}"  \
+  -jar indexers/java_indexer.jar "$TEST_REPOSRCDIR/kythe/testdata/test.kzip" > entries
 # TODO(zarko): add C++ test kindex entries
 
 # Ensure basic Kythe pipeline toolset works
@@ -76,17 +92,19 @@ tools/read_entries --graphstore gs | \
   tools/entrystream --sort >/dev/null
 
 # Smoke test the verifier
-tools/verifier --ignore_dups --show_goals <(echo "//- Any childof Any2") < entries
-if tools/verifier --ignore_dups <(echo "//- Any noSuchEdge Any2") < entries; then
+echo "//- _ childof _" > any_childof_any2
+tools/verifier --nofile_vnames --ignore_dups --show_goals any_childof_any2 \
+    < entries
+echo "//- _ noSuchEdge _" > any_nosuchedge_any2
+if tools/verifier --nofile_vnames --ignore_dups any_nosuchedge_any2 < entries;\
+    then
   echo "ERROR: verifier found a non-existent edge" >&2
   exit 1
 fi
 
 # Ensure kythe tool is functional
-tools/kythe --api srv node 'kythe:?lang=java#pkg.Names'
-
+tools/kythe --api srv nodes 'kythe:?lang=java#pkg.Names'
 tools/http_server \
-  --public_resources web/ui \
   --serving_table srv \
   --listen $ADDR &
 pid=$!
@@ -98,13 +116,8 @@ while ! curl -s $ADDR >/dev/null; do
 done
 
 # Ensure basic HTTP handlers work
-curl -sf $ADDR >/dev/null
 curl -sf $ADDR/corpusRoots | jq . >/dev/null
 curl -sf $ADDR/dir | jq . >/dev/null
-curl -sf $ADDR/nodes -d '{"ticket": ["kythe:?lang=java#pkg.Names"]}' | \
-  jq -e '(.nodes | length) > 0'
-curl -sf $ADDR/edges -d '{"ticket": ["kythe:?lang=java#pkg.Names"]}' | \
-  jq -e '(.edge_sets | length) > 0'
 curl -sf $ADDR/decorations -d '{"location": {"ticket": "kythe://kythe?path=kythe/javatests/com/google/devtools/kythe/analyzers/java/testdata/pkg/Names.java"}, "source_text": true, "references": true}' | \
   jq -e '(.reference | length) > 0
      and (.nodes | length) == 0

@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,14 +17,16 @@
 // This file uses the Clang style conventions.
 
 #include "IndexerPPCallbacks.h"
-#include "GraphObserver.h"
 
-#include "glog/logging.h"
-#include "kythe/cxx/common/path_utils.h"
+#include "GraphObserver.h"
+#include "absl/strings/str_format.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Index/USRGeneration.h"
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Lex/Preprocessor.h"
+#include "glog/logging.h"
+#include "kythe/cxx/extractor/path_utils.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -44,24 +46,41 @@
 
 namespace kythe {
 
-IndexerPPCallbacks::IndexerPPCallbacks(clang::Preprocessor &PP,
-                                       GraphObserver &GO, enum Verbosity V)
-    : Preprocessor(PP), Observer(GO), Verbosity(V) {
+IndexerPPCallbacks::IndexerPPCallbacks(clang::Preprocessor& PP,
+                                       GraphObserver& GO, enum Verbosity V,
+                                       int UsrByteSize)
+    : Preprocessor(PP), Observer(GO), Verbosity(V), UsrByteSize(UsrByteSize) {
   class MetadataPragmaHandlerWrapper : public clang::PragmaHandler {
-  public:
-    MetadataPragmaHandlerWrapper(IndexerPPCallbacks *context)
+   public:
+    MetadataPragmaHandlerWrapper(IndexerPPCallbacks* context)
         : PragmaHandler("kythe_metadata"), context_(context) {}
-    void HandlePragma(clang::Preprocessor &Preprocessor,
-                      clang::PragmaIntroducerKind Introducer,
-                      clang::Token &FirstToken) override {
-      context_->HandleKytheMetadataPragma(Preprocessor, Introducer, FirstToken);
+    void HandlePragma(clang::Preprocessor& Preprocessor,
+                      clang::PragmaIntroducer Introducer,
+                      clang::Token& FirstToken) override {
+      context_->HandleKytheMetadataPragma(Preprocessor, Introducer.Kind,
+                                          FirstToken);
     }
 
-  private:
-    IndexerPPCallbacks *context_;
+   private:
+    IndexerPPCallbacks* context_;
+  };
+  class InlineMetadataPragmaHandlerWrapper : public clang::PragmaHandler {
+   public:
+    InlineMetadataPragmaHandlerWrapper(IndexerPPCallbacks* context)
+        : PragmaHandler("kythe_inline_metadata"), context_(context) {}
+    void HandlePragma(clang::Preprocessor& Preprocessor,
+                      clang::PragmaIntroducer Introducer,
+                      clang::Token& FirstToken) override {
+      context_->HandleKytheInlineMetadataPragma(Preprocessor, Introducer.Kind,
+                                                FirstToken);
+    }
+
+   private:
+    IndexerPPCallbacks* context_;
   };
   // Clang takes ownership.
   PP.AddPragmaHandler(new MetadataPragmaHandlerWrapper(this));
+  PP.AddPragmaHandler(new InlineMetadataPragmaHandlerWrapper(this));
 }
 
 IndexerPPCallbacks::~IndexerPPCallbacks() {}
@@ -71,34 +90,31 @@ void IndexerPPCallbacks::FileChanged(clang::SourceLocation Loc,
                                      clang::SrcMgr::CharacteristicKind FileType,
                                      clang::FileID PrevFID) {
   switch (Reason) {
-  case clang::PPCallbacks::EnterFile:
-    Observer.pushFile(LastInclusionHash, Loc);
-    break;
-  case clang::PPCallbacks::ExitFile:
-    Observer.popFile();
-    break;
-  case clang::PPCallbacks::SystemHeaderPragma:
-    break;
-  // RenameFile occurs when a #line directive is encountered, for example:
-  // #line 10 "foo.cc"
-  case clang::PPCallbacks::RenameFile:
-    break;
-  default:
-    llvm::dbgs() << "Unknown FileChangeReason " << Reason << "\n";
+    case clang::PPCallbacks::EnterFile:
+      Observer.pushFile(LastInclusionHash, Loc);
+      break;
+    case clang::PPCallbacks::ExitFile:
+      Observer.popFile();
+      break;
+    case clang::PPCallbacks::SystemHeaderPragma:
+      break;
+    // RenameFile occurs when a #line directive is encountered, for example:
+    // #line 10 "foo.cc"
+    case clang::PPCallbacks::RenameFile:
+      break;
+    default:
+      llvm::dbgs() << "Unknown FileChangeReason " << Reason << "\n";
   }
 }
 
 void IndexerPPCallbacks::FilterAndEmitDeferredRecords() {
-  for (const auto &R : DeferredRecords) {
+  for (const auto& R : DeferredRecords) {
     if (R.WasDefined) {
       if (!R.Macro->getMacroInfo()->isUsedForHeaderGuard()) {
         Observer.recordBoundQueryRange(
             R.Range,
             BuildNodeIdForMacro(R.MacroName, *R.Macro->getMacroInfo()));
       }
-    } else {
-      Observer.recordUnboundQueryRange(R.Range,
-                                       BuildNameIdForMacro(R.MacroName));
     }
   }
   DeferredRecords.clear();
@@ -109,22 +125,22 @@ void IndexerPPCallbacks::EndOfMainFile() {
   Observer.popFile();
 }
 
-GraphObserver::Range
-IndexerPPCallbacks::RangeForTokenInCurrentContext(const clang::Token &Token) {
+GraphObserver::Range IndexerPPCallbacks::RangeForTokenInCurrentContext(
+    const clang::Token& Token) {
   const auto Start = Token.getLocation();
   const auto End = Start.getLocWithOffset(Token.getLength());
   return RangeInCurrentContext(clang::SourceRange(Start, End));
 }
 
-void IndexerPPCallbacks::MacroDefined(const clang::Token &Token,
-                                      const clang::MacroDirective *Macro) {
+void IndexerPPCallbacks::MacroDefined(const clang::Token& Token,
+                                      const clang::MacroDirective* Macro) {
   if (Macro == nullptr) {
     return;
   }
-  const clang::MacroInfo &Info = *Macro->getMacroInfo();
+  const clang::MacroInfo& Info = *Macro->getMacroInfo();
   clang::FileID MacroFileID =
       Observer.getSourceManager()->getFileID(Info.getDefinitionLoc());
-  const clang::FileEntry *MacroFileEntry =
+  const clang::FileEntry* MacroFileEntry =
       Observer.getSourceManager()->getFileEntryForID(MacroFileID);
   if (MacroFileEntry == nullptr) {
     // This is a builtin macro. Ignore it.
@@ -136,32 +152,44 @@ void IndexerPPCallbacks::MacroDefined(const clang::Token &Token,
     Observer.recordDefinitionBindingRange(RangeForTokenInCurrentContext(Token),
                                           MacroId);
     Observer.recordMacroNode(MacroId);
-    Observer.recordNamedEdge(MacroId, MacroName);
+    MarkedSource MacroCode;
+    MacroCode.set_kind(MarkedSource::IDENTIFIER);
+    MacroCode.set_pre_text(std::string(Token.getIdentifierInfo()->getName()));
+    Observer.recordMarkedSource(MacroId, MacroCode);
+    if (UsrByteSize > 0) {
+      llvm::SmallString<128> Usr;
+      if (!clang::index::generateUSRForMacro(
+              Token.getIdentifierInfo()->getName(), Macro->getLocation(),
+              *Observer.getSourceManager(), Usr)) {
+        Observer.assignUsr(MacroId, Usr, UsrByteSize);
+      }
+    }
   }
   // TODO(zarko): Record information about the definition (like other macro
   // references).
 }
 
-void IndexerPPCallbacks::MacroUndefined(const clang::Token &MacroName,
-                                        const clang::MacroDefinition &Macro) {
+void IndexerPPCallbacks::MacroUndefined(const clang::Token& MacroName,
+                                        const clang::MacroDefinition& Macro,
+                                        const clang::MacroDirective* Undef) {
   if (!Macro) {
     return;
   }
-  const clang::MacroInfo &Info = *Macro.getMacroInfo();
+  const clang::MacroInfo& Info = *Macro.getMacroInfo();
   GraphObserver::NodeId MacroId = BuildNodeIdForMacro(MacroName, Info);
   Observer.recordUndefinesRange(RangeForTokenInCurrentContext(MacroName),
                                 MacroId);
 }
 
-void IndexerPPCallbacks::MacroExpands(const clang::Token &Token,
-                                      const clang::MacroDefinition &Macro,
+void IndexerPPCallbacks::MacroExpands(const clang::Token& Token,
+                                      const clang::MacroDefinition& Macro,
                                       clang::SourceRange Range,
-                                      const clang::MacroArgs *Args) {
+                                      const clang::MacroArgs* Args) {
   if (!Macro || Range.isInvalid()) {
     return;
   }
 
-  const clang::MacroInfo &Info = *Macro.getMacroInfo();
+  const clang::MacroInfo& Info = *Macro.getMacroInfo();
   GraphObserver::NodeId MacroId = BuildNodeIdForMacro(Token, Info);
   if (!Range.getBegin().isFileID() || !Range.getEnd().isFileID()) {
     if (Verbosity) {
@@ -170,11 +198,11 @@ void IndexerPPCallbacks::MacroExpands(const clang::Token &Token,
       if (!NewBegin.isFileID()) {
         return;
       }
-      Range = clang::SourceRange(NewBegin,
-                                 clang::Lexer::getLocForEndOfToken(
-                                     NewBegin, 0, /* offset from token end */
-                                     *Observer.getSourceManager(),
-                                     *Observer.getLangOptions()));
+      Range = clang::SourceRange(
+          NewBegin,
+          clang::Lexer::getLocForEndOfToken(
+              NewBegin, 0, /* offset from token end */
+              *Observer.getSourceManager(), *Observer.getLangOptions()));
       if (Range.isInvalid()) {
         return;
       }
@@ -187,8 +215,8 @@ void IndexerPPCallbacks::MacroExpands(const clang::Token &Token,
   // TODO(zarko): Index macro arguments.
 }
 
-void IndexerPPCallbacks::Defined(const clang::Token &MacroName,
-                                 const clang::MacroDefinition &Macro,
+void IndexerPPCallbacks::Defined(const clang::Token& MacroName,
+                                 const clang::MacroDefinition& Macro,
                                  clang::SourceRange Range) {
   DeferredRecords.push_back(
       DeferredRecord{MacroName, Macro ? Macro.getLocalDirective() : nullptr,
@@ -197,25 +225,25 @@ void IndexerPPCallbacks::Defined(const clang::Token &MacroName,
 }
 
 void IndexerPPCallbacks::Ifdef(clang::SourceLocation Location,
-                               const clang::Token &MacroName,
-                               const clang::MacroDefinition &Macro) {
+                               const clang::Token& MacroName,
+                               const clang::MacroDefinition& Macro) {
   // Just delegate.
   Defined(MacroName, Macro, clang::SourceRange(Location));
 }
 
 void IndexerPPCallbacks::Ifndef(clang::SourceLocation Location,
-                                const clang::Token &MacroName,
-                                const clang::MacroDefinition &Macro) {
+                                const clang::Token& MacroName,
+                                const clang::MacroDefinition& Macro) {
   // Just delegate.
   Defined(MacroName, Macro, clang::SourceRange(Location));
 }
 
 void IndexerPPCallbacks::InclusionDirective(
-    clang::SourceLocation HashLocation, const clang::Token &IncludeToken,
+    clang::SourceLocation HashLocation, const clang::Token& IncludeToken,
     llvm::StringRef Filename, bool IsAngled,
-    clang::CharSourceRange FilenameRange, const clang::FileEntry *FileEntry,
+    clang::CharSourceRange FilenameRange, const clang::FileEntry* FileEntry,
     llvm::StringRef SearchPath, llvm::StringRef RelativePath,
-    const clang::Module *Imported) {
+    const clang::Module* Imported, clang::SrcMgr::CharacteristicKind FileType) {
   // TODO(zarko) (Modules): Check if `Imported` is non-null; if so, this
   // was transformed to a module import.
   if (FileEntry != nullptr) {
@@ -226,16 +254,16 @@ void IndexerPPCallbacks::InclusionDirective(
 }
 
 void IndexerPPCallbacks::AddMacroReferenceIfDefined(
-    const clang::Token &MacroNameToken) {
-  if (clang::IdentifierInfo *const NameII =
+    const clang::Token& MacroNameToken) {
+  if (clang::IdentifierInfo* const NameII =
           MacroNameToken.getIdentifierInfo()) {
     if (NameII->hasMacroDefinition()) {
-      if (auto *Macro = Preprocessor.getLocalMacroDirective(NameII)) {
+      if (auto* Macro = Preprocessor.getLocalMacroDirective(NameII)) {
         AddReferenceToMacro(MacroNameToken, *Macro->getMacroInfo(),
                             Macro->isDefined());
       }
     } else if (NameII->hadMacroDefinition()) {
-      if (auto *Macro = Preprocessor.getLocalMacroDirectiveHistory(NameII)) {
+      if (auto* Macro = Preprocessor.getLocalMacroDirectiveHistory(NameII)) {
         AddReferenceToMacro(MacroNameToken, *Macro->getMacroInfo(),
                             Macro->isDefined());
       }
@@ -252,26 +280,25 @@ void IndexerPPCallbacks::AddMacroReferenceIfDefined(
   }
 }
 
-void IndexerPPCallbacks::AddReferenceToMacro(const clang::Token &MacroNameToken,
-                                             clang::MacroInfo const &Info,
+void IndexerPPCallbacks::AddReferenceToMacro(const clang::Token& MacroNameToken,
+                                             clang::MacroInfo const& Info,
                                              bool IsDefined) {
   llvm::StringRef MacroName(MacroNameToken.getIdentifierInfo()->getName());
   Observer.recordExpandsRange(RangeForTokenInCurrentContext(MacroNameToken),
                               BuildNodeIdForMacro(MacroNameToken, Info));
 }
 
-GraphObserver::NameId
-IndexerPPCallbacks::BuildNameIdForMacro(const clang::Token &Spelling) {
+GraphObserver::NameId IndexerPPCallbacks::BuildNameIdForMacro(
+    const clang::Token& Spelling) {
   CHECK(Spelling.getIdentifierInfo()) << "Macro spelling lacks IdentifierInfo";
   GraphObserver::NameId Id;
   Id.EqClass = GraphObserver::NameId::NameEqClass::Macro;
-  Id.Path = Spelling.getIdentifierInfo()->getName();
+  Id.Path = std::string(Spelling.getIdentifierInfo()->getName());
   return Id;
 }
 
-GraphObserver::NodeId
-IndexerPPCallbacks::BuildNodeIdForMacro(const clang::Token &Spelling,
-                                        clang::MacroInfo const &Info) {
+GraphObserver::NodeId IndexerPPCallbacks::BuildNodeIdForMacro(
+    const clang::Token& Spelling, clang::MacroInfo const& Info) {
   // Macro definitions always appear at the topmost level *and* always appear
   // in source text (or are implicit). For this reason, it's safe to use
   // location information to stably unique them. However, we must be careful
@@ -280,7 +307,7 @@ IndexerPPCallbacks::BuildNodeIdForMacro(const clang::Token &Spelling,
   std::string IdString;
   llvm::raw_string_ostream Ostream(IdString);
   Ostream << BuildNameIdForMacro(Spelling);
-  auto &SM = *Observer.getSourceManager();
+  auto& SM = *Observer.getSourceManager();
   if (Loc.isInvalid()) {
     Ostream << "@invalid";
   } else if (!Loc.isFileID()) {
@@ -303,24 +330,53 @@ IndexerPPCallbacks::BuildNodeIdForMacro(const clang::Token &Spelling,
 }
 
 void IndexerPPCallbacks::HandleKytheMetadataPragma(
-    clang::Preprocessor &preprocessor, clang::PragmaIntroducerKind introducer,
-    clang::Token &first_token) {
+    clang::Preprocessor& preprocessor, clang::PragmaIntroducerKind introducer,
+    clang::Token& FirstToken) {
   llvm::SmallString<1024> search_path;
   llvm::SmallString<1024> relative_path;
   llvm::SmallString<1024> filename;
-  const auto *file = LookupFileForIncludePragma(&preprocessor, &search_path,
-                                                &relative_path, &filename);
+  const auto* file = cxx_extractor::LookupFileForIncludePragma(
+      &preprocessor, &search_path, &relative_path, &filename);
   if (!file) {
-    fprintf(stderr, "Missing metadata file: %s\n", filename.c_str());
+    absl::FPrintF(stderr, "Missing metadata file: %s\n",
+                  std::string(filename.str()));
     return;
   }
   clang::FileID pragma_file_id =
-      Observer.getSourceManager()->getFileID(first_token.getLocation());
+      Observer.getSourceManager()->getFileID(FirstToken.getLocation());
   if (!pragma_file_id.isInvalid()) {
-    Observer.applyMetadataFile(pragma_file_id, file);
+    Observer.applyMetadataFile(pragma_file_id, file, "");
   } else {
-    fprintf(stderr, "Metadata pragma was in an impossible place\n");
+    absl::FPrintF(stderr, "Metadata pragma was in an impossible place\n");
   }
 }
 
-} // namespace kythe
+void IndexerPPCallbacks::HandleKytheInlineMetadataPragma(
+    clang::Preprocessor& preprocessor, clang::PragmaIntroducerKind introducer,
+    clang::Token& FirstToken) {
+  std::string search_string;
+  clang::Token tok;
+  if (!preprocessor.LexStringLiteral(tok, search_string,
+                                     "pragma kythe_inline_metadata",
+                                     /*AllowMacroExpansion=*/true)) {
+    return;
+  }
+  if (search_string.empty()) {
+    return;
+  }
+  clang::FileID pragma_file_id =
+      Observer.getSourceManager()->getFileID(FirstToken.getLocation());
+  if (pragma_file_id.isInvalid()) {
+    LOG(WARNING) << "Invalid file ID for kythe_inline_metadata";
+    return;
+  }
+  const clang::FileEntry* pragma_file_entry =
+      Observer.getSourceManager()->getFileEntryForID(pragma_file_id);
+  if (pragma_file_entry == nullptr) {
+    LOG(WARNING) << "Missing file entry for kythe_inline_metadata";
+    return;
+  }
+  Observer.applyMetadataFile(pragma_file_id, pragma_file_entry, search_string);
+}
+
+}  // namespace kythe

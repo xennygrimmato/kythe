@@ -7,8 +7,15 @@ import java.util.function.Function;
 
 //- @Lambdas defines/binding LambdasClass
 public class Lambdas {
+  //- @Function ref FuncAbs
+  //- Func childof FuncAbs
+  //- @"x -> x" defines IdentLambda
+  //- IdentLambda.node/kind function
+  //- IdentLambda extends Func
+  private static final Function<Object, Object> IDENTITY = x -> x;
+
   //- @fieldName defines/binding Field
-  //- Field childof LambdaClass
+  //- Field childof LambdasClass
   Object fieldName;
 
   //- @num defines/binding NumParameter1
@@ -34,10 +41,23 @@ public class Lambdas {
   //- @getAdder defines/binding GetAdder
   //- @adderX defines/binding AdderX
   public Function<Integer, Integer> getAdder(final int adderX) {
-    //- @adderY defines/binding AdderyY
+    //- @adderY defines/binding AdderY
     return adderY
         //- @adderX ref AdderX
         //- @adderY ref AdderY
         -> adderX + adderY;
+  }
+
+  //- @String defines/binding StrCopy
+  private static final class String { // purposefully clash with builtin class
+    public static String create() { return new String(); }
+  }
+
+  //- @#0String ref StrBuiltin
+  //- @#1String ref StrCopy
+  public Function<java.lang.String, String> checkParameterAnchors() {
+    //- @String ref StrCopy
+    //- !{ @String ref StrBuiltin }
+    return s -> String.create();
   }
 }

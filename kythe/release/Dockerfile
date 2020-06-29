@@ -1,4 +1,4 @@
-# Copyright 2014 Google Inc. All rights reserved.
+# Copyright 2014 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,11 +41,15 @@ RUN chmod +x /kythe/bin/*_extractor
 ################################## <INDEXERS>
 # C++
 ADD kythe/cxx/indexer/cxx/indexer /kythe/bin/c++_indexer.bin
-RUN echo 'exec /kythe/bin/c++_indexer.bin --flush_after_each_entry=true --ignore_unimplemented=true --index_template_instantiations=false "$@"' > /kythe/bin/c++_indexer
+RUN echo 'exec /kythe/bin/c++_indexer.bin --flush_after_each_entry --ignore_unimplemented --noindex_template_instantiations "$@"' > /kythe/bin/c++_indexer
 
 # Java
 ADD kythe/java/com/google/devtools/kythe/analyzers/java/indexer_deploy.jar /kythe/bin/java_indexer_deploy.jar
-RUN echo 'exec java -jar /kythe/bin/java_indexer_deploy.jar "$@"' > /kythe/bin/java_indexer
+ADD third_party/javac/javac-9-dev-r4023-1.jar /kythe/bin/javac9.jar
+RUN echo 'exec java -Xbootclasspath/p:/kythe/bin/javac9.jar -jar /kythe/bin/java_indexer_deploy.jar "$@"' > /kythe/bin/java_indexer
+
+# Go
+ADD kythe/go/indexer/cmd/go_indexer/go_indexer /kythe/bin/go_indexer
 
 RUN chmod +x /kythe/bin/*_indexer
 ################################## </INDEXERS>

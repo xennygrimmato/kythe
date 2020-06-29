@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,71 +18,125 @@ package com.google.devtools.kythe.analyzers.java;
 
 import com.beust.jcommander.Parameter;
 import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableList;
+import com.google.common.flogger.FluentLogger;
 import com.google.devtools.kythe.analyzers.base.FactEmitter;
+import com.google.devtools.kythe.analyzers.base.StreamFactEmitter;
 import com.google.devtools.kythe.extractors.shared.CompilationDescription;
 import com.google.devtools.kythe.extractors.shared.IndexInfoUtils;
-import com.google.devtools.kythe.platform.indexpack.Archive;
 import com.google.devtools.kythe.platform.java.JavacAnalysisDriver;
+import com.google.devtools.kythe.platform.kzip.KZip;
+import com.google.devtools.kythe.platform.kzip.KZipException;
+import com.google.devtools.kythe.platform.kzip.KZipReader;
 import com.google.devtools.kythe.platform.shared.AnalysisException;
 import com.google.devtools.kythe.platform.shared.FileDataCache;
+import com.google.devtools.kythe.platform.shared.KytheMetadataLoader;
 import com.google.devtools.kythe.platform.shared.MemoryStatisticsCollector;
+import com.google.devtools.kythe.platform.shared.MetadataLoaders;
 import com.google.devtools.kythe.platform.shared.NullStatisticsCollector;
-import com.google.devtools.kythe.proto.Storage.Entry;
-import com.google.devtools.kythe.proto.Storage.VName;
-import com.google.protobuf.ByteString;
+import com.google.devtools.kythe.platform.shared.ProtobufMetadataLoader;
+import com.google.devtools.kythe.platform.shared.StatisticsCollector;
+import com.google.devtools.kythe.proto.Analysis.IndexedCompilation;
+import com.google.devtools.kythe.util.JsonUtil;
 import java.io.BufferedOutputStream;
+import java.io.EOFException;
+import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.file.FileSystems;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.ServiceLoader;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
-/** Binary to run Kythe's Java index over a single .kindex file, emitting entries to STDOUT. */
+/**
+ * Binary to run Kythe's Java indexer over one of more .kzip/.kindex files, emitting entries to a
+ * file or STDOUT.
+ */
 public class JavaIndexer {
+  private static final FluentLogger logger = FluentLogger.forEnclosingClass();
+
   public static void main(String[] args) throws AnalysisException, IOException {
+    JsonUtil.usingTypeRegistry(JsonUtil.JSON_TYPE_REGISTRY);
+
     StandaloneConfig config = new StandaloneConfig();
     config.parseCommandLine(args);
+
+    List<Supplier<Plugin>> plugins = new ArrayList<>();
+    if (!Strings.isNullOrEmpty(config.getPlugin())) {
+      URLClassLoader classLoader = new URLClassLoader(new URL[] {fileURL(config.getPlugin())});
+      for (Plugin plugin : ServiceLoader.load(Plugin.class, classLoader)) {
+        final Class<? extends Plugin> clazz = plugin.getClass();
+        plugins.add(
+            () -> {
+              try {
+                return clazz.getConstructor().newInstance();
+              } catch (Exception e) {
+                throw new IllegalStateException("failed to construct Plugin " + clazz, e);
+              }
+            });
+      }
+    }
+    if (config.getPrintVNames()) {
+      plugins.add(Plugin.PrintKytheNodes::new);
+    }
 
     MemoryStatisticsCollector statistics = null;
     if (config.getPrintStatistics()) {
       statistics = new MemoryStatisticsCollector();
     }
 
-    List<String> compilation = config.getCompilation();
-    if (compilation.size() > 1) {
-      System.err.println("Java indexer received too many arguments; got " + compilation);
-      usage(1);
-    }
-
-    CompilationDescription desc = null;
-    if (!Strings.isNullOrEmpty(config.getIndexPackRoot())) {
-      // java_indexer --index_pack=archive-root unit-key
-      desc = new Archive(config.getIndexPackRoot()).readDescription(compilation.get(0));
-    } else {
-      // java_indexer kindex-file
-      desc = IndexInfoUtils.readIndexInfoFromFile(compilation.get(0));
-    }
-
-    if (desc == null) {
-      throw new IllegalStateException("Unknown error reading CompilationDescription");
-    }
-    if (!desc.getFileContents().iterator().hasNext()) {
-      return;
-    }
-
     try (OutputStream stream =
-        Strings.isNullOrEmpty(config.getOutputPath())
-            ? System.out
-            : new BufferedOutputStream(new FileOutputStream(config.getOutputPath()))) {
-      new JavacAnalysisDriver()
-          .analyze(
-              new KytheJavacAnalyzer(
-                  config,
-                  new StreamFactEmitter(stream),
-                  statistics == null ? NullStatisticsCollector.getInstance() : statistics),
-              desc.getCompilationUnit(),
-              new FileDataCache(desc.getFileContents()),
-              false);
+            Strings.isNullOrEmpty(config.getOutputPath())
+                ? System.out
+                : new BufferedOutputStream(new FileOutputStream(config.getOutputPath()));
+        FactEmitter emitter = new StreamFactEmitter(stream)) {
+
+      // java_indexer compilation-file+
+      for (String compilationPath : config.getCompilation()) {
+        if (compilationPath.endsWith(IndexInfoUtils.KZIP_FILE_EXT)) {
+          // java_indexer kzip-file
+          boolean foundCompilation = false;
+          try {
+            KZip.Reader reader = new KZipReader(new File(compilationPath));
+            for (IndexedCompilation indexedCompilation : reader.scan()) {
+              foundCompilation = true;
+              CompilationDescription desc =
+                  IndexInfoUtils.indexedCompilationToCompilationDescription(
+                      indexedCompilation, reader);
+              analyzeCompilation(config, plugins, statistics, desc, emitter);
+            }
+          } catch (KZipException e) {
+            throw new IllegalArgumentException("Unable to read kzip", e);
+          }
+          if (!config.getIgnoreEmptyKZip() && !foundCompilation) {
+            throw new IllegalArgumentException(
+                "given empty .kzip file \"" + compilationPath + "\"; try --ignore_empty_kzip");
+          }
+        } else {
+          // java_indexer kindex-file
+          logger.atWarning().atMostEvery(1, TimeUnit.DAYS).log(
+              ".kindex files are deprecated; "
+                  + "use kzip files instead: https://kythe.io/docs/kythe-kzip.html");
+          try {
+            CompilationDescription desc = IndexInfoUtils.readKindexInfoFromFile(compilationPath);
+            analyzeCompilation(config, plugins, statistics, desc, emitter);
+          } catch (EOFException e) {
+            if (config.getIgnoreEmptyKIndex()) {
+              return;
+            }
+            throw new IllegalArgumentException(
+                "given empty .kindex file \"" + compilationPath + "\"; try --ignore_empty_kindex",
+                e);
+          }
+        }
+      }
     }
 
     if (statistics != null) {
@@ -90,73 +144,100 @@ public class JavaIndexer {
     }
   }
 
-  private static void usage(int exitCode) {
-    System.err.println(
-        "usage: java_indexer [--print_statistics] kindex-file\n"
-            + "       java_indexer [--print_statistics] --index_pack=archive-root unit-key");
-    System.exit(exitCode);
-  }
-
-  /** {@link FactEmitter} directly streaming to an {@link OutputValueStream}. */
-  private static class StreamFactEmitter implements FactEmitter {
-    private final OutputStream stream;
-
-    public StreamFactEmitter(OutputStream stream) {
-      this.stream = stream;
+  private static void analyzeCompilation(
+      StandaloneConfig config,
+      List<Supplier<Plugin>> plugins,
+      StatisticsCollector statistics,
+      CompilationDescription desc,
+      FactEmitter emitter)
+      throws AnalysisException, IOException {
+    if (!desc.getFileContents().iterator().hasNext()) {
+      // Skip empty compilations.
+      return;
     }
 
-    @Override
-    public void emit(
-        VName source, String edgeKind, VName target, String factName, byte[] factValue) {
-      Entry.Builder entry =
-          Entry.newBuilder()
-              .setSource(source)
-              .setFactName(factName)
-              .setFactValue(ByteString.copyFrom(factValue));
-      if (edgeKind != null) {
-        entry.setEdgeKind(edgeKind).setTarget(target);
-      }
+    MetadataLoaders metadataLoaders = new MetadataLoaders();
+    metadataLoaders.addLoader(
+        new ProtobufMetadataLoader(desc.getCompilationUnit(), config.getDefaultMetadataCorpus()));
+    metadataLoaders.addLoader(new KytheMetadataLoader());
 
-      try {
-        entry.build().writeDelimitedTo(stream);
-      } catch (IOException ioe) {
-        throw new RuntimeException(ioe);
-      }
-    }
+    KytheJavacAnalyzer analyzer =
+        new KytheJavacAnalyzer(
+            config,
+            emitter,
+            statistics == null ? NullStatisticsCollector.getInstance() : statistics,
+            metadataLoaders);
+    plugins.forEach(analyzer::registerPlugin);
+
+    Path tempPath =
+        Strings.isNullOrEmpty(config.getTemporaryDirectory())
+            ? null
+            : FileSystems.getDefault().getPath(config.getTemporaryDirectory());
+    new JavacAnalysisDriver(
+            ImmutableList.of(), config.getUseExperimentalPathFileManager(), tempPath)
+        .analyze(analyzer, desc.getCompilationUnit(), new FileDataCache(desc.getFileContents()));
   }
 
-  private static class StandaloneConfig extends IndexerConfig {
+  private static URL fileURL(String path) throws MalformedURLException {
+    return new File(path).toURI().toURL();
+  }
+
+  private static class StandaloneConfig extends JavaIndexerConfig {
     @Parameter(description = "<compilation to analyze>", required = true)
     private List<String> compilation = new ArrayList<>();
 
     @Parameter(
-      names = "--print_statistics",
-      description = "Print final analyzer statistics to stderr"
-    )
+        names = "--load_plugin",
+        description = "Load and execute each Kythe Plugin in the given .jar")
+    private String pluginJar;
+
+    @Parameter(
+        names = "--print_vnames",
+        description = "Print Kythe node VNames associated to each JCTree to stderr")
+    private boolean printVNames;
+
+    @Parameter(
+        names = "--print_statistics",
+        description = "Print final analyzer statistics to stderr")
     private boolean printStatistics;
 
     @Parameter(
-      names = {"--index_pack", "-index_pack"},
-      description = "Retrieve the specified compilation from the given index pack"
-    )
-    private String indexPackRoot;
+        names = "--ignore_empty_kindex",
+        description = "Ignore empty .kindex files; exit successfully with no output")
+    private boolean ignoreEmptyKIndex;
 
     @Parameter(
-      names = {"--out", "-out"},
-      description = "Write the entries to this file (or stdout if unspecified)"
-    )
+        names = "--ignore_empty_kzip",
+        description = "Ignore empty .kzip files; exit successfully with no output")
+    private boolean ignoreEmptyKZip;
+
+    @Parameter(
+        names = {"--out", "-out"},
+        description = "Write the entries to this file (or stdout if unspecified)")
     private String outputPath;
 
     public StandaloneConfig() {
       super("java-indexer");
     }
 
+    public final String getPlugin() {
+      return pluginJar;
+    }
+
+    public final boolean getPrintVNames() {
+      return printVNames;
+    }
+
     public final boolean getPrintStatistics() {
       return printStatistics;
     }
 
-    public final String getIndexPackRoot() {
-      return indexPackRoot;
+    public final boolean getIgnoreEmptyKIndex() {
+      return ignoreEmptyKIndex;
+    }
+
+    public final boolean getIgnoreEmptyKZip() {
+      return ignoreEmptyKZip;
     }
 
     public final String getOutputPath() {

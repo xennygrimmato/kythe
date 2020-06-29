@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,6 +39,9 @@ public class FileDataDirectory implements FileDataProvider {
 
   @Override
   public ListenableFuture<byte[]> startLookup(String path, String digest) {
+    if (path == null) {
+      return Futures.immediateFailedFuture(new IllegalArgumentException("path cannot be null"));
+    }
     try {
       return Futures.immediateFuture(
           Files.asByteSource(rootDirectory.resolve(path).toFile()).read());

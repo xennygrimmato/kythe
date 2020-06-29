@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,30 +16,39 @@
 
 package com.google.devtools.kythe.extractors.shared;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
+import com.google.common.collect.Streams;
 import com.google.devtools.kythe.proto.Storage.VName;
+import com.google.devtools.kythe.proto.Storage.VNameRewriteRule;
+import com.google.devtools.kythe.proto.Storage.VNameRewriteRules;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonDeserializationContext;
 import com.google.gson.JsonDeserializer;
 import com.google.gson.JsonElement;
-import com.google.gson.JsonParseException;
 import com.google.gson.reflect.TypeToken;
 import com.google.re2j.Matcher;
 import com.google.re2j.Pattern;
-import java.io.FileReader;
 import java.io.IOException;
 import java.lang.reflect.Type;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Stack;
+import java.util.stream.Collectors;
 
 /**
  * Utility for configuring base {@link VName}s to use for particular file paths. Useful for
  * populating the {@link VName}s for each required input in a {@link CompilationUnit}.
  *
- * JSON format:
- *   <pre>[
+ * <p>JSON format:
+ *
+ * <pre>[
  *     {
  *       "pattern": "pathRegex",
  *       "vname": {
@@ -52,7 +61,7 @@ import java.util.Stack;
  * The {@link VName} template values can contain markers such as @1@ or @2@ that will be replaced by
  * the first or second regex groups in the pathRegex.
  *
- * NOTE: regex syntax is RE2: https://code.google.com/p/re2/wiki/Syntax
+ * <p>NOTE: regex syntax is RE2: https://code.google.com/p/re2/wiki/Syntax
  */
 public class FileVNames {
   private static final Gson GSON =
@@ -64,8 +73,8 @@ public class FileVNames {
   private FileVNames(List<BaseFileVName> baseVNames) {
     Preconditions.checkNotNull(baseVNames);
     for (BaseFileVName b : baseVNames) {
-      Preconditions.checkNotNull(b.pattern, "pattern == null for base VName: " + b.vname);
-      Preconditions.checkNotNull(b.vname, "vname template == null for pattern: " + b.pattern);
+      Preconditions.checkNotNull(b.pattern, "pattern == null for base VName: %s", b.vname);
+      Preconditions.checkNotNull(b.vname, "vname template == null for pattern: %s", b.pattern);
     }
     this.baseVNames = baseVNames;
   }
@@ -80,13 +89,45 @@ public class FileVNames {
             new BaseFileVName(Pattern.compile(".*"), new VNameTemplate(corpus, null, null))));
   }
 
+  /** Returns a {@link FileVNames} parsed from the given JSON-encoded file. */
   public static FileVNames fromFile(String configFile) throws IOException {
-    return new FileVNames(
-        GSON.<List<BaseFileVName>>fromJson(new FileReader(configFile), CONFIG_TYPE));
+    return fromFile(Paths.get(configFile));
   }
 
+  /** Returns a {@link FileVNames} parsed from the given JSON-encoded file. */
+  public static FileVNames fromFile(Path configFile) throws IOException {
+    return new FileVNames(
+        GSON.<List<BaseFileVName>>fromJson(
+            Files.newBufferedReader(configFile, UTF_8), CONFIG_TYPE));
+  }
+
+  /** Returns a {@link FileVNames} parsed from the given JSON-encoded {@link String}. */
   public static FileVNames fromJson(String json) {
     return new FileVNames(GSON.<List<BaseFileVName>>fromJson(json, CONFIG_TYPE));
+  }
+
+  /**
+   * Returns an equivalent {@link FileVNames} from the given sequence of {@link VNameRewriteRule}s.
+   */
+  public static FileVNames fromProto(VNameRewriteRules rules) {
+    return fromProto(rules.getRuleList());
+  }
+
+  /**
+   * Returns an equivalent {@link FileVNames} from the given sequence of {@link VNameRewriteRule}s.
+   */
+  public static FileVNames fromProto(Iterable<VNameRewriteRule> rules) {
+    return new FileVNames(
+        Streams.stream(rules)
+            .map(
+                r ->
+                    new BaseFileVName(
+                        Pattern.compile(r.getPattern()),
+                        new VNameTemplate(
+                            Strings.emptyToNull(r.getVName().getCorpus()),
+                            Strings.emptyToNull(r.getVName().getRoot()),
+                            Strings.emptyToNull(r.getVName().getPath()))))
+            .collect(Collectors.toList()));
   }
 
   /**
@@ -105,6 +146,26 @@ public class FileVNames {
     return VName.getDefaultInstance();
   }
 
+  /** Returns an equivalent {@link VNameRewriteRules}. */
+  public VNameRewriteRules toProto() {
+    return VNameRewriteRules.newBuilder()
+        .addAllRule(
+            baseVNames.stream()
+                .map(
+                    b ->
+                        VNameRewriteRule.newBuilder()
+                            .setPattern(b.pattern.toString())
+                            .setVName(
+                                VName.newBuilder()
+                                    .setCorpus(Strings.nullToEmpty(b.vname.corpus))
+                                    .setRoot(Strings.nullToEmpty(b.vname.root))
+                                    .setPath(Strings.nullToEmpty(b.vname.path))
+                                    .build())
+                            .build())
+                .collect(Collectors.toList()))
+        .build();
+  }
+
   /** Base {@link VName} to use for files matching {@code pattern}. */
   private static class BaseFileVName {
     public final Pattern pattern;
@@ -114,16 +175,28 @@ public class FileVNames {
       this.pattern = pattern;
       this.vname = vname;
     }
+
+    // GSON-required no-args constructor.
+    private BaseFileVName() {
+      this(null, null);
+    }
   }
 
   /** Subset of a {@link VName} with built-in templating '@<num>@' markers. */
   private static class VNameTemplate {
-    private final String corpus, root, path;
+    private final String corpus;
+    private final String root;
+    private final String path;
 
     public VNameTemplate(String corpus, String root, String path) {
       this.corpus = corpus;
       this.root = root;
       this.path = path;
+    }
+
+    // GSON-required no-args constructor.
+    private VNameTemplate() {
+      this(null, null, null);
     }
 
     /**
@@ -148,7 +221,7 @@ public class FileVNames {
 
     private static String fillIn(String tmpl, Matcher m) {
       Matcher replacers = replacerMatcher.matcher(tmpl);
-      Stack<ReplacementMarker> matches = new Stack<ReplacementMarker>();
+      Stack<ReplacementMarker> matches = new Stack<>();
       while (replacers.find()) {
         matches.push(
             new ReplacementMarker(
@@ -170,7 +243,9 @@ public class FileVNames {
 
   /** Representation of a '@n@' marker's span and integer parse of 'n'. */
   private static class ReplacementMarker {
-    final int start, end, grp;
+    final int start;
+    final int end;
+    final int grp;
 
     ReplacementMarker(int start, int end, int grp) {
       this.start = start;
@@ -181,8 +256,7 @@ public class FileVNames {
 
   private static class PatternDeserializer implements JsonDeserializer<Pattern> {
     @Override
-    public Pattern deserialize(JsonElement json, Type typeOfT, JsonDeserializationContext context)
-        throws JsonParseException {
+    public Pattern deserialize(JsonElement json, Type typeOfT, JsonDeserializationContext context) {
       return Pattern.compile(json.getAsJsonPrimitive().getAsString());
     }
   }

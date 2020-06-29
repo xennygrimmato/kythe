@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Google Inc. All rights reserved.
+ * Copyright 2016 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,13 +17,12 @@
 // Package reduce provides a simple interface for transforming a stream of
 // inputs.  Currently, other than utility functions/interfaces, the only
 // transformation available is Sort.
-package reduce
+package reduce // import "kythe.io/kythe/go/util/reduce"
 
 import (
+	"context"
 	"io"
 	"sync"
-
-	"golang.org/x/net/context"
 )
 
 // A Reducer transforms one stream of values into another stream of values.

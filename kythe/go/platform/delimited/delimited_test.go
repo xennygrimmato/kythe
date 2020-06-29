@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -68,7 +68,7 @@ func TestGoodWriter(t *testing.T) {
 			t.Errorf("Put %q: unexpected error: %v", record, err)
 		}
 	}
-	if got := string(w.Bytes()); got != testData {
+	if got := w.String(); got != testData {
 		t.Errorf("Writer result: got %q, want %q", got, testData)
 	}
 }

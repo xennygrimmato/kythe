@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Google Inc. All rights reserved.
+ * Copyright 2016 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -27,17 +28,18 @@ import (
 	"io"
 	"log"
 	"os"
-	"reflect"
 	"strconv"
 	"strings"
 
 	"kythe.io/kythe/go/storage/leveldb"
 	"kythe.io/kythe/go/util/flagutil"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 
-	_ "kythe.io/kythe/proto/serving_proto"
-	_ "kythe.io/kythe/proto/storage_proto"
+	_ "kythe.io/kythe/proto/serving_go_proto"
+	_ "kythe.io/kythe/proto/storage_go_proto"
 )
 
 var (
@@ -63,11 +65,12 @@ func main() {
 		flagutil.UsageError("Missing path to LevelDB")
 	}
 
-	var protoValueType reflect.Type
+	var protoValueType protoreflect.MessageType
 	if *protoValue != "" {
-		protoValueType = proto.MessageType(*protoValue)
-		if protoValueType == nil {
-			flagutil.UsageErrorf("could not understand protocol buffer type: %q", *protoValue)
+		var err error
+		protoValueType, err = protoregistry.GlobalTypes.FindMessageByName(protoreflect.FullName(*protoValue))
+		if err != nil {
+			flagutil.UsageErrorf("could not understand protocol buffer type: %q: %v", *protoValue, err)
 		}
 	}
 
@@ -76,17 +79,18 @@ func main() {
 		en = json.NewEncoder(os.Stdout)
 	}
 
+	ctx := context.Background()
 	for _, path := range flag.Args() {
 		func() {
 			db, err := leveldb.Open(path, nil)
 			if err != nil {
 				log.Fatalf("Error opening %q: %v", path, err)
 			}
-			defer db.Close()
+			defer db.Close(ctx)
 
-			it, err := db.ScanPrefix([]byte(*keyPrefix), nil)
+			it, err := db.ScanPrefix(ctx, []byte(*keyPrefix), nil)
 			if err != nil {
-				log.Fatalf("Error creating iterator for %q: v", path, err)
+				log.Fatalf("Error creating iterator for %q: %v", path, err)
 			}
 			defer it.Close()
 
@@ -112,7 +116,7 @@ func main() {
 						v = base64.StdEncoding.EncodeToString(val)
 					}
 				} else {
-					p := reflect.New(protoValueType.Elem()).Interface().(proto.Message)
+					p := protoValueType.New().Interface()
 					if err := proto.Unmarshal(val, p); err != nil {
 						log.Fatalf("Error unmarshaling value to %q: %v", *protoValue, err)
 					}

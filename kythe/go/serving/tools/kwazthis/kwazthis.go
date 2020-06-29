@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,9 +32,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -43,16 +43,20 @@ import (
 	"strings"
 
 	"kythe.io/kythe/go/platform/vfs"
+	"kythe.io/kythe/go/services/graph"
 	"kythe.io/kythe/go/services/xrefs"
 	"kythe.io/kythe/go/serving/api"
 	"kythe.io/kythe/go/util/flagutil"
 	"kythe.io/kythe/go/util/kytheuri"
 	"kythe.io/kythe/go/util/schema"
+	"kythe.io/kythe/go/util/schema/edges"
+	"kythe.io/kythe/go/util/schema/facts"
+	"kythe.io/kythe/go/util/schema/tickets"
 
-	"golang.org/x/net/context"
-
-	spb "kythe.io/kythe/proto/storage_proto"
-	xpb "kythe.io/kythe/proto/xref_proto"
+	cpb "kythe.io/kythe/proto/common_go_proto"
+	gpb "kythe.io/kythe/proto/graph_go_proto"
+	spb "kythe.io/kythe/proto/storage_go_proto"
+	xpb "kythe.io/kythe/proto/xref_go_proto"
 )
 
 func init() {
@@ -97,7 +101,10 @@ var (
 	skipDefinitions = flag.Bool("skip_defs", false, "Skip listing definitions for each node")
 )
 
-var xs xrefs.Service
+var (
+	xs xrefs.Service
+	gs graph.Service
+)
 
 type definition struct {
 	File  *spb.VName `json:"file"`
@@ -125,8 +132,8 @@ type reference struct {
 }
 
 var (
-	definedAtEdge        = schema.MirrorEdge(schema.DefinesEdge)
-	definedBindingAtEdge = schema.MirrorEdge(schema.DefinesBindingEdge)
+	definedAtEdge        = edges.Mirror(edges.Defines)
+	definedBindingAtEdge = edges.Mirror(edges.DefinesBinding)
 )
 
 func main() {
@@ -139,8 +146,9 @@ func main() {
 		flagutil.UsageError("must provide --path")
 	}
 
-	defer (*apiFlag).Close()
+	defer (*apiFlag).Close(ctx)
 	xs = *apiFlag
+	gs = *apiFlag
 
 	relPath := *path
 	if *localRepoRoot != "NONE" {
@@ -167,7 +175,7 @@ func main() {
 	}
 
 	fileTicket := (&kytheuri.URI{Corpus: *corpus, Root: *root, Path: relPath}).String()
-	point := &xpb.Location_Point{
+	point := &cpb.Point{
 		ByteOffset:   int32(*offset),
 		LineNumber:   int32(*lineNumber),
 		ColumnOffset: int32(*columnOffset),
@@ -177,26 +185,25 @@ func main() {
 		Location: &xpb.Location{
 			Ticket: fileTicket,
 			Kind:   xpb.Location_SPAN,
-			Start:  point,
-			End:    point,
+			Span:   &cpb.Span{Start: point, End: point},
 		},
 		SpanKind:    xpb.DecorationsRequest_AROUND_SPAN,
 		References:  true,
 		SourceText:  true,
 		DirtyBuffer: dirtyBuffer,
 		Filter: []string{
-			schema.NodeKindFact,
-			schema.SubkindFact,
+			facts.NodeKind,
+			facts.Subkind,
 		},
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	nodes := xrefs.NodesMap(decor.Nodes)
+	nodes := graph.NodesMap(decor.Nodes)
 
 	en := json.NewEncoder(os.Stdout)
 	for _, ref := range decor.Reference {
-		start, end := int(ref.AnchorStart.ByteOffset), int(ref.AnchorEnd.ByteOffset)
+		start, end := int(ref.Span.Start.ByteOffset), int(ref.Span.End.ByteOffset)
 
 		var r reference
 		r.Span.Start = start
@@ -204,22 +211,22 @@ func main() {
 		if len(dirtyBuffer) > 0 {
 			r.Span.Text = string(dirtyBuffer[start:end])
 		} // TODO(schroederc): add option to get anchor text from DecorationsReply
-		r.Kind = strings.TrimPrefix(ref.Kind, schema.EdgePrefix)
+		r.Kind = strings.TrimPrefix(ref.Kind, edges.Prefix)
 		r.Node.Ticket = ref.TargetTicket
 
 		node := nodes[ref.TargetTicket]
-		r.Node.Kind = string(node[schema.NodeKindFact])
-		r.Node.Subkind = string(node[schema.SubkindFact])
+		r.Node.Kind = string(node[facts.NodeKind])
+		r.Node.Subkind = string(node[facts.Subkind])
 
 		// TODO(schroederc): use CrossReferences method
-		if eReply, err := xrefs.AllEdges(ctx, xs, &xpb.EdgesRequest{
+		if eReply, err := graph.AllEdges(ctx, gs, &gpb.EdgesRequest{
 			Ticket: []string{ref.TargetTicket},
-			Kind:   []string{schema.NamedEdge, schema.TypedEdge, definedAtEdge, definedBindingAtEdge},
+			Kind:   []string{edges.Named, edges.Typed, definedAtEdge, definedBindingAtEdge},
 		}); err != nil {
 			log.Printf("WARNING: error getting edges for %q: %v", ref.TargetTicket, err)
 		} else {
-			edges := xrefs.EdgesMap(eReply.EdgeSets)[ref.TargetTicket]
-			for name := range edges[schema.NamedEdge] {
+			matching := graph.EdgesMap(eReply.EdgeSets)[ref.TargetTicket]
+			for name := range matching[edges.Named] {
 				if uri, err := kytheuri.Parse(name); err != nil {
 					log.Printf("WARNING: named node ticket (%q) could not be parsed: %v", name, err)
 				} else {
@@ -227,15 +234,15 @@ func main() {
 				}
 			}
 
-			for typed := range edges[schema.TypedEdge] {
+			for typed := range matching[edges.Typed] {
 				r.Node.Typed = typed
 				break
 			}
 
 			if !*skipDefinitions {
-				defs := edges[definedAtEdge]
+				defs := matching[definedAtEdge]
 				if len(defs) == 0 {
-					defs = edges[definedBindingAtEdge]
+					defs = matching[definedBindingAtEdge]
 				}
 				for defAnchor := range defs {
 					def, err := completeDefinition(defAnchor)
@@ -255,45 +262,33 @@ func main() {
 }
 
 func completeDefinition(defAnchor string) (*definition, error) {
-	parentReply, err := xrefs.AllEdges(ctx, xs, &xpb.EdgesRequest{
+	parentFile, err := tickets.AnchorFile(defAnchor)
+	if err != nil {
+		return nil, err
+	}
+	parent, err := kytheuri.Parse(parentFile)
+	if err != nil {
+		return nil, err
+	}
+	locReply, err := gs.Nodes(ctx, &gpb.NodesRequest{
 		Ticket: []string{defAnchor},
-		Kind:   []string{schema.ChildOfEdge},
-		Filter: []string{schema.NodeKindFact, schema.AnchorLocFilter},
+		Filter: []string{schema.AnchorLocFilter},
 	})
 	if err != nil {
 		return nil, err
 	}
-
-	parentNodes := xrefs.NodesMap(parentReply.Nodes)
-	var files []string
-	for parent := range xrefs.EdgesMap(parentReply.EdgeSets)[defAnchor][schema.ChildOfEdge] {
-		if string(parentNodes[parent][schema.NodeKindFact]) == schema.FileKind {
-			files = append(files, parent)
-		}
-	}
-
-	if len(files) == 0 {
-		return nil, nil
-	} else if len(files) > 1 {
-		return nil, fmt.Errorf("anchor has multiple file parents %q: %v", defAnchor, files)
-	}
-
-	vName, err := kytheuri.Parse(files[0])
-	if err != nil {
-		return nil, err
-	}
-	start, end := parseAnchorSpan(parentNodes[defAnchor])
-
+	nodes := graph.NodesMap(locReply.Nodes)
+	start, end := parseAnchorSpan(nodes[defAnchor])
 	return &definition{
-		File:  vName.VName(),
+		File:  parent.VName(),
 		Start: start,
 		End:   end,
 	}, nil
 }
 
 func parseAnchorSpan(anchor map[string][]byte) (start int, end int) {
-	start, _ = strconv.Atoi(string(anchor[schema.AnchorStartFact]))
-	end, _ = strconv.Atoi(string(anchor[schema.AnchorEndFact]))
+	start, _ = strconv.Atoi(string(anchor[facts.AnchorStart]))
+	end, _ = strconv.Atoi(string(anchor[facts.AnchorEnd]))
 	return
 }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Stopwatch;
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
-import com.google.devtools.kythe.common.FormattingLogger;
+import com.google.common.flogger.FluentLogger;
 import com.google.devtools.kythe.platform.shared.AnalysisException;
 import com.google.devtools.kythe.platform.shared.FileDataProvider;
 import com.google.devtools.kythe.platform.shared.NullStatisticsCollector;
@@ -31,11 +31,12 @@ import com.google.devtools.kythe.proto.Analysis.CompilationUnit;
 import com.google.devtools.kythe.proto.Storage.Entry;
 import com.google.devtools.kythe.proto.Storage.VName;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.TextFormat;
+import java.util.Optional;
 
 /** Abstract CompilationAnalyzer that handles common boilerplate code. */
 public abstract class AbstractCompilationAnalyzer {
-  private static final FormattingLogger logger =
-      FormattingLogger.getLogger(AbstractCompilationAnalyzer.class);
+  private static final FluentLogger logger = FluentLogger.forEnclosingClass();
 
   private final StatisticsCollector statistics;
 
@@ -52,18 +53,28 @@ public abstract class AbstractCompilationAnalyzer {
    * Analyzes the given {@link AnalysisRequest}, emitting all facts with the given {@link
    * FactEmitter}.
    */
-  public void analyzeRequest(AnalysisRequest req, FactEmitter emitter) throws AnalysisException {
+  public void analyzeRequest(AnalysisRequest req, FactEmitter emitter)
+      throws AnalysisException, InterruptedException {
     Preconditions.checkNotNull(req, "AnalysisRequest must be non-null");
     Stopwatch timer = Stopwatch.createStarted();
     try (FileDataProvider fileData = parseFileDataService(req.getFileDataService())) {
-      analyzeCompilation(req.getCompilation(), fileData, emitter);
+      String revision = req.getRevision();
+      if (revision.isEmpty()) {
+        revision = null;
+      }
+      logger.atInfo().log(
+          "Analyzing compilation: {%s}",
+          TextFormat.shortDebugString(req.getCompilation().getVName()));
+      analyzeCompilation(req.getCompilation(), Optional.ofNullable(revision), fileData, emitter);
+    } catch (InterruptedException e) {
+      throw e;
     } catch (Throwable t) {
-      logger.warningfmt("Uncaught exception: %s", t);
+      logger.atWarning().withCause(t).log("Uncaught exception");
       t.printStackTrace();
       Throwables.propagateIfInstanceOf(t, AnalysisException.class);
       throw new AnalysisException(t);
     } finally {
-      logger.infofmt("Analysis completed in %s", timer.stop());
+      logger.atInfo().log("Analysis completed in %s", timer.stop());
     }
   }
 
@@ -83,8 +94,11 @@ public abstract class AbstractCompilationAnalyzer {
    * {@link FileDataProvider} and {@link FactEmitter} should no longer be used.
    */
   protected abstract void analyzeCompilation(
-      CompilationUnit compilationUnit, FileDataProvider fileDataProvider, FactEmitter emitter)
-      throws AnalysisException;
+      CompilationUnit compilationUnit,
+      Optional<String> revision,
+      FileDataProvider fileDataProvider,
+      FactEmitter emitter)
+      throws AnalysisException, InterruptedException;
 
   /**
    * {@link FactEmitter} that emits an {@link AnalysisOutput} with an embedded {@link Entry} for

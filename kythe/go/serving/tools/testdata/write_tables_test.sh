@@ -1,6 +1,6 @@
-#!/bin/bash -e
-set -o pipefail
-# Copyright 2016 Google Inc. All rights reserved.
+#!/bin/bash
+set -eo pipefail
+# Copyright 2016 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,34 +14,52 @@ set -o pipefail
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-TMPDIR=${TMPDIR:-/tmp}
+readonly TABLE="$TEST_TMPDIR/serving_table"
 
-jq=third_party/jq/jq
-root=kythe/go/serving/tools/testdata
+scan() {
+  local out="$TABLE.${1%:}.json"
+  echo -n "$out: " >&2
+  "$scan_leveldb" --prefix $1 --proto_value $2 --json "$TABLE" | \
+    tee >(wc -l >&2) | \
+    "$jq" -S . > "$out"
+}
+
+entries2tables() {
+  local ENTRIES="$1"
+  local OUT="$2"
+
+  gunzip -c "$ENTRIES" | \
+    "$entrystream" --unique | \
+    "$write_tables" --max_page_size 75 --entries - --out "$OUT"
+}
 
 echo "Building new serving table"
-$root/entries2tables kythe/testdata/entries.gz "$TMPDIR/serving_table"
+entries2tables kythe/testdata/entries.gz "$TABLE"
 
 echo "Splitting serving data in JSON"
-$root/debug_serving.sh "$TMPDIR/serving_table"
+scan edgeSets:  kythe.proto.serving.PagedEdgeSet
+scan edgePages: kythe.proto.serving.EdgePage
+scan xrefs:     kythe.proto.serving.PagedCrossReferences
+scan xrefPages: kythe.proto.serving.PagedCrossReferences.Page
+scan decor:     kythe.proto.serving.FileDecorations
 
 check_diff() {
   local table="serving_table.$1.json"
   local gold="kythe/testdata/$table"
-  local new="$TMPDIR/$table"
-  gzip -kd "$gold.gz"
+  local new="$TEST_TMPDIR/$table"
+  gzip -kdf "$gold.gz"
 
   echo
   if ! diff -q "$gold" "$new"; then
-    $jq .key "$gold" > "$TMPDIR/gold.keys"
-    $jq .key "$new" > "$TMPDIR/new.keys"
+    $jq .key "$gold" > "$TEST_TMPDIR/gold.keys"
+    $jq .key "$new" > "$TEST_TMPDIR/new.keys"
 
-    if ! diff -u "$TMPDIR/"{gold,new}.keys | diffstat -qm; then
+    if ! diff -u "$TEST_TMPDIR/"{gold,new}.keys | diffstat -qm; then
       echo "  Key samples:"
       echo "    Unique to gold:"
-      comm -23 "$TMPDIR/"{gold,new}.keys | sort -R | head -n3
+      comm -23 "$TEST_TMPDIR/"{gold,new}.keys | sort -R | head -n3
       echo "    Unique to new:"
-      comm -13 "$TMPDIR/"{gold,new}.keys | sort -R | head -n3
+      comm -13 "$TEST_TMPDIR/"{gold,new}.keys | sort -R | head -n3
     fi
 
     echo "  Key-value samples:"

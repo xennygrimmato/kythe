@@ -14,6 +14,8 @@
 // This file uses the Clang style conventions.
 #include "cxx_extractor_preprocessor_utils.h"
 
+#include <set>
+
 #include "clang/Lex/Preprocessor.h"
 
 namespace kythe {
@@ -29,7 +31,7 @@ std::string getMacroUnexpandedString(clang::SourceRange Range,
   if (MI->isFunctionLike()) {
     clang::SourceLocation EndLoc(Range.getEnd());
     const char *EndPtr = PP.getSourceManager().getCharacterData(EndLoc) + 1;
-    Length = (EndPtr - BeginPtr) + 1; // +1 is ')' width.
+    Length = (EndPtr - BeginPtr) + 1;  // +1 is ')' width.
   } else
     Length = MacroName.size();
   return llvm::StringRef(BeginPtr, Length).trim().str();
@@ -48,11 +50,11 @@ std::string getMacroExpandedStringInternal(
   typedef clang::MacroInfo::tokens_iterator Iter;
   for (Iter I = MI->tokens_begin(), E = MI->tokens_end(); I != E; ++I) {
     clang::IdentifierInfo *II = I->getIdentifierInfo();
-    int ArgNo = (II && Args ? MI->getArgumentNum(II) : -1);
+    int ArgNo = (II && Args ? MI->getParameterNum(II) : -1);
     if (ArgNo == -1) {
       // This isn't an argument, just add it.
       if (II == nullptr)
-        Expanded += PP.getSpelling((*I)); // Not an identifier.
+        Expanded += PP.getSpelling((*I));  // Not an identifier.
       else {
         // Token is for an identifier.
         std::string Name = II->getName().str();
@@ -71,19 +73,18 @@ std::string getMacroExpandedStringInternal(
     const clang::Token *ArgTok = Args->getUnexpArgument(ArgNo);
     if (Args->ArgNeedsPreexpansion(ArgTok, PP))
       ResultArgToks = &(const_cast<clang::MacroArgs *>(Args))
-                           ->getPreExpArgument(ArgNo, MI, PP)[0];
+                           ->getPreExpArgument(ArgNo, PP)[0];
     else
-      ResultArgToks = ArgTok; // Use non-preexpanded Tokens.
+      ResultArgToks = ArgTok;  // Use non-preexpanded Tokens.
     // If the arg token didn't expand into anything, ignore it.
-    if (ResultArgToks->is(clang::tok::eof))
-      continue;
+    if (ResultArgToks->is(clang::tok::eof)) continue;
     unsigned NumToks = clang::MacroArgs::getArgLength(ResultArgToks);
     // Append the resulting argument expansions.
     for (unsigned ArgumentIndex = 0; ArgumentIndex < NumToks; ++ArgumentIndex) {
       const clang::Token &AT = ResultArgToks[ArgumentIndex];
       clang::IdentifierInfo *II = AT.getIdentifierInfo();
       if (II == nullptr)
-        Expanded += PP.getSpelling(AT); // Not an identifier.
+        Expanded += PP.getSpelling(AT);  // Not an identifier.
       else {
         // It's an identifier.  Check for further expansion.
         std::string Name = II->getName().str();
@@ -108,18 +109,9 @@ std::string getMacroExpandedString(clang::Preprocessor &PP,
 }
 
 std::string getSourceString(clang::Preprocessor &PP, clang::SourceRange Range) {
-  clang::SourceLocation BeginLoc = Range.getBegin();
-  clang::SourceLocation EndLoc = Range.getEnd();
-  if (!BeginLoc.isValid() || !EndLoc.isValid() ||
-      BeginLoc.isFileID() != EndLoc.isFileID()) {
-    return llvm::StringRef();
-  }
-  const char *BeginPtr = PP.getSourceManager().getCharacterData(BeginLoc);
-  const char *EndPtr = PP.getSourceManager().getCharacterData(EndLoc);
-  if (BeginPtr > EndPtr) {
-    return llvm::StringRef();
-  }
-  size_t Length = EndPtr - BeginPtr;
-  return llvm::StringRef(BeginPtr, Length).trim().str();
+  return std::string(
+      clang::Lexer::getSourceText(clang::CharSourceRange(Range, false),
+                                  PP.getSourceManager(), PP.getLangOpts())
+          .trim());
 }
-}
+}  // namespace kythe

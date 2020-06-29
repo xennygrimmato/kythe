@@ -2,16 +2,13 @@
 // the default package.
 
 //- @DefaultPackage defines/binding Class
-//- Class named vname(".DefaultPackage","","","","java")
 //- !{ Class childof AnyPackage
 //-    AnyPackage.node/kind package }
 public class DefaultPackage {
 
-  //- @CONSTANT defines/binding ConstantField
-  //- ConstantField named vname(".DefaultPackage.CONSTANT","","","","java")
+  //- @CONSTANT defines/binding _ConstantField
   public static final String CONSTANT = "constantly unused... :-(";
 
-  //- @main defines/binding MainMethod
-  //- MainMethod named vname(".DefaultPackage.main(java.lang.String[])","","","","java")
+  //- @main defines/binding _MainMethod
   public static void main(String[] args) {}
 }

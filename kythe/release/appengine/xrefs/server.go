@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"time"
 
 	"kythe.io/kythe/go/services/filetree"
 	"kythe.io/kythe/go/services/xrefs"
@@ -38,26 +39,11 @@ import (
 var (
 	servingTable    = flag.String("serving_table", "/srv/table", "LevelDB serving table path")
 	publicResources = flag.String("public_resources", "/srv/public", "Path to directory of static resources to serve")
-	listeningAddr   = flag.String("listen", "localhost:8080", "Listening address for HTTP server")
+	listeningAddr   = flag.String("listen", "localhost:8080", "Listening address for HTTP server (:<port> allows access from any machine)")
 )
 
 func main() {
 	flag.Parse()
-
-	db, err := leveldb.Open(*servingTable, nil)
-	if err != nil {
-		log.Fatalf("Error opening db at %q: %v", *servingTable, err)
-	}
-	defer db.Close()
-	tbl := table.ProtoBatchParallel{&table.KVProto{db}}
-
-	ctx := context.Background()
-	xrefs.RegisterHTTPHandlers(ctx, xsrv.NewCombinedTable(tbl), http.DefaultServeMux)
-	filetree.RegisterHTTPHandlers(ctx, &ftsrv.Table{tbl, true}, http.DefaultServeMux)
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, filepath.Join(*publicResources, filepath.Clean(r.URL.Path)))
-	})
 
 	http.HandleFunc("/_ah/health", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "ok")
@@ -65,7 +51,33 @@ func main() {
 	http.HandleFunc("/_ah/start", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "sure, we'll start!")
 	})
+	http.HandleFunc("/liveness_check", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	})
 
 	log.Printf("Server listening on %q", *listeningAddr)
-	log.Fatal(http.ListenAndServe(*listeningAddr, nil))
+	go func() { log.Fatal(http.ListenAndServe(*listeningAddr, nil)) }()
+
+	start := time.Now()
+	ctx := context.Background()
+	db, err := leveldb.Open(*servingTable, nil)
+	if err != nil {
+		log.Fatalf("Error opening db at %q: %v", *servingTable, err)
+	}
+	defer db.Close(ctx)
+	tbl := &table.KVProto{db}
+	log.Printf("Serving data opened in %s", time.Since(start))
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, filepath.Join(*publicResources, filepath.Clean(r.URL.Path)))
+	})
+	xrefs.RegisterHTTPHandlers(ctx, xsrv.NewCombinedTable(tbl), http.DefaultServeMux)
+	filetree.RegisterHTTPHandlers(ctx, &ftsrv.Table{tbl, true}, http.DefaultServeMux)
+
+	http.HandleFunc("/readiness_check", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	})
+	log.Print("Server ready for traffic")
+
+	select {} // block forever
 }

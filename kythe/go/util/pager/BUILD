@@ -1,11 +1,18 @@
-load("//tools:build_rules/go.bzl", "go_package")
+load("//tools:build_rules/shims.bzl", "go_library", "go_test")
 
 package(default_visibility = ["//kythe:default_visibility"])
 
-go_package(
-    test_deps = ["//kythe/go/test/testutil"],
-    deps = [
-        "@go_x_net//:context",
-        "//kythe/go/util/sortutil",
-    ],
+go_library(
+    name = "pager",
+    srcs = ["pager.go"],
+    deps = ["//kythe/go/util/sortutil"],
+)
+
+go_test(
+    name = "pager_test",
+    size = "small",
+    srcs = ["pager_test.go"],
+    library = "pager",
+    visibility = ["//visibility:private"],
+    deps = ["//kythe/go/test/testutil"],
 )

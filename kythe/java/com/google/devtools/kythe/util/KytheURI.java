@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,26 +18,39 @@ package com.google.devtools.kythe.util;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
-import static com.google.common.base.Strings.emptyToNull;
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static com.google.common.base.Strings.nullToEmpty;
 
 import com.google.common.base.Joiner;
+import com.google.common.base.Splitter;
+import com.google.common.escape.Escaper;
+import com.google.common.net.PercentEscaper;
 import com.google.devtools.kythe.proto.Storage.VName;
 import java.io.Serializable;
-import java.net.URI;
-import java.net.URISyntaxException;
+import java.net.URLDecoder;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.Map;
 
 /**
- * {@link URI}/{@link String} realization of a {@link VName}.
+ * /{@link String} realization of a {@link VName}.
  *
- * Specification: //kythe/util/go/kytheuri/kythe-uri-spec.txt
+ * <p>Specification: //kythe/util/go/kytheuri/kythe-uri-spec.txt
  */
 public class KytheURI implements Serializable {
   private static final long serialVersionUID = 2726281203803801095L;
 
   public static final String SCHEME_LABEL = "kythe";
+  public static final String SCHEME = SCHEME_LABEL + ":";
   public static final KytheURI EMPTY = new KytheURI();
+
+  private static final String SAFE_CHARS = ".-_~";
+  private static final Escaper PATH_ESCAPER = new PercentEscaper(SAFE_CHARS + "/", false);
+  private static final Escaper ALL_ESCAPER = new PercentEscaper(SAFE_CHARS, false);
+  private static final Splitter SIGNATURE_SPLITTER = Splitter.on('#');
+  private static final Splitter.MapSplitter PARAMS_SPLITTER =
+      Splitter.on('?').withKeyValueSeparator("=");
+  private static final Splitter PATH_SPLITTER = Splitter.on('/');
 
   private final VName vName;
 
@@ -88,35 +101,6 @@ public class KytheURI implements Serializable {
     return vName.getLanguage();
   }
 
-  /**
-   * Returns an equivalent {@link URI}.
-   *
-   * @throw URISyntaxException when the corpus/path/root/language are all empty
-   */
-  public URI toURI() throws URISyntaxException {
-    String query =
-        Joiner.on("?")
-            .skipNulls()
-            .join(
-                attr("lang", vName.getLanguage()),
-                attr("path", vName.getPath()),
-                attr("root", vName.getRoot()));
-    String corpus = vName.getCorpus();
-    String authority = corpus, path = null;
-    int slash = corpus.indexOf('/');
-    if (slash != -1) {
-      authority = corpus.substring(0, slash);
-      path = corpus.substring(slash);
-    }
-    return new URI(
-            SCHEME_LABEL,
-            emptyToNull(authority),
-            path,
-            emptyToNull(query),
-            emptyToNull(vName.getSignature()))
-        .normalize();
-  }
-
   /** Returns an equivalent {@link VName}. */
   public VName toVName() {
     return vName;
@@ -124,20 +108,28 @@ public class KytheURI implements Serializable {
 
   @Override
   public String toString() {
-    if (vName.getCorpus().isEmpty()
-        && vName.getPath().isEmpty()
-        && vName.getRoot().isEmpty()
-        && vName.getLanguage().isEmpty()) {
-      // java.net.URI does not handle an empty scheme-specific-part well...
-      return vName.getSignature().isEmpty()
-          ? SCHEME_LABEL + ":"
-          : SCHEME_LABEL + ":#" + vName.getSignature();
+    StringBuilder b =
+        new StringBuilder(
+            SCHEME.length()
+                + "//?=?=?=#".length() // assume all punctuation is necessary
+                + getCorpus().length()
+                + getPath().length()
+                + getRoot().length()
+                + getLanguage().length()
+                + getSignature().length());
+    b.append(SCHEME);
+    if (!vName.getCorpus().isEmpty()) {
+      b.append("//");
+      b.append(PATH_ESCAPER.escape(vName.getCorpus()));
     }
-    try {
-      return toURI().toString().replace("+", "%2B");
-    } catch (URISyntaxException e) {
-      throw new IllegalArgumentException("URI failed to construct", e);
+    attr(b, "lang", ALL_ESCAPER.escape(vName.getLanguage()));
+    attr(b, "path", PATH_ESCAPER.escape(cleanPath(vName.getPath())));
+    attr(b, "root", PATH_ESCAPER.escape(vName.getRoot()));
+    if (!vName.getSignature().isEmpty()) {
+      b.append("#");
+      b.append(ALL_ESCAPER.escape(vName.getSignature()));
     }
+    return b.toString();
   }
 
   @Override
@@ -150,48 +142,90 @@ public class KytheURI implements Serializable {
     return this == o || (o instanceof KytheURI && vName.equals(((KytheURI) o).vName));
   }
 
-  /** Parses the given string to produce a new {@link KytheURI}. */
-  public static KytheURI parse(String str) throws URISyntaxException {
-    checkNotNull(str, "str must be non-null");
+  /** Returns an equivalent Kythe ticket for the given {@link VName}. */
+  public static String asString(VName vName) {
+    return new KytheURI(vName).toString();
+  }
 
-    // java.net.URI does not handle an empty scheme-specific-part well...
-    str = str.replaceFirst("^" + SCHEME_LABEL + ":([^/]|$)", SCHEME_LABEL + "://$1");
-    if (str.isEmpty() || str.equals(SCHEME_LABEL + "://")) {
+  /** Parses the given string to produce a new {@link KytheURI}. */
+  public static KytheURI parse(String str) {
+    checkNotNull(str, "str must be non-null");
+    if (str.isEmpty() || str.equals(SCHEME) || str.equals(SCHEME + "//")) {
       return EMPTY;
     }
+    String original = str;
 
-    URI uri = new URI(str).normalize();
-    checkArgument(
-        SCHEME_LABEL.equals(uri.getScheme()) || isNullOrEmpty(uri.getScheme()),
-        "URI Scheme must be " + SCHEME_LABEL + "; was " + uri.getScheme());
-    String root = null, path = null, lang = null;
-    if (!isNullOrEmpty(uri.getQuery())) {
-      for (String attr : uri.getQuery().split("\\?")) {
-        String[] keyValue = attr.split("=", 2);
-        if (keyValue.length != 2) {
-          throw new URISyntaxException(str, "Invalid query: " + uri.getQuery());
-        }
-        switch (keyValue[0]) {
-          case "lang":
-            lang = keyValue[1];
+    // Check for a scheme label.  This may be empty; but if present, it must be
+    // our expected scheme.
+    if (str.startsWith(SCHEME)) {
+      str = str.substring(SCHEME.length());
+    }
+
+    String signature = null;
+    String corpus = null;
+    String path = null;
+    String root = null;
+    String lang = null;
+
+    // Split corpus/attributes from signature.
+    Iterator<String> parts = SIGNATURE_SPLITTER.split(str).iterator();
+    String head = parts.next();
+    if (parts.hasNext()) {
+      signature = parts.next();
+    }
+    checkArgument(!parts.hasNext(), "URI has multiple fragments: %s", original);
+
+    // Remove corpus prefix from attributes.
+    int firstParam = head.indexOf('?');
+    firstParam = firstParam < 0 ? head.length() : firstParam;
+    if (head.startsWith("//")) {
+      corpus = head.substring(2, firstParam);
+      head = head.substring(firstParam);
+    } else {
+      checkArgument(firstParam == 0, "invalid URI scheme: %s", original);
+    }
+
+    // If there are any attributes, parse them.  We allow valid attributes to
+    // occur in any order, even if it is not canonical.
+    if (!head.isEmpty()) {
+      Map<String, String> params = PARAMS_SPLITTER.split(head.substring(1));
+
+      for (Map.Entry<String, String> e : params.entrySet()) {
+        switch (e.getKey()) {
+          case "path":
+            path = e.getValue();
             break;
           case "root":
-            root = keyValue[1];
+            root = e.getValue();
             break;
-          case "path":
-            path = keyValue[1];
+          case "lang":
+            lang = e.getValue();
             break;
           default:
-            throw new URISyntaxException(str, "Invalid query attribute: " + keyValue[0]);
+            checkArgument(false, "invalid attribute: %s (value: %s)", e.getKey(), e.getValue());
+            break;
         }
       }
     }
-    String signature = uri.getFragment();
-    String corpus =
-        ((uri.getHost() == null ? nullToEmpty(uri.getAuthority()) : nullToEmpty(uri.getHost()))
-                + nullToEmpty(uri.getPath()))
-            .replaceAll("/+$", "");
-    return new KytheURI(signature, corpus, root, path, lang);
+
+    return new KytheURI(
+        decode(signature), decode(corpus), decode(root), decode(path), decode(lang));
+  }
+
+  /** Parses the given Kythe ticket string to produce a new {@link VName}. */
+  public static VName parseVName(String ticket) {
+    return parse(ticket).toVName();
+  }
+
+  private static String decode(String str) {
+    if (isNullOrEmpty(str)) {
+      return null;
+    }
+    try {
+      return URLDecoder.decode(str.replace("+", "%2B"), "UTF-8");
+    } catch (java.io.UnsupportedEncodingException e) {
+      throw new RuntimeException(e);
+    }
   }
 
   /** Returns a new {@link KytheURI.Builder}. */
@@ -232,7 +266,32 @@ public class KytheURI implements Serializable {
     }
   }
 
-  private static String attr(String name, String value) {
-    return value.isEmpty() ? null : name + "=" + value;
+  private static void attr(StringBuilder b, String name, String value) {
+    if (value.isEmpty()) {
+      return;
+    }
+    b.append("?");
+    b.append(name);
+    b.append("=");
+    b.append(value);
+  }
+
+  /**
+   * Returns a lexically cleaned path, with repeated slashes and "." path components removed, and
+   * ".." path components rewound as far as possible without touching the filesystem.
+   */
+  private static String cleanPath(String path) {
+    ArrayList<String> clean = new ArrayList<>();
+    for (String part : PATH_SPLITTER.split(path)) {
+      if (part.isEmpty() || part.equals(".")) {
+        continue; // skip empty path components and "here" markers.
+      } else if (part.equals("..") && !clean.isEmpty()) {
+        clean.remove(clean.size() - 1);
+        continue; // back off if possible for "up" (..) markers.
+      } else {
+        clean.add(part);
+      }
+    }
+    return Joiner.on('/').join(clean);
   }
 }

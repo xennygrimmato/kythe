@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -118,6 +118,6 @@ class UsageAsInputReportingJavaFileObject implements JavaFileObject {
 
   @Override
   public String toString() {
-    return toUri().toString() + "@" + getKind().name();
+    return toUri() + "@" + getKind().name();
   }
 }

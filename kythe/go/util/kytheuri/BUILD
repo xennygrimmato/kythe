@@ -1,8 +1,29 @@
-load("//tools:build_rules/go.bzl", "go_package")
+load("//tools:build_rules/shims.bzl", "go_library", "go_test")
 
-package(default_visibility = ["//kythe:default_visibility"])
+# N.B. This package is given proto visibility although it is not a proto,
+# because it is impractical to use the Kythe protos without ticket support.
+package(default_visibility = ["//kythe:proto_visibility"])
 
-go_package(
-    test_deps = ["@go_protobuf//:proto"],
-    deps = ["//kythe/proto:storage_proto_go"],
+go_library(
+    name = "kytheuri",
+    srcs = [
+        "escape.go",
+        ":uri.go",
+    ],
+    deps = ["//kythe/proto:storage_go_proto"],
+)
+
+go_test(
+    name = "kytheuri_test",
+    size = "small",
+    srcs = [
+        "bench_test.go",
+        "uri_test.go",
+    ],
+    library = "kytheuri",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//kythe/proto:storage_go_proto",
+        "@org_golang_google_protobuf//proto:go_default_library",
+    ],
 )

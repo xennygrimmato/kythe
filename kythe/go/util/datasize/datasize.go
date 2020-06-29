@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
  */
 
 // Package datasize implements a type representing data sizes in bytes.
-package datasize
+package datasize // import "kythe.io/kythe/go/util/datasize"
 
 import (
 	"errors"
@@ -39,6 +39,11 @@ func Flag(name, value, description string) *Size {
 	f := &sizeFlag{sz}
 	flag.Var(f, name, description)
 	return &f.Size
+}
+
+// Get implements part of the flag.Getter interface.
+func (f *sizeFlag) Get() interface{} {
+	return f.Size
 }
 
 // Set implements part of the flag.Value interface.

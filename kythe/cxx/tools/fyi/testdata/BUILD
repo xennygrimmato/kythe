@@ -1,11 +1,19 @@
 package(default_visibility = ["//kythe:default_visibility"])
 
-sh_test(
-    name = "nothing",
-    size = "small",
-    srcs = [
-        "nothing_test.sh",
+load("//tools:build_rules/testing.bzl", "shell_tool_test")
+load(":compile_commands.bzl", "compile_commands")
+
+compile_commands(
+    name = "compile_commands",
+    filenames = [
+        "nothing.cc",
+        "basic.cc",
+        "hopeless.cc",
     ],
+)
+
+shell_tool_test(
+    name = "nothing",
     data = [
         "compile_commands.json.in",
         "nothing.cc",
@@ -13,20 +21,19 @@ sh_test(
         "nothing.cc.json",
         "test_case.sh",
         "//kythe/cxx/common/testdata:start_http_service",
-        "//kythe/cxx/tools/fyi",
-        "//kythe/go/platform/tools:entrystream",
-        "//kythe/go/serving/tools:write_tables",
-        "//kythe/go/storage/tools:write_entries",
-        "//kythe/go/test/tools:http_server",
     ],
+    scriptfile = "nothing_test.sh",
+    tools = {
+        "FYI": "//kythe/cxx/tools/fyi",
+        "KYTHE_ENTRYSTREAM": "//kythe/go/platform/tools/entrystream",
+        "KYTHE_HTTP_SERVER": "//kythe/go/test/tools:http_server",
+        "KYTHE_WRITE_ENTRIES": "//kythe/go/storage/tools:write_entries",
+        "KYTHE_WRITE_TABLES": "//kythe/go/serving/tools:write_tables",
+    },
 )
 
-sh_test(
+shell_tool_test(
     name = "basic",
-    size = "small",
-    srcs = [
-        "basic_test.sh",
-    ],
     data = [
         "basic.cc",
         "basic.cc.expected",
@@ -35,30 +42,33 @@ sh_test(
         "compile_commands.json.in",
         "test_case.sh",
         "//kythe/cxx/common/testdata:start_http_service",
-        "//kythe/cxx/tools/fyi",
-        "//kythe/go/platform/tools:entrystream",
-        "//kythe/go/serving/tools:write_tables",
-        "//kythe/go/storage/tools:write_entries",
-        "//kythe/go/test/tools:http_server",
     ],
+    scriptfile = "basic_test.sh",
+    tools = {
+        "FYI": "//kythe/cxx/tools/fyi",
+        "KYTHE_ENTRYSTREAM": "//kythe/go/platform/tools/entrystream",
+        "KYTHE_HTTP_SERVER": "//kythe/go/test/tools:http_server",
+        "KYTHE_WRITE_ENTRIES": "//kythe/go/storage/tools:write_entries",
+        "KYTHE_WRITE_TABLES": "//kythe/go/serving/tools:write_tables",
+    },
 )
 
-sh_test(
+shell_tool_test(
     name = "hopeless",
     size = "small",
-    srcs = [
-        "hopeless_test.sh",
-    ],
     data = [
         "compile_commands.json.in",
         "hopeless.cc",
         "hopeless.cc.json",
         "test_case.sh",
         "//kythe/cxx/common/testdata:start_http_service",
-        "//kythe/cxx/tools/fyi",
-        "//kythe/go/platform/tools:entrystream",
-        "//kythe/go/serving/tools:write_tables",
-        "//kythe/go/storage/tools:write_entries",
-        "//kythe/go/test/tools:http_server",
     ],
+    scriptfile = "hopeless_test.sh",
+    tools = {
+        "FYI": "//kythe/cxx/tools/fyi",
+        "KYTHE_ENTRYSTREAM": "//kythe/go/platform/tools/entrystream",
+        "KYTHE_HTTP_SERVER": "//kythe/go/test/tools:http_server",
+        "KYTHE_WRITE_ENTRIES": "//kythe/go/storage/tools:write_entries",
+        "KYTHE_WRITE_TABLES": "//kythe/go/serving/tools:write_tables",
+    },
 )

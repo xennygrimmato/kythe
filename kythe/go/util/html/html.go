@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
  */
 
 // Package html is a set of utilities for manipulating html Nodes.
-package html
+package html // import "kythe.io/kythe/go/util/html"
 
 import (
 	"bytes"
@@ -225,7 +225,7 @@ func copyNode(n *html.Node) *html.Node {
 func Zip(n *html.Node, path string) (*html.Node, error) {
 	for i, step := range path {
 		if n == nil {
-			return nil, fmt.Errorf("Ran into nil Node after %d steps: %q", i, path)
+			return nil, fmt.Errorf("ran into nil Node after %d steps: %q", i, path)
 		}
 		switch step {
 		case 'f':
@@ -239,7 +239,7 @@ func Zip(n *html.Node, path string) (*html.Node, error) {
 		case 'u':
 			n = n.Parent
 		default:
-			return nil, fmt.Errorf("Invalid zip path (%q) rune: %q", path, step)
+			return nil, fmt.Errorf("invalid zip path (%q) rune: %q", path, step)
 		}
 	}
 	return n, nil

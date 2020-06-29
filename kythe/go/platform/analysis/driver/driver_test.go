@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,25 +18,25 @@ package driver
 
 import (
 	"bytes"
+	"context"
 	"errors"
-	"io"
+	"fmt"
+	"strings"
 	"testing"
 
 	"kythe.io/kythe/go/platform/analysis"
 	"kythe.io/kythe/go/test/testutil"
 
-	"golang.org/x/net/context"
-
-	apb "kythe.io/kythe/proto/analysis_proto"
-	spb "kythe.io/kythe/proto/storage_proto"
+	apb "kythe.io/kythe/proto/analysis_go_proto"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
 type mock struct {
 	t *testing.T
 
-	idx          int
-	Compilations []*apb.CompilationUnit
+	idx int
 
+	Compilations []Compilation
 	Outputs      []*apb.AnalysisOutput
 	AnalyzeError error
 	OutputError  error
@@ -59,6 +59,8 @@ func (m *mock) out() analysis.OutputFunc {
 	}
 }
 
+const buildID = "aabbcc"
+
 // Analyze implements the analysis.CompilationAnalyzer interface.
 func (m *mock) Analyze(ctx context.Context, req *apb.AnalysisRequest, out analysis.OutputFunc) error {
 	m.OutputIndex = 0
@@ -72,48 +74,66 @@ func (m *mock) Analyze(ctx context.Context, req *apb.AnalysisRequest, out analys
 	if m.OutputIndex != len(m.Outputs) {
 		m.t.Errorf("Expected OutputIndex: %d; found: %d", len(m.Outputs), m.OutputIndex)
 	}
+	if req.BuildId != buildID {
+		m.t.Errorf("Missing build ID")
+	}
 	return m.AnalyzeError
 }
 
 // Next implements the Queue interface.
 func (m *mock) Next(ctx context.Context, f CompilationFunc) error {
 	if m.idx >= len(m.Compilations) {
-		return io.EOF
+		return ErrEndOfQueue
 	}
 	err := f(ctx, m.Compilations[m.idx])
 	m.idx++
 	return err
 }
 
-const fdsAddr = "TEST FDS ADDR"
+// A testContext implements the Context interface through local functions.
+// The default implementations are no-ops without error.
+type testContext struct {
+	setup         func(context.Context, Compilation) error
+	teardown      func(context.Context, Compilation) error
+	analysisError func(context.Context, Compilation, error) error
+}
+
+func (t testContext) Setup(ctx context.Context, unit Compilation) error {
+	if t.setup != nil {
+		return t.setup(ctx, unit)
+	}
+	return nil
+}
+
+func (t testContext) Teardown(ctx context.Context, unit Compilation) error {
+	if t.teardown != nil {
+		return t.teardown(ctx, unit)
+	}
+	return nil
+}
+
+func (t testContext) AnalysisError(ctx context.Context, unit Compilation, err error) error {
+	if t.analysisError != nil {
+		return t.analysisError(ctx, unit, err)
+	}
+	return nil
+}
 
 func TestDriverInvalid(t *testing.T) {
 	m := &mock{t: t}
-	tests := []*Driver{
-		{},
-		{Analyzer: m},
-		{Compilations: m},
-		{Output: m.out()},
-		{Analyzer: m, Compilations: m},
-		{Analyzer: m, Output: m.out()},
-		{Compilations: m, Output: m.out()},
-	}
-
-	for _, d := range tests {
-		if err := d.Run(context.Background()); err == nil {
-			t.Fatalf("Did not receive expected error from %#v.Run(ctx)", d)
-		}
+	test := new(Driver)
+	if err := test.Run(context.Background(), m); err == nil {
+		t.Errorf("Expected error from %#v.Run but got none", test)
 	}
 }
 
 func TestDriverEmpty(t *testing.T) {
 	m := &mock{t: t}
 	d := &Driver{
-		Analyzer:     m,
-		Compilations: m,
-		Output:       m.out(),
+		Analyzer:    m,
+		WriteOutput: m.out(),
 	}
-	testutil.FatalOnErrT(t, "Driver error: %v", d.Run(context.Background()))
+	testutil.FatalOnErrT(t, "Driver error: %v", d.Run(context.Background(), m))
 	if len(m.Requests) != 0 {
 		t.Fatalf("Unexpected AnalysisRequests: %v", m.Requests)
 	}
@@ -127,22 +147,28 @@ func TestDriver(t *testing.T) {
 	}
 	var setupIdx, teardownIdx int
 	d := &Driver{
-		Analyzer:     m,
-		Compilations: m,
-		Output:       m.out(),
-		Setup: func(_ context.Context, cu *apb.CompilationUnit) error {
-			setupIdx++
-			return nil
-		},
-		Teardown: func(_ context.Context, cu *apb.CompilationUnit) error {
-			if setupIdx != teardownIdx+1 {
-				t.Error("Teardown was not called directly after Setup/Analyze")
-			}
-			teardownIdx++
-			return nil
+		Analyzer:    m,
+		WriteOutput: m.out(),
+		Context: testContext{
+			setup: func(_ context.Context, cu Compilation) error {
+				setupIdx++
+				return nil
+			},
+			teardown: func(_ context.Context, cu Compilation) error {
+				if setupIdx != teardownIdx+1 {
+					t.Error("Teardown was not called directly after Setup/Analyze")
+				}
+				teardownIdx++
+				return nil
+			},
+			analysisError: func(_ context.Context, _ Compilation, err error) error {
+				// Compilations that do not report an error should not call this hook.
+				t.Errorf("Unexpected call of AnalysisError hook with %v", err)
+				return err
+			},
 		},
 	}
-	testutil.FatalOnErrT(t, "Driver error: %v", d.Run(context.Background()))
+	testutil.FatalOnErrT(t, "Driver error: %v", d.Run(context.Background(), m))
 	if len(m.Requests) != len(m.Compilations) {
 		t.Errorf("Expected %d AnalysisRequests; found %v", len(m.Compilations), m.Requests)
 	}
@@ -164,11 +190,10 @@ func TestDriverAnalyzeError(t *testing.T) {
 		AnalyzeError: errFromAnalysis,
 	}
 	d := &Driver{
-		Analyzer:     m,
-		Compilations: m,
-		Output:       m.out(),
+		Analyzer:    m,
+		WriteOutput: m.out(),
 	}
-	if err := d.Run(context.Background()); err != errFromAnalysis {
+	if err := d.Run(context.Background(), m); err != errFromAnalysis {
 		t.Errorf("Expected AnalysisError: %v; found: %v", errFromAnalysis, err)
 	}
 	if len(m.Requests) != 1 { // we didn't analyze the second
@@ -185,15 +210,16 @@ func TestDriverErrorHandler(t *testing.T) {
 	}
 	var analysisErr error
 	d := &Driver{
-		Analyzer:     m,
-		Compilations: m,
-		Output:       m.out(),
-		AnalysisError: func(_ context.Context, cu *apb.CompilationUnit, err error) error {
-			analysisErr = err
-			return nil // don't return err
+		Analyzer:    m,
+		WriteOutput: m.out(),
+		Context: testContext{
+			analysisError: func(_ context.Context, cu Compilation, err error) error {
+				analysisErr = err
+				return nil // don't return err
+			},
 		},
 	}
-	testutil.FatalOnErrT(t, "Driver error: %v", d.Run(context.Background()))
+	testutil.FatalOnErrT(t, "Driver error: %v", d.Run(context.Background(), m))
 	if len(m.Requests) != len(m.Compilations) {
 		t.Errorf("Expected %d AnalysisRequests; found %v", len(m.Compilations), m.Requests)
 	}
@@ -210,15 +236,29 @@ func TestDriverSetup(t *testing.T) {
 	}
 	var setupIdx int
 	d := &Driver{
-		Analyzer:     m,
-		Compilations: m,
-		Output:       m.out(),
-		Setup: func(_ context.Context, cu *apb.CompilationUnit) error {
-			setupIdx++
-			return nil
+		Analyzer:    m,
+		WriteOutput: m.out(),
+		Context: testContext{
+			setup: func(_ context.Context, cu Compilation) error {
+				setupIdx++
+				var missing []string
+				if cu.UnitDigest == "" {
+					missing = append(missing, "unit digest")
+				}
+				if cu.Revision == "" {
+					missing = append(missing, "revision marker")
+				}
+				if cu.BuildID == "" {
+					missing = append(missing, "build ID")
+				}
+				if len(missing) != 0 {
+					return fmt.Errorf("missing %s: %v", strings.Join(missing, ", "), cu)
+				}
+				return nil
+			},
 		},
 	}
-	testutil.FatalOnErrT(t, "Driver error: %v", d.Run(context.Background()))
+	testutil.FatalOnErrT(t, "Driver error: %v", d.Run(context.Background(), m))
 	if len(m.Requests) != len(m.Compilations) {
 		t.Errorf("Expected %d AnalysisRequests; found %v", len(m.Compilations), m.Requests)
 	}
@@ -235,15 +275,16 @@ func TestDriverTeardown(t *testing.T) {
 	}
 	var teardownIdx int
 	d := &Driver{
-		Analyzer:     m,
-		Compilations: m,
-		Output:       m.out(),
-		Teardown: func(_ context.Context, cu *apb.CompilationUnit) error {
-			teardownIdx++
-			return nil
+		Analyzer:    m,
+		WriteOutput: m.out(),
+		Context: testContext{
+			teardown: func(_ context.Context, cu Compilation) error {
+				teardownIdx++
+				return nil
+			},
 		},
 	}
-	testutil.FatalOnErrT(t, "Driver error: %v", d.Run(context.Background()))
+	testutil.FatalOnErrT(t, "Driver error: %v", d.Run(context.Background(), m))
 	if len(m.Requests) != len(m.Compilations) {
 		t.Errorf("Expected %d AnalysisRequests; found %v", len(m.Compilations), m.Requests)
 	}
@@ -259,9 +300,14 @@ func outs(vals ...string) (as []*apb.AnalysisOutput) {
 	return
 }
 
-func comps(sigs ...string) (cs []*apb.CompilationUnit) {
+func comps(sigs ...string) (cs []Compilation) {
 	for _, sig := range sigs {
-		cs = append(cs, &apb.CompilationUnit{VName: &spb.VName{Signature: sig}})
+		cs = append(cs, Compilation{
+			Unit:       &apb.CompilationUnit{VName: &spb.VName{Signature: sig}},
+			Revision:   "12345",
+			UnitDigest: "digest:" + sig,
+			BuildID:    buildID,
+		})
 	}
 	return
 }

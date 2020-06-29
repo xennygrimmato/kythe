@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,8 +48,6 @@ func tempGS() (graphstore.Service, graphstore.DestroyFunc, error) {
 	}
 	return keyvalue.NewGraphStore(db), graphstore.DestroyFunc(destroy), err
 }
-
-func destroy(i interface{}) error { return os.RemoveAll(i.(string)) }
 
 func BenchmarkWriteSingle(b *testing.B) { keyvalue.BatchWriteBenchmark(b, tempDB, 1) }
 func BenchmarkWriteBatchSml(b *testing.B) {

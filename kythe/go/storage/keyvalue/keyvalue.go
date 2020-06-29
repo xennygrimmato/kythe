@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,11 @@
 
 // Package keyvalue implements a generic GraphStore for anything that implements
 // the DB interface.
-package keyvalue
+package keyvalue // import "kythe.io/kythe/go/storage/keyvalue"
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -30,9 +31,7 @@ import (
 	"kythe.io/kythe/go/services/graphstore"
 	"kythe.io/kythe/go/util/datasize"
 
-	"golang.org/x/net/context"
-
-	spb "kythe.io/kythe/proto/storage_proto"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
 // debug controls whether debugging information is emitted
@@ -65,26 +64,27 @@ func NewGraphStore(db DB) *Store {
 // A DB is a sorted key-value store with read/write access. DBs must be Closed
 // when no longer used to ensure resources are not leaked.
 type DB interface {
-	io.Closer
-
 	// Get returns the value associated with the given key.  An io.EOF will be
 	// returned if the key is not found.
-	Get([]byte, *Options) ([]byte, error)
+	Get(context.Context, []byte, *Options) ([]byte, error)
 
 	// ScanPrefix returns an Iterator for all key-values starting with the given
 	// key prefix.  Options may be nil to use the defaults.
-	ScanPrefix([]byte, *Options) (Iterator, error)
+	ScanPrefix(context.Context, []byte, *Options) (Iterator, error)
 
 	// ScanRange returns an Iterator for all key-values starting with the given
 	// key range.  Options may be nil to use the defaults.
-	ScanRange(*Range, *Options) (Iterator, error)
+	ScanRange(context.Context, *Range, *Options) (Iterator, error)
 
 	// Writer return a new write-access object
-	Writer() (Writer, error)
+	Writer(context.Context) (Writer, error)
 
 	// NewSnapshot returns a new consistent view of the DB that can be passed as
 	// an option to DB scan methods.
-	NewSnapshot() Snapshot
+	NewSnapshot(context.Context) Snapshot
+
+	// Close release the underlying resources for the database.
+	Close(context.Context) error
 }
 
 // Snapshot is a consistent view of the DB.
@@ -124,6 +124,12 @@ type Iterator interface {
 	// entry. If there is no key-value entry to return, an io.EOF error is
 	// returned.
 	Next() (key, val []byte, err error)
+
+	// Seeks positions the Iterator to the given key.  The key must be further
+	// than the current Iterator's position.  If the key does not exist, the
+	// Iterator is positioned at the next existing key.  If no such key exists,
+	// io.EOF is returned.
+	Seek(key []byte) error
 }
 
 // Writer provides write access to a DB. Writes must be Closed when no longer
@@ -181,9 +187,9 @@ func NewPool(db DB, opts *PoolOptions) *WritePool { return &WritePool{db: db, op
 
 // Write buffers the given write until the pool becomes to large or Flush is
 // called.
-func (p *WritePool) Write(key, val []byte) error {
+func (p *WritePool) Write(ctx context.Context, key, val []byte) error {
 	if p.wr == nil {
-		wr, err := p.db.Writer()
+		wr, err := p.db.Writer(ctx)
 		if err != nil {
 			return err
 		}
@@ -220,7 +226,7 @@ func (s *Store) Read(ctx context.Context, req *spb.ReadRequest, f graphstore.Ent
 	if err != nil {
 		return fmt.Errorf("invalid ReadRequest: %v", err)
 	}
-	iter, err := s.db.ScanPrefix(keyPrefix, nil)
+	iter, err := s.db.ScanPrefix(ctx, keyPrefix, nil)
 	if err != nil {
 		return fmt.Errorf("db seek error: %v", err)
 	}
@@ -254,7 +260,7 @@ func streamEntries(iter Iterator, f graphstore.EntryFunc) error {
 func (s *Store) Write(ctx context.Context, req *spb.WriteRequest) (err error) {
 	// TODO(schroederc): fix shardTables to include new entries
 
-	wr, err := s.db.Writer()
+	wr, err := s.db.Writer(ctx)
 	if err != nil {
 		return fmt.Errorf("db writer error: %v", err)
 	}
@@ -281,7 +287,7 @@ func (s *Store) Write(ctx context.Context, req *spb.WriteRequest) (err error) {
 
 // Scan implements part of the graphstore.Service interface.
 func (s *Store) Scan(ctx context.Context, req *spb.ScanRequest, f graphstore.EntryFunc) error {
-	iter, err := s.db.ScanPrefix(entryKeyPrefixBytes, &Options{LargeRead: true})
+	iter, err := s.db.ScanPrefix(ctx, entryKeyPrefixBytes, &Options{LargeRead: true})
 	if err != nil {
 		return fmt.Errorf("db seek error: %v", err)
 	}
@@ -309,7 +315,7 @@ func (s *Store) Scan(ctx context.Context, req *spb.ScanRequest, f graphstore.Ent
 }
 
 // Close implements part of the graphstore.Service interface.
-func (s *Store) Close(ctx context.Context) error { return s.db.Close() }
+func (s *Store) Close(ctx context.Context) error { return s.db.Close(ctx) }
 
 // Count implements part of the graphstore.Sharded interface.
 func (s *Store) Count(ctx context.Context, req *spb.CountRequest) (int64, error) {
@@ -319,7 +325,7 @@ func (s *Store) Count(ctx context.Context, req *spb.CountRequest) (int64, error)
 		return 0, fmt.Errorf("invalid index for %d shards: %d", req.Shards, req.Index)
 	}
 
-	tbl, _, err := s.constructShards(req.Shards)
+	tbl, _, err := s.constructShards(ctx, req.Shards)
 	if err != nil {
 		return 0, err
 	}
@@ -334,7 +340,7 @@ func (s *Store) Shard(ctx context.Context, req *spb.ShardRequest, f graphstore.E
 		return fmt.Errorf("invalid index for %d shards: %d", req.Shards, req.Index)
 	}
 
-	tbl, snapshot, err := s.constructShards(req.Shards)
+	tbl, snapshot, err := s.constructShards(ctx, req.Shards)
 	if err != nil {
 		return err
 	}
@@ -342,7 +348,7 @@ func (s *Store) Shard(ctx context.Context, req *spb.ShardRequest, f graphstore.E
 		return nil
 	}
 	shard := tbl[req.Index]
-	iter, err := s.db.ScanRange(&shard.Range, &Options{
+	iter, err := s.db.ScanRange(ctx, &shard.Range, &Options{
 		LargeRead: true,
 		Snapshot:  snapshot,
 	})
@@ -352,7 +358,7 @@ func (s *Store) Shard(ctx context.Context, req *spb.ShardRequest, f graphstore.E
 	return streamEntries(iter, f)
 }
 
-func (s *Store) constructShards(num int64) ([]shard, Snapshot, error) {
+func (s *Store) constructShards(ctx context.Context, num int64) ([]shard, Snapshot, error) {
 	s.shardMu.Lock()
 	defer s.shardMu.Unlock()
 	if s.shardTables == nil {
@@ -362,11 +368,11 @@ func (s *Store) constructShards(num int64) ([]shard, Snapshot, error) {
 	if tbl, ok := s.shardTables[num]; ok {
 		return tbl, s.shardSnapshots[num], nil
 	}
-	snapshot := s.db.NewSnapshot()
+	snapshot := s.db.NewSnapshot(ctx)
 	iters := make([]Iterator, num)
 	for i := range iters {
 		var err error
-		iters[i], err = s.db.ScanPrefix(entryKeyPrefixBytes, &Options{
+		iters[i], err = s.db.ScanPrefix(ctx, entryKeyPrefixBytes, &Options{
 			LargeRead: true,
 			Snapshot:  snapshot,
 		})
@@ -491,9 +497,9 @@ func EncodeKey(source *spb.VName, factName string, edgeKind string, target *spb.
 		return nil, errors.New("invalid Entry: missing source VName for key encoding")
 	} else if (edgeKind == "" || target == nil) && (edgeKind != "" || target != nil) {
 		return nil, errors.New("invalid Entry: edgeKind and target Ticket must be both non-empty or empty")
-	} else if strings.Index(edgeKind, entryKeySepStr) != -1 {
+	} else if strings.Contains(edgeKind, entryKeySepStr) {
 		return nil, errors.New("invalid Entry: edgeKind contains key separator")
-	} else if strings.Index(factName, entryKeySepStr) != -1 {
+	} else if strings.Contains(factName, entryKeySepStr) {
 		return nil, errors.New("invalid Entry: factName contains key separator")
 	}
 
@@ -502,13 +508,13 @@ func EncodeKey(source *spb.VName, factName string, edgeKind string, target *spb.
 	srcEncoding, err := encodeVName(source)
 	if err != nil {
 		return nil, fmt.Errorf("error encoding source VName: %v", err)
-	} else if bytes.Index(srcEncoding, entryKeySepBytes) != -1 {
-		return nil, fmt.Errorf("invalid Entry: source VName contains key separator %v", source)
+	} else if bytes.Contains(srcEncoding, entryKeySepBytes) {
+		return nil, fmt.Errorf("invalid Entry: source VName contains key separator (%q) %v", entryKeySepBytes, source)
 	}
 	targetEncoding, err := encodeVName(target)
 	if err != nil {
 		return nil, fmt.Errorf("error encoding target VName: %v", err)
-	} else if bytes.Index(targetEncoding, entryKeySepBytes) != -1 {
+	} else if bytes.Contains(targetEncoding, entryKeySepBytes) {
 		return nil, errors.New("invalid Entry: target VName contains key separator")
 	}
 

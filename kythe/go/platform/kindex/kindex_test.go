@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,8 +25,10 @@ import (
 
 	"github.com/golang/protobuf/proto"
 
-	apb "kythe.io/kythe/proto/analysis_proto"
-	spb "kythe.io/kythe/proto/storage_proto"
+	anypb "github.com/golang/protobuf/ptypes/any"
+	apb "kythe.io/kythe/proto/analysis_go_proto"
+	gopb "kythe.io/kythe/proto/go_go_proto"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
 // A fakeFetcher maps file "paths" to their contents.
@@ -54,7 +56,6 @@ func TestRoundTrip(t *testing.T) {
 			Path:      "magic/test/unit",
 			Signature: "成功",
 		},
-		Revision:         "1",
 		WorkingDirectory: "/usr/local/src",
 		RequiredInput: []*apb.CompilationUnit_FileInput{
 			{Info: &apb.FileInfo{
@@ -155,5 +156,64 @@ func TestFetch(t *testing.T) {
 		t.Errorf("Fetch %q: unexpected error: %v", magicDigest, err)
 	} else if got := string(raw); got != magic {
 		t.Errorf("Fetch %q: got %q, want %q", magicDigest, got, magic)
+	}
+}
+
+func TestAdders(t *testing.T) {
+	var cu Compilation
+
+	if err := cu.AddFile("foo", strings.NewReader(""), nil, &gopb.GoPackageInfo{
+		ImportPath: "vanity.io/foo",
+	}); err != nil {
+		t.Errorf("AddFile failed: %v", err)
+	}
+	if err := cu.AddDetails(&gopb.GoDetails{
+		Goroot: "plover",
+	}); err != nil {
+		t.Errorf("AddDetails failed: %v", err)
+	}
+	unit := cu.Unit()
+	unit.VName = &spb.VName{Language: "go", Corpus: "kythe"}
+	unit.Argument = []string{"this", "isn't", "an", "argument"}
+	unit.OutputKey = "blathe.a"
+	unit.SourceFile = []string{"foo"}
+
+	want := &apb.CompilationUnit{
+		VName: &spb.VName{
+			Language: "go",
+			Corpus:   "kythe",
+		},
+		RequiredInput: []*apb.CompilationUnit_FileInput{{
+			Info: &apb.FileInfo{
+				Path:   "foo",
+				Digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			},
+			Details: []*anypb.Any{{
+				TypeUrl: "kythe.io/proto/kythe.proto.GoPackageInfo",
+				Value:   []byte("\n\rvanity.io/foo"),
+			}},
+		}},
+		SourceFile: []string{"foo"},
+		OutputKey:  "blathe.a",
+		Argument:   []string{"this", "isn't", "an", "argument"},
+		Details: []*anypb.Any{{
+			TypeUrl: "kythe.io/proto/kythe.proto.GoDetails",
+			Value:   []byte("\x1a\x06plover"),
+		}},
+	}
+	if got := cu.Unit(); !proto.Equal(got, want) {
+		t.Errorf("Incorrect proto constructed:\n got: %+v\nwant: %+v", got, want)
+	}
+	wantFile := &apb.FileData{
+		Content: []byte(""),
+		Info: &apb.FileInfo{
+			Path:   "foo",
+			Digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		},
+	}
+	if n := len(cu.Files); n != 1 {
+		t.Errorf("Wrong number of files: got %d, wanted 1", n)
+	} else if got := cu.Files[0]; !proto.Equal(got, wantFile) {
+		t.Errorf("Wrong file data:\n got: %+v\nwant: %+v", got, want)
 	}
 }

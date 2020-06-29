@@ -7,11 +7,18 @@ package pkg;
 public class Definitions {
 
   //- @HELLO defines/binding HelloConstant
-  //- HelloDef defines HelloConstant
+  //- HelloDef=vname(_,_,_,_,"java") defines HelloConstant
   //- HelloDef.node/kind anchor
   //- HelloDef.loc/start @^private
   //- HelloDef.loc/end @$";"
   private static final String HELLO = "こんにちは";
+
+  //- @"HELLO2" defines/binding Hello2
+  //- Hello2Def defines Hello2
+  //- Hello2Def.node/kind anchor
+  //- Hello2Def.loc/start @^private
+  //- Hello2Def.loc/end @$";"
+  private static final String HELLO2 = "今日は";  // こんにちは
 
   //- @Inner defines/binding Inner
   //- InnerClassDef defines Inner

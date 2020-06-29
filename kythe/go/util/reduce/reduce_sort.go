@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Google Inc. All rights reserved.
+ * Copyright 2016 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,16 +17,16 @@
 package reduce
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 
 	"kythe.io/kythe/go/util/disksort"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
-	ipb "kythe.io/kythe/proto/internal_proto"
+	ipb "kythe.io/kythe/proto/internal_go_proto"
 )
 
 // KeyValueSorter returns a disksort for arbitrary *ipb.SortedKeyValues.

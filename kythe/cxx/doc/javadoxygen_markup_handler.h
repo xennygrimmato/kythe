@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Google Inc. All rights reserved.
+ * Copyright 2016 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,8 +23,9 @@
 namespace kythe {
 
 /// \brief Parse a Printable containing Javadoc and/or Doxygen style directives.
-/// \note This does not handle parsing Markdown.
-void ParseJavadoxygen(const Printable& in_message, PrintableSpans* out_spans);
+/// \note This does not handle parsing Markdown or HTML.
+void ParseJavadoxygen(const Printable& in_message, const PrintableSpans& spans,
+                      PrintableSpans* out_spans);
 
 }  // namespace kythe
 

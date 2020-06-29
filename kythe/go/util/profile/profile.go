@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,9 +17,10 @@
 // Package profile provides a simple method for exposing profile information
 // through a --cpu_profile flag.  This package also implicitly adds the
 // /debug/pprof/... HTTP handlers.
-package profile
+package profile // import "kythe.io/kythe/go/util/profile"
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -32,8 +33,6 @@ import (
 	"sync"
 
 	"kythe.io/kythe/go/platform/vfs"
-
-	"golang.org/x/net/context"
 
 	_ "net/http/pprof" // for /debug/pprof/... handlers
 )

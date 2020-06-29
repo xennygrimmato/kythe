@@ -1,4 +1,5 @@
 // We index anonymous inline namespaces.
-//- @namespace defines/binding AnonymousInlineNS
+//- @namespace ref AnonymousInlineNS
+//- AnonymousInlineNS.node/kind package
 inline namespace {
 }

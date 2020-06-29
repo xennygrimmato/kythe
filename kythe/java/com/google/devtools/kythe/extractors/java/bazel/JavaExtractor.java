@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,14 @@
 
 package com.google.devtools.kythe.extractors.java.bazel;
 
-import com.google.common.base.Predicate;
-import com.google.common.collect.Iterables;
+import static com.google.common.base.StandardSystemProperty.USER_DIR;
+import static com.google.common.io.Files.touch;
+import static java.util.stream.Collectors.toCollection;
+
+import com.google.common.collect.Lists;
+import com.google.common.flogger.FluentLogger;
+import com.google.common.io.ByteSource;
+import com.google.common.io.MoreFiles;
 import com.google.devtools.build.lib.actions.extra.ExtraActionInfo;
 import com.google.devtools.build.lib.actions.extra.ExtraActionsBase;
 import com.google.devtools.build.lib.actions.extra.JavaCompileInfo;
@@ -26,16 +32,31 @@ import com.google.devtools.kythe.extractors.shared.CompilationDescription;
 import com.google.devtools.kythe.extractors.shared.ExtractionException;
 import com.google.devtools.kythe.extractors.shared.FileVNames;
 import com.google.devtools.kythe.extractors.shared.IndexInfoUtils;
+import com.google.devtools.kythe.util.JsonUtil;
 import com.google.protobuf.CodedInputStream;
 import com.google.protobuf.ExtensionRegistry;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.Optional;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 /** Java CompilationUnit extractor using Bazel's extra_action feature. */
 public class JavaExtractor {
+
+  private static final FluentLogger logger = FluentLogger.forEnclosingClass();
+
   public static void main(String[] args) throws IOException, ExtractionException {
+    JsonUtil.usingTypeRegistry(JsonUtil.JSON_TYPE_REGISTRY);
+
     if (args.length != 3) {
       System.err.println("Usage: java_extractor extra-action-file output-file vname-config");
       System.exit(1);
@@ -59,32 +80,168 @@ public class JavaExtractor {
     }
 
     JavaCompileInfo jInfo = info.getExtension(JavaCompileInfo.javaCompileInfo);
+
+    List<String> sources = Lists.newArrayList(jInfo.getSourceFileList());
+    List<String> sourcepaths = jInfo.getSourcepathList();
+
+    if (!sourcepaths.isEmpty()) {
+      List<String> updatedSourcepaths = new ArrayList<>();
+      for (String sourcepath : sourcepaths) {
+        // Support source jars like proto compilation outputs.
+        if (sourcepath.endsWith(".jar") || sourcepath.endsWith(".srcjar")) {
+          extractSourceJar(sourcepath, sources);
+        } else {
+          updatedSourcepaths.add(sourcepath);
+        }
+      }
+      sourcepaths = updatedSourcepaths;
+    }
+
+    if (sources.isEmpty()) {
+      // Skip binary-only compilations; there is nothing to analyze.
+      touch(new File(outputPath));
+      return;
+    }
+
+    List<String> javacOpts =
+        jInfo.getJavacOptList().stream()
+            .filter(
+                // Filter out Bazel-specific flags.  Bazel adds its own flags (such as error-prone
+                // flags) to the javac_opt list that cannot be handled by the standard javac
+                // compiler, or in turn, by this extractor.
+                opt ->
+                    !(opt.startsWith("-Werror:")
+                        || opt.startsWith("-extra_checks")
+                        || opt.startsWith("-Xep")))
+            .collect(toCollection(ArrayList::new));
+
+    // Set up a fresh output directory
+    javacOpts.add("-d");
+    Path output = Files.createTempDirectory("output");
+    javacOpts.add(output.toString());
+
+    // Add the generated sources directory if any processors could be invoked.
+    if (!jInfo.getProcessorList().isEmpty()) {
+      Optional<Path> genSrcDir = Optional.empty();
+      try {
+        genSrcDir = readGeneratedSourceDirParam(jInfo);
+      } catch (IOException ioe) {
+        logger.atWarning().withCause(ioe).log(
+            "Failed to find generated sources directory from javac parameters");
+      }
+      if (!genSrcDir.isPresent()) {
+        genSrcDir = Optional.of(Files.createTempDirectory("sourcegendir"));
+      }
+      javacOpts.add("-s");
+      javacOpts.add(genSrcDir.get().toString());
+      // javac expects the directory to already exist.
+      Files.createDirectories(genSrcDir.get());
+    }
+
+    // TODO(salguarnieri) Read -system module directory from the javac arguments.
     CompilationDescription description =
-        new JavaCompilationUnitExtractor(
-                FileVNames.fromFile(vNamesConfigPath), System.getProperty("user.dir"))
+        new JavaCompilationUnitExtractor(FileVNames.fromFile(vNamesConfigPath), USER_DIR.value())
             .extract(
                 info.getOwner(),
-                jInfo.getSourceFileList(),
+                sources,
                 jInfo.getClasspathList(),
-                jInfo.getSourcepathList(),
+                jInfo.getBootclasspathList(),
+                sourcepaths,
                 jInfo.getProcessorpathList(),
                 jInfo.getProcessorList(),
-                Iterables.filter(jInfo.getJavacOptList(), JAVAC_OPT_FILTER),
+                javacOpts,
                 jInfo.getOutputjar());
 
-    IndexInfoUtils.writeIndexInfoToFile(description, outputPath);
+    if (outputPath.endsWith(IndexInfoUtils.KZIP_FILE_EXT)) {
+      IndexInfoUtils.writeKzipToFile(description, outputPath);
+    } else {
+      IndexInfoUtils.writeKindexToFile(description, outputPath);
+    }
   }
 
-  // Predicate that filters out Bazel-specific flags.  Bazel adds its own flags (such as error-prone
-  // flags) to the javac_opt list that cannot be handled by the standard javac compiler, or in turn,
-  // by this extractor.
-  private static final Predicate<String> JAVAC_OPT_FILTER =
-      new Predicate<String>() {
-        @Override
-        public boolean apply(String opt) {
-          return !(opt.startsWith("-Werror:")
-              || opt.startsWith("-extra_checks")
-              || opt.startsWith("-Xep"));
+  /** Extracts a source jar and adds all java files in it to the list of sources. */
+  private static void extractSourceJar(String sourcepath, List<String> sources) throws IOException {
+    // We unzip the sourcefiles to a temp location (<the location of the jar>.files/)
+    File tempFile = new File(sourcepath + ".files");
+    if (tempFile.exists()) {
+      MoreFiles.deleteRecursively(tempFile.toPath());
+    }
+    tempFile.mkdirs();
+    List<String> files = unzipFile(new ZipFile(sourcepath), tempFile);
+
+    // And update the list of sources based on the .java files we unzipped.
+    files.stream().filter(input -> input.endsWith(".java")).forEachOrdered(sources::add);
+  }
+
+  /** Unzips specified zipFile to targetDirectory and returns a list of the unzipped files. */
+  private static List<String> unzipFile(final ZipFile zipFile, File targetDirectory)
+      throws IOException {
+    List<String> files = new ArrayList<>();
+    try {
+      Enumeration<? extends ZipEntry> entries = zipFile.entries();
+      // Zip Slip fix courtesy of snyk.io/research/zip-slip-vulnerability.
+      String canonicalDirPath = targetDirectory.getCanonicalPath() + File.separator;
+      while (entries.hasMoreElements()) {
+        final ZipEntry entry = entries.nextElement();
+        File targetFile = new File(targetDirectory, entry.getName());
+        String canonicalFilePath = targetFile.getCanonicalPath();
+        if (!canonicalFilePath.startsWith(canonicalDirPath)) {
+          throw new IllegalArgumentException(
+              "Zip archive trying to write file outside of target dir: " + canonicalFilePath);
         }
-      };
+        if (entry.isDirectory()) {
+          if (!targetFile.isDirectory() && !targetFile.mkdirs()) {
+            throw new IOException("Failed to create directory: " + targetFile.getAbsolutePath());
+          }
+        } else {
+          File parentFile = targetFile.getParentFile();
+          if (!parentFile.isDirectory()) {
+            if (!parentFile.mkdirs()) {
+              throw new IOException("Failed to create directory: " + parentFile.getAbsolutePath());
+            }
+          }
+          // Write the file to the destination.
+          new ByteSource() {
+            @Override
+            public InputStream openStream() throws IOException {
+              return zipFile.getInputStream(entry);
+            }
+          }.copyTo(MoreFiles.asByteSink(targetFile.toPath()));
+          files.add(targetFile.getAbsolutePath());
+        }
+      }
+    } finally {
+      zipFile.close();
+    }
+    return files;
+  }
+
+  private static final String SOURCEGENDIR_FLAG = "--sourcegendir";
+
+  /** Reads Bazel's compilation parameters and returns the value of the --sourcegendir flag. */
+  private static Optional<Path> readGeneratedSourceDirParam(JavaCompileInfo jInfo)
+      throws IOException {
+    for (int i = 0; i < jInfo.getArgumentCount() - 1; i++) {
+      if (jInfo.getArgument(i).equals(SOURCEGENDIR_FLAG)) {
+        return Optional.of(Paths.get(jInfo.getArgument(i + 1)));
+      }
+    }
+
+    // Fall-back to reading from the Bazel .params file
+    try (java.io.BufferedReader params =
+        Files.newBufferedReader(
+            Paths.get(jInfo.getOutputjar() + "-2.params"),
+            java.nio.charset.StandardCharsets.UTF_8)) {
+      String line;
+      while ((line = params.readLine()) != null) {
+        if (SOURCEGENDIR_FLAG.equals(line)) {
+          return Optional.of(Paths.get(params.readLine()));
+        }
+      }
+      return Optional.empty();
+    } catch (NoSuchFileException nsfe) {
+      // params file is not guaranteed to exist; convert to missing path
+      return Optional.empty();
+    }
+  }
 }

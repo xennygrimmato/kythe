@@ -1,45 +1,42 @@
-sh_test(
+load("@rules_java//java:defs.bzl", "java_library", "java_test")
+load("//tools:build_rules/testing.bzl", "shell_tool_test")
+
+shell_tool_test(
     name = "indexer_test",
-    size = "small",
-    srcs = ["indexer_test.sh"],
-    data = [
-        "//kythe/go/platform/tools:entrystream",
-        "//kythe/go/platform/tools:indexpack",
-        "//kythe/java/com/google/devtools/kythe/analyzers/java:indexer",
-        "//kythe/testdata:test.kindex",
-    ],
+    data = ["//kythe/testdata:test.kzip"],
+    scriptfile = "indexer_test.sh",
+    tools = {
+        "entrystream": "//kythe/go/platform/tools/entrystream",
+        "indexer": "//kythe/java/com/google/devtools/kythe/analyzers/java:indexer",
+    },
 )
 
-sh_test(
+shell_tool_test(
     name = "indexer_empty_cu_test",
-    size = "small",
-    srcs = ["indexer_empty_cu_test.sh"],
-    data = [
-        "//kythe/go/platform/tools:entrystream",
-        "//kythe/java/com/google/devtools/kythe/analyzers/java:indexer",
-        "//kythe/testdata:java_empty.kindex",
-    ],
+    data = ["//kythe/testdata:java_empty.kindex"],
+    scriptfile = "indexer_empty_cu_test.sh",
+    tools = {
+        "entrystream": "//kythe/go/platform/tools/entrystream",
+        "indexer": "//kythe/java/com/google/devtools/kythe/analyzers/java:indexer",
+    },
 )
 
-# See https://kythe.io/phabricator/T70
-sh_test(
+# See #818
+shell_tool_test(
     name = "indexer_source_root_test",
-    srcs = ["indexer_source_root_test.sh"],
     data = [
-        "//kythe/go/platform/tools:entrystream",
-        "//kythe/java/com/google/devtools/kythe/analyzers/java:indexer",
         "//kythe/javatests/com/google/devtools/kythe/analyzers/java/testdata:corner_case.kindex",
-
-        # Having the following sources in the Java indexer's source path will cause T70.  The
-        # indexer reads the .java file instead of the .class file found in corner_case.kindex,
+        # Having the following sources in the Java indexer's source path caused #818.  The
+        # indexer read the .java file instead of the .class file found in corner_case.kindex,
         # causing javac to compile these sources without their depedencies (the transitive
         # dependencies of corner_case.kindex's compilation).
         "//kythe/java/com/google/devtools/kythe/analyzers/base:corner_case_srcs",
     ],
-    tags = [
-        "broken",
-        "manual",
-    ],
+    scriptfile = "indexer_source_root_test.sh",
+    tools = {
+        "entrystream": "//kythe/go/platform/tools/entrystream",
+        "indexer": "//kythe/java/com/google/devtools/kythe/analyzers/java:indexer",
+    },
 )
 
 java_test(
@@ -48,21 +45,22 @@ java_test(
     srcs = ["MiniAnchorTest.java"],
     test_class = "com.google.devtools.kythe.analyzers.java.MiniAnchorTest",
     deps = [
-        "//external:guava",
-        "//external:junit4",
-        "//external:truth",
         "//kythe/java/com/google/devtools/kythe/analyzers/java:analyzer",
+        "//third_party/guava",
+        "//third_party/truth",
+        "@maven//:junit_junit",
     ],
 )
 
-java_test(
-    name = "source_text_test",
-    size = "small",
-    srcs = ["SourceTextTest.java"],
-    test_class = "com.google.devtools.kythe.analyzers.java.SourceTextTest",
+java_library(
+    name = "test_plugin",
+    srcs = ["TestPlugin.java"],
+    visibility = ["//kythe/javatests/com/google/devtools/kythe/analyzers/java:__subpackages__"],
     deps = [
-        "//external:junit4",
-        "//external:truth",
-        "//kythe/java/com/google/devtools/kythe/analyzers/java:analyzer",
+        "//kythe/java/com/google/devtools/kythe/analyzers/base:entryset",
+        "//kythe/java/com/google/devtools/kythe/analyzers/java:plugin",
+        "//kythe/java/com/google/devtools/kythe/common:autoservice",
+        "//kythe/proto:storage_java_proto",
+        "//third_party/javac",
     ],
 )

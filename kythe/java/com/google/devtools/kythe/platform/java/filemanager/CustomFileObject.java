@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
  */
 
 package com.google.devtools.kythe.platform.java.filemanager;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 import com.google.devtools.kythe.platform.shared.FileDataProvider;
 import java.io.ByteArrayInputStream;
@@ -79,9 +81,7 @@ public class CustomFileObject implements FileObject {
             String.format("Unable to find file with digest %s, path %s", digest, path));
       }
       return result;
-    } catch (InterruptedException e) {
-      throw new IOException(e);
-    } catch (ExecutionException e) {
+    } catch (InterruptedException | ExecutionException e) {
       throw new IOException(e);
     }
   }
@@ -93,7 +93,7 @@ public class CustomFileObject implements FileObject {
 
   @Override
   public Reader openReader(boolean ignoreEncodingErrors) throws IOException {
-    return new InputStreamReader(openInputStream());
+    return new InputStreamReader(openInputStream(), UTF_8);
   }
 
   @Override

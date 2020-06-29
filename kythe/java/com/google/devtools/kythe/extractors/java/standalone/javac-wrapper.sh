@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2015 Google Inc. All rights reserved.
+# Copyright 2015 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,9 @@
 # KYTHE_OUTPUT_DIRECTORY set to understand where the root of the compiled source
 # repository is and where to put the resulting .kindex files, respectively.
 #
-# This script assumes a usable java binary is on $PATH.
+# This script assumes a usable java binary is on $PATH or in $JAVA_HOME.
+# Runtime options (e.g -Xbootclasspath/p:)can be passed to `java` with the
+# $KYTHE_JAVA_RUNTIME_OPTIONS environment variable.
 #
 # This script is meant as a replacement for $JAVA_HOME/bin/javac.  It assumes
 # the true javac binary is in the same directory as itself and named
@@ -36,10 +38,12 @@
 #
 # Other environment variables that may be passed to this script include:
 #   KYTHE_EXTRACT_ONLY: if set, suppress the call to javac after extraction
-#   TMPDIR: override the location of extraction logs and other temporary output
 
-export TMPDIR="${TMPDIR:-/tmp}"
-
+if [[ -z "$JAVA_HOME" ]]; then
+  readonly JAVABIN="$(which java)"
+else
+  readonly JAVABIN="$JAVA_HOME/bin/java"
+fi
 if [[ -z "$REAL_JAVAC" ]]; then
   readonly REAL_JAVAC="$(dirname "$(readlink -e "$0")")/javac.real"
 fi
@@ -49,7 +53,10 @@ fi
 
 fix_permissions() {
   local dir="${1:?missing path}"
-  chown -R $(stat "$dir" -c %u:%g) "$dir"
+  # We cannot use stat -c to get user and group because it varies too much from
+  # system to system.
+  local ug=$(ls -ld "$dir" | awk '{print $3":"$4}')
+  chown -R "$ug" "$dir"
 }
 cleanup() {
   fix_permissions "$KYTHE_ROOT_DIRECTORY"
@@ -59,9 +66,10 @@ if [[ -n "$DOCKER_CLEANUP" ]]; then
   trap cleanup EXIT ERR INT
 fi
 
-java -Xbootclasspath/p:"$JAVAC_EXTRACTOR_JAR" \
-     -jar "$JAVAC_EXTRACTOR_JAR" \
-     "$@" >>"$TMPDIR"/javac-extractor.out 2>> "$TMPDIR"/javac-extractor.err
+"$JAVABIN" "${KYTHE_JAVA_RUNTIME_OPTIONS[@]}" \
+  -jar "$JAVAC_EXTRACTOR_JAR" "$@" \
+  1> >(sed -e 's/^/EXTRACT OUT: /') \
+  2> >(sed -e 's/^/EXTRACT ERR: /' >&2)
 if [[ -z "$KYTHE_EXTRACT_ONLY" ]]; then
   "$REAL_JAVAC" "$@"
 fi

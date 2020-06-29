@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,9 +17,18 @@
 package indexer
 
 import (
-	"golang.org/x/net/context"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"fmt"
+	"strconv"
 
-	spb "kythe.io/kythe/proto/storage_proto"
+	"kythe.io/kythe/go/extractors/govname"
+	"kythe.io/kythe/go/util/schema/edges"
+	"kythe.io/kythe/go/util/schema/facts"
+	"kythe.io/kythe/go/util/schema/nodes"
+
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
 // A Sink is a callback invoked by the indexer to deliver entries.
@@ -42,4 +51,58 @@ func (s Sink) writeEdge(ctx context.Context, src, tgt *spb.VName, kind string) e
 		EdgeKind: kind,
 		FactName: "/",
 	})
+}
+
+// writeAnchor emits an anchor with the given offsets to s.
+func (s Sink) writeAnchor(ctx context.Context, src *spb.VName, start, end int) error {
+	if err := s.writeFact(ctx, src, facts.NodeKind, nodes.Anchor); err != nil {
+		return err
+	}
+	if err := s.writeFact(ctx, src, facts.AnchorStart, strconv.Itoa(start)); err != nil {
+		return err
+	}
+	return s.writeFact(ctx, src, facts.AnchorEnd, strconv.Itoa(end))
+}
+
+// A diagnostic represents a diagnostic message attached to some node in the
+// graph by the indexer.
+type diagnostic struct {
+	Message string // One-line human-readable summary
+	Details string // Detailed description or content
+	URL     string // Optional context URL
+}
+
+func (d diagnostic) vname(src *spb.VName) *spb.VName {
+	return &spb.VName{
+		Language:  govname.Language,
+		Corpus:    src.Corpus,
+		Path:      src.Path,
+		Root:      src.Root,
+		Signature: "diag " + hashSignature(d.Message, d.Details, d.URL),
+	}
+}
+
+// writeDiagnostic attaches d as a diagnostic on src.
+func (s Sink) writeDiagnostic(ctx context.Context, src *spb.VName, d diagnostic) error {
+	dname := d.vname(src)
+	facts := [...]struct{ name, value string }{
+		{facts.NodeKind, nodes.Diagnostic},
+		{facts.Message, d.Message},
+		{facts.Details, d.Details},
+		{facts.ContextURL, d.URL},
+	}
+	for _, fact := range facts {
+		if fact.value == "" {
+			continue
+		} else if err := s.writeFact(ctx, dname, fact.name, fact.value); err != nil {
+			return err
+		}
+	}
+	return s.writeEdge(ctx, src, dname, edges.Tagged)
+}
+
+func hashSignature(s ...interface{}) string {
+	hash := sha256.New()
+	fmt.Fprintln(hash, s...)
+	return base64.URLEncoding.EncodeToString(hash.Sum(nil)[:])
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 
 #include "file_vname_generator.h"
+
 #include "gtest/gtest.h"
 
 extern const char kTestFile[];
@@ -41,6 +42,9 @@ TEST(FileVNameGenerator, EmptyLookup) {
 TEST(FileVNameGenerator, DefaultLookup) {
   FileVNameGenerator generator;
   kythe::proto::VName default_vname;
+  default_vname.set_root("root");
+  default_vname.set_corpus("corpus");
+  generator.set_default_base_vname(default_vname);
   ASSERT_EQ(default_vname.DebugString(),
             generator.LookupBaseVName("").DebugString());
 }
@@ -89,17 +93,16 @@ TEST(FileVNameGenerator, LookupGroups) {
   kythe::proto::VName kythe_java_vname;
   kythe_java_vname.set_corpus("kythe");
   kythe_java_vname.set_root("java");
-  EXPECT_EQ(
-      kythe_java_vname.DebugString(),
-      generator
-          .LookupBaseVName(
-               "bazel-bin/kythe/java/some/path/A.jar!/some/path/A.class")
-          .DebugString());
-  EXPECT_EQ(
-      kythe_java_vname.DebugString(),
-      generator.LookupBaseVName(
+  EXPECT_EQ(kythe_java_vname.DebugString(),
+            generator
+                .LookupBaseVName(
+                    "bazel-bin/kythe/java/some/path/A.jar!/some/path/A.class")
+                .DebugString());
+  EXPECT_EQ(kythe_java_vname.DebugString(),
+            generator
+                .LookupBaseVName(
                     "kythe/java/com/google/devtools/kythe/util/KytheURI.java")
-          .DebugString());
+                .DebugString());
   kythe::proto::VName other_java_vname;
   other_java_vname.set_corpus("otherCorpus");
   other_java_vname.set_root("java");
@@ -107,7 +110,7 @@ TEST(FileVNameGenerator, LookupGroups) {
       other_java_vname.DebugString(),
       generator
           .LookupBaseVName(
-               "otherCorpus/java/com/google/devtools/kythe/util/KytheURI.java")
+              "otherCorpus/java/com/google/devtools/kythe/util/KytheURI.java")
           .DebugString());
 }
 
@@ -124,7 +127,7 @@ TEST(FileVNameGenerator, ActualConfigTests) {
       test_file.DebugString(),
       generator
           .LookupVName(
-               "kythe/cxx/extractor/testdata/extract_verify_std_string_test.cc")
+              "kythe/cxx/extractor/testdata/extract_verify_std_string_test.cc")
           .DebugString());
 
   kythe::proto::VName stdlib_file;
@@ -147,7 +150,7 @@ TEST(FileVNameGenerator, ActualConfigTests) {
 }  // namespace
 }  // namespace kythe
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   int result = RUN_ALL_TESTS();
   return result;

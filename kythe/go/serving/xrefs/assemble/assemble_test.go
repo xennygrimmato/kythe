@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,16 +17,16 @@
 package assemble
 
 import (
-	"reflect"
+	"context"
 	"testing"
 
 	"kythe.io/kythe/go/test/testutil"
 
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
-	ipb "kythe.io/kythe/proto/internal_proto"
-	srvpb "kythe.io/kythe/proto/serving_proto"
-	spb "kythe.io/kythe/proto/storage_proto"
+	ipb "kythe.io/kythe/proto/internal_go_proto"
+	srvpb "kythe.io/kythe/proto/serving_go_proto"
+	spb "kythe.io/kythe/proto/storage_go_proto"
 )
 
 func fact(name, value string) *spb.Entry {
@@ -78,7 +78,7 @@ func TestAppendEntry(t *testing.T) {
 				"blah": []byte("blah"),
 			},
 			EdgeGroups: map[string]*ipb.Source_EdgeGroup{
-				"edgeKind": &ipb.Source_EdgeGroup{
+				"edgeKind": {
 					Edges: []*ipb.Source_Edge{{
 						Ticket: "kythe:#firstTarget",
 					}, {
@@ -140,7 +140,7 @@ func makeNodes() map[string]*srvpb.Node {
 }
 
 // TODO(schroederc): add some facts for each node
-var nodes = makeNodes()
+var testNodes = makeNodes()
 
 func getEdgeTargets(tickets ...string) []*srvpb.EdgeGroup_Edge {
 	es := make([]*srvpb.EdgeGroup_Edge, len(tickets))
@@ -153,7 +153,7 @@ func getEdgeTargets(tickets ...string) []*srvpb.EdgeGroup_Edge {
 }
 
 func getNode(t string) *srvpb.Node {
-	n, ok := nodes[t]
+	n, ok := testNodes[t]
 	if !ok {
 		n = &srvpb.Node{Ticket: t}
 	}
@@ -358,7 +358,7 @@ func TestEdgeSetBuilder(t *testing.T) {
 			// Expected a new PagedEdgeSet
 			if edgeSets+1 != len(tESB.PagedEdgeSets) {
 				t.Fatalf("Missing expected PagedEdgeSet: %v", test.edgeSet)
-			} else if found := tESB.PagedEdgeSets[len(tESB.PagedEdgeSets)-1]; !reflect.DeepEqual(test.edgeSet, found) {
+			} else if found := tESB.PagedEdgeSets[len(tESB.PagedEdgeSets)-1]; !proto.Equal(test.edgeSet, found) {
 				t.Errorf("Expected PagedEdgeSet: %v; found: %v", test.edgeSet, found)
 			}
 			edgeSets++

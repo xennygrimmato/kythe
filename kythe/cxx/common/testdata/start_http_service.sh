@@ -1,5 +1,5 @@
-#!/bin/bash -e
-# Copyright 2015 Google Inc. All rights reserved.
+#!/bin/bash
+# Copyright 2015 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,16 +41,19 @@
 #   "//kythe/go/storage/tools:write_entries",
 #   "//kythe/go/test/tools:http_server",
 
-KYTHE_WRITE_TABLES="kythe/go/serving/tools/write_tables/write_tables"
-KYTHE_WRITE_ENTRIES="kythe/go/storage/tools/write_entries/write_entries"
-KYTHE_ENTRYSTREAM="kythe/go/platform/tools/entrystream/entrystream"
-KYTHE_HTTP_SERVER="kythe/go/test/tools/http_server"
+set -e
+
+: ${KYTHE_WRITE_TABLES?:missing write_tables}
+: ${KYTHE_WRITE_ENTRIES?:missing write_entries}
+: ${KYTHE_ENTRYSTREAM?:missing entrystream}
+: ${KYTHE_HTTP_SERVER?:missing http_server}
+
 PORT_FILE="${OUT_DIR:?no output directory for test}/service_port"
 
 ENTRYSTREAM_ARGS=
 if [[ -z "$TEST_ENTRIES" ]]; then
   TEST_ENTRIES="$TEST_JSON"
-  ENTRYSTREAM_ARGS=-read_json=true
+  ENTRYSTREAM_ARGS=-read_format=json
 fi
 CAT=cat
 if [[ "$TEST_ENTRIES" == *.gz ]]; then

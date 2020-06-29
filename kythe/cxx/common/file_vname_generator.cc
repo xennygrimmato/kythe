@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,27 +29,27 @@ FileVNameGenerator::FileVNameGenerator() {
   CHECK_EQ(RE2::NoError, substitution_matcher_.error_code());
 }
 
-std::string FileVNameGenerator::ApplyRule(const StringConsRule &rule,
-                                          const re2::StringPiece *argv,
+std::string FileVNameGenerator::ApplyRule(const StringConsRule& rule,
+                                          const re2::StringPiece* argv,
                                           int argc) const {
   std::string ret;
-  for (const auto &node : rule) {
+  for (const auto& node : rule) {
     switch (node.kind) {
       case StringConsNode::Kind::kEmitText:
         ret.append(node.raw_text);
         break;
       case StringConsNode::Kind::kUseSubstitution:
         // Invariant: 0 <= node.capture_index < argc
-        ret.append(argv[node.capture_index].ToString());
+        ret.append(std::string(argv[node.capture_index]));
         break;
     }
   }
   return ret;
 }
 
-bool FileVNameGenerator::ParseRule(const std::string &rule, int max_capture,
-                                   StringConsRule *result,
-                                   std::string *error_text) {
+bool FileVNameGenerator::ParseRule(const std::string& rule, int max_capture,
+                                   StringConsRule* result,
+                                   std::string* error_text) {
   CHECK(result != nullptr);
   CHECK(error_text != nullptr);
   re2::StringPiece rule_left(rule);
@@ -58,18 +58,18 @@ bool FileVNameGenerator::ParseRule(const std::string &rule, int max_capture,
     if (!RE2::Consume(&rule_left, substitution_matcher_, &prefix,
                       &substitution)) {
       prefix = rule_left;
-      rule_left.clear();
+      rule_left = re2::StringPiece();
     }
     if (!prefix.empty()) {
       StringConsNode node;
       node.kind = StringConsNode::Kind::kEmitText;
-      node.raw_text = prefix.ToString();
+      node.raw_text = std::string(prefix);
       result->push_back(node);
     }
     if (!substitution.empty()) {
       StringConsNode node;
       node.kind = StringConsNode::Kind::kUseSubstitution;
-      node.capture_index = std::stoi(substitution.ToString());
+      node.capture_index = std::stoi(std::string(substitution));
       if (node.capture_index == 0 || node.capture_index > max_capture) {
         *error_text =
             "Capture index out of range: " + std::to_string(node.capture_index);
@@ -84,38 +84,38 @@ bool FileVNameGenerator::ParseRule(const std::string &rule, int max_capture,
 }
 
 kythe::proto::VName FileVNameGenerator::LookupBaseVName(
-    const std::string &path) const {
+    const std::string& path) const {
   re2::StringPiece argv[kMaxRegexArgs];
   RE2::Arg args[kMaxRegexArgs];
-  RE2::Arg *arg_pointers[kMaxRegexArgs];
+  RE2::Arg* arg_pointers[kMaxRegexArgs];
   for (size_t n = 0; n < kMaxRegexArgs; ++n) {
     args[n] = &argv[n];
     arg_pointers[n] = &args[n];
   }
-  for (const auto &rule : rules_) {
+  for (const auto& rule : rules_) {
     // Invariant: capture_groups <= kMaxRegexArgs
     // RE2 will fail to match if we provide more args than there are captures
     // for a given regex.
     int capture_groups = rule.pattern->NumberOfCapturingGroups();
     if (RE2::FullMatchN(path, *rule.pattern, arg_pointers, capture_groups)) {
       kythe::proto::VName result;
-      if (rule.corpus.size()) {
+      if (!rule.corpus.empty()) {
         result.set_corpus(ApplyRule(rule.corpus, argv, capture_groups));
       }
-      if (rule.root.size()) {
+      if (!rule.root.empty()) {
         result.set_root(ApplyRule(rule.root, argv, capture_groups));
       }
-      if (rule.path.size()) {
+      if (!rule.path.empty()) {
         result.set_path(ApplyRule(rule.path, argv, capture_groups));
       }
       return result;
     }
   }
-  return kythe::proto::VName();
+  return default_vname_;
 }
 
 kythe::proto::VName FileVNameGenerator::LookupVName(
-    const std::string &path) const {
+    const std::string& path) const {
   kythe::proto::VName vname = LookupBaseVName(path);
   if (vname.path().empty()) {
     vname.set_path(path);
@@ -123,8 +123,8 @@ kythe::proto::VName FileVNameGenerator::LookupVName(
   return vname;
 }
 
-bool FileVNameGenerator::LoadJsonString(const std::string &data,
-                                        std::string *error_text) {
+bool FileVNameGenerator::LoadJsonString(const std::string& data,
+                                        std::string* error_text) {
   CHECK(error_text != nullptr);
   using Value = rapidjson::Value;
   rapidjson::Document document;
@@ -154,7 +154,7 @@ bool FileVNameGenerator::LoadJsonString(const std::string &data,
     }
     VNameRule next_rule;
     // RE2s don't act like values. Just box them.
-    next_rule.pattern = std::shared_ptr<RE2>(new RE2(regex->value.GetString()));
+    next_rule.pattern = std::make_shared<RE2>(regex->value.GetString());
     if (next_rule.pattern->error_code() != RE2::NoError) {
       *error_text = next_rule.pattern->error();
       return false;

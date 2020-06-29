@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,26 +16,57 @@
 
 package com.google.devtools.kythe.analyzers.base;
 
+import com.google.devtools.kythe.util.schema.Schema;
+
 /** Schema-defined Kythe edge kinds. */
 public enum EdgeKind {
   DEFINES(true, "defines"),
   DEFINES_BINDING(true, "defines/binding"),
   DOCUMENTS(true, "documents"),
+  TAGGED(true, "tagged"),
+  UNDEFINES(true, "undefines"),
 
+  // Edges from an anchor.
+  COMPLETES(true, "completes"),
+  COMPLETES_UNIQUELY(true, "completes/uniquely"),
+  IMPUTES(true, "imputes"),
   REF(true, "ref"),
   REF_CALL(true, "ref/call"),
+  REF_CALL_IMPLICIT(true, "ref/call/implicit"),
   REF_DOC(true, "ref/doc"),
+  REF_EXPANDS(true, "ref/expands"),
+  REF_EXPANDS_TRANSITIVE(true, "ref/expands/transitive"),
+  REF_FILE(true, "ref/file"),
+  REF_IMPLICIT(true, "ref/implicit"),
   REF_IMPORTS(true, "ref/imports"),
+  REF_INCLUDES(true, "ref/includes"),
+  REF_INIT(true, "ref/init"),
+  REF_INIT_IMPLICIT(true, "ref/init/implicit"),
+  REF_QUERIES(true, "ref/queries"),
 
+  ALIASES("aliases"),
+  ALIASES_ROOT("aliases/root"),
   ANNOTATED_BY("annotatedby"),
   BOUNDED_LOWER("bounded/lower"),
   BOUNDED_UPPER("bounded/upper"),
   CHILDOF("childof"),
+  CHILDOF_CONTEXT("childof/context"),
+  DEPENDS("depends"),
+  EXPORTS("exports"),
   EXTENDS("extends"),
+  GENERATES("generates"),
+  INSTANTIATES("instantiates"),
+  INSTANTIATES_SPECULATIVE("instantiates/speculative"),
   NAMED("named"),
   OVERRIDES("overrides"),
+  OVERRIDES_ROOT("overrides/root"),
   OVERRIDES_TRANSITIVE("overrides/transitive"),
   PARAM("param"),
+  PROPERTY_READS("property/reads"),
+  PROPERTY_WRITES("property/writes"),
+  SATISFIES("satisfies"),
+  SPECIALIZES("specializes"),
+  SPECIALIZES_SPECULATIVE("specializes/speculative"),
   TYPED("typed");
 
   private static final String EDGE_PREFIX = "/kythe/edge/";
@@ -60,6 +91,11 @@ public enum EdgeKind {
   /** Returns the edge kind's Kythe GraphStore value. */
   public final String getValue() {
     return kind;
+  }
+
+  /** Returns the edge kind's proto enum value. */
+  public final com.google.devtools.kythe.proto.Schema.EdgeKind getProtoEdgeKind() {
+    return Schema.edgeKind(getValue());
   }
 
   @Override

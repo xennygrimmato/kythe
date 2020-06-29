@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,11 @@
 
 // Package leveldb implements a graphstore.Service using a LevelDB backend
 // database.
-package leveldb
+package leveldb // import "kythe.io/kythe/go/storage/leveldb"
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -45,6 +46,25 @@ type levelDB struct {
 	readOpts      *levigo.ReadOptions
 	largeReadOpts *levigo.ReadOptions
 	writeOpts     *levigo.WriteOptions
+}
+
+// CompactRange runs a manual compaction on the Range of keys given.
+// If r == nil, the entire table will be compacted.
+func CompactRange(path string, r *keyvalue.Range) error {
+	options := levigo.NewOptions()
+	defer options.Close()
+	db, err := levigo.Open(path, options)
+	if err != nil {
+		return err
+	}
+	lr := levigo.Range{}
+	if r != nil {
+		lr.Start = r.Start
+		lr.Limit = r.End
+	}
+	db.CompactRange(lr)
+	db.Close()
+	return nil
 }
 
 // DefaultOptions is the default Options struct passed to Open when not
@@ -120,7 +140,7 @@ func Open(path string, opts *Options) (keyvalue.DB, error) {
 }
 
 // Close will close the underlying LevelDB database.
-func (s *levelDB) Close() error {
+func (s *levelDB) Close(_ context.Context) error {
 	s.db.Close()
 	s.cache.Close()
 	s.readOpts.Close()
@@ -135,7 +155,7 @@ type snapshot struct {
 }
 
 // NewSnapshot implements part of the keyvalue.DB interface.
-func (s *levelDB) NewSnapshot() keyvalue.Snapshot {
+func (s *levelDB) NewSnapshot(_ context.Context) keyvalue.Snapshot {
 	return &snapshot{s.db, s.db.NewSnapshot()}
 }
 
@@ -146,12 +166,12 @@ func (s *snapshot) Close() error {
 }
 
 // Writer implements part of the keyvalue.DB interface.
-func (s *levelDB) Writer() (keyvalue.Writer, error) {
+func (s *levelDB) Writer(_ context.Context) (keyvalue.Writer, error) {
 	return &writer{s, levigo.NewWriteBatch()}, nil
 }
 
 // Get implements part of the keyvalue.DB interface.
-func (s *levelDB) Get(key []byte, opts *keyvalue.Options) ([]byte, error) {
+func (s *levelDB) Get(_ context.Context, key []byte, opts *keyvalue.Options) ([]byte, error) {
 	ro := s.readOptions(opts)
 	if ro != s.largeReadOpts && ro != s.readOpts {
 		defer ro.Close()
@@ -166,7 +186,7 @@ func (s *levelDB) Get(key []byte, opts *keyvalue.Options) ([]byte, error) {
 }
 
 // ScanPrefix implements part of the keyvalue.DB interface.
-func (s *levelDB) ScanPrefix(prefix []byte, opts *keyvalue.Options) (keyvalue.Iterator, error) {
+func (s *levelDB) ScanPrefix(_ context.Context, prefix []byte, opts *keyvalue.Options) (keyvalue.Iterator, error) {
 	iter, ro := s.iterator(opts)
 	if len(prefix) == 0 {
 		iter.SeekToFirst()
@@ -177,7 +197,7 @@ func (s *levelDB) ScanPrefix(prefix []byte, opts *keyvalue.Options) (keyvalue.It
 }
 
 // ScanRange implements part of the keyvalue.DB interface.
-func (s *levelDB) ScanRange(r *keyvalue.Range, opts *keyvalue.Options) (keyvalue.Iterator, error) {
+func (s *levelDB) ScanRange(_ context.Context, r *keyvalue.Range, opts *keyvalue.Options) (keyvalue.Iterator, error) {
 	iter, ro := s.iterator(opts)
 	iter.Seek(r.Start)
 	return &iterator{iter, ro, nil, r}, nil
@@ -258,4 +278,16 @@ func (i iterator) Next() ([]byte, []byte, error) {
 	}
 	i.it.Next()
 	return key, val, nil
+}
+
+// Seek implements part of the keyvalue.Iterator interface.
+func (i *iterator) Seek(k []byte) error {
+	i.it.Seek(k)
+	if !i.it.Valid() {
+		if err := i.it.GetError(); err != nil {
+			return err
+		}
+		return io.EOF
+	}
+	return nil
 }

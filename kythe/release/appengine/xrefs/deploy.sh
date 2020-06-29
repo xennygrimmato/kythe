@@ -1,5 +1,5 @@
 #!/bin/bash -e
-# Copyright 2015 Google Inc. All rights reserved.
+# Copyright 2015 The Kythe Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,16 +30,7 @@ if [[ "$1" == "--dev" ]]; then
   shift
 fi
 
-if [[ ! -d "$DIR"/serving ]]; then
-  "$DIR"/build_serving_tables.sh "$@" --out "$DIR"/serving
-fi
-
-cd "$(dirname "$0")/../../../.."
-SERVER='//kythe/release/appengine/xrefs:server'
-bazel build "$SERVER"
-cp -f --preserve=all bazel-bin/kythe/release/appengine/xrefs/server "$DIR"/
-
-cd kythe/web/ui
+cd "$DIR/../../../web/ui"
 lein cljsbuild once prod
 rsync -aP --delete resources/public "$DIR"/
 
@@ -49,6 +40,6 @@ rm -f appengine_generated*
 if [[ -n "$DEV" ]]; then
   dev_appserver.py app.yaml
 else
-  gcloud preview app deploy --promote --server gcr.appengine.google.com app.yaml
+  gcloud app deploy --promote --server gcr.appengine.google.com app.yaml
 fi
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All rights reserved.
+ * Copyright 2014 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,10 @@
 
 package com.google.devtools.kythe.analyzers.base;
 
+import com.google.devtools.kythe.util.schema.Schema;
+import java.util.Optional;
+import org.checkerframework.checker.nullness.qual.Nullable;
+
 /** Schema-defined Kythe node kinds. */
 public enum NodeKind {
   // Core kinds
@@ -23,16 +27,21 @@ public enum NodeKind {
   ABS_VAR("absvar"),
   ANCHOR("anchor"),
   CONSTANT("constant"),
+  DIAGNOSTIC("diagnostic"),
   DOC("doc"),
   FILE("file"),
   FUNCTION("function"),
   INTERFACE("interface"),
   NAME("name"),
   PACKAGE("package"),
+  PROCESS("process"),
+  SYMBOL("symbol"),
+  TALIAS("talias"),
   TAPPLY("tapp"),
   TBUILTIN("tbuiltin"),
 
   // Sub-kinds
+  ANCHOR_IMPLICIT("anchor", "implicit"),
   FUNCTION_CONSTRUCTOR("function", "constructor"),
   RECORD_CLASS("record", "class"),
   SUM_ENUM_CLASS("sum", "enumClass"),
@@ -41,13 +50,15 @@ public enum NodeKind {
   VARIABLE_LOCAL("variable", "local"),
   VARIABLE_PARAMETER("variable", "local/parameter"),
   VARIABLE_RESOURCE("variable", "local/resource");
-  private final String kind, subkind;
+
+  private final String kind;
+  @Nullable private final String subkind;
 
   NodeKind(String kind) {
     this(kind, null);
   }
 
-  NodeKind(String kind, String subkind) {
+  NodeKind(String kind, @Nullable String subkind) {
     this.kind = kind;
     this.subkind = subkind;
   }
@@ -57,9 +68,19 @@ public enum NodeKind {
     return kind;
   }
 
-  /** Returns the node's subkind Kythe GraphStore value (or {@code null}). */
-  public final String getSubkind() {
-    return subkind;
+  /** Returns the node's subkind Kythe GraphStore value. */
+  public final Optional<String> getSubkind() {
+    return Optional.ofNullable(subkind);
+  }
+
+  /** Returns the node kind's proto enum value. */
+  public final com.google.devtools.kythe.proto.Schema.NodeKind getProtoNodeKind() {
+    return Schema.nodeKind(getKind());
+  }
+
+  /** Returns the node subkind's proto enum value. */
+  public final Optional<com.google.devtools.kythe.proto.Schema.Subkind> getProtoSubkind() {
+    return getSubkind().map(Schema::subkind);
   }
 
   @Override

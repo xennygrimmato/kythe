@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2015 The Kythe Authors. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 // Package dedup implements a utility to determine if a record has not been seen
 // before (whether it's unique).
-package dedup
+package dedup // import "kythe.io/kythe/go/util/dedup"
 
 import (
 	"crypto/sha512"

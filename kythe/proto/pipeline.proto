@@ -1,0 +1,59 @@
+/*
+ * Copyright 2018 The Kythe Authors. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+package kythe.proto.pipeline;
+
+option go_package = "pipeline_go_proto";
+option java_package = "com.google.devtools.kythe.proto";
+
+import "kythe/proto/common.proto";
+import "kythe/proto/schema.proto";
+import "kythe/proto/serving.proto";
+import "kythe/proto/storage.proto";
+
+message Reference {
+  kythe.proto.VName source = 1;
+  oneof kind {
+    kythe.proto.schema.EdgeKind kythe_kind = 2;
+    string generic_kind = 3;
+  }
+  kythe.proto.serving.ExpandedAnchor anchor = 4;
+
+  kythe.proto.VName scope = 5;  // anchor scope
+}
+
+// A DecorationPiece is an independent component of a larger
+// kythe.proto.serving.FileDecorations message.  Each FileDecorations field is
+// one choice for the piece oneof field.
+message DecorationPiece {
+  kythe.proto.VName file_v_name = 1;
+
+  message Definition {
+    kythe.proto.VName node = 1;
+    kythe.proto.serving.ExpandedAnchor definition = 2;
+  }
+
+  oneof piece {
+    kythe.proto.serving.File file = 2;
+    Reference reference = 3;
+    kythe.proto.schema.Node node = 4;
+    Definition definition = 5;
+    kythe.proto.common.Diagnostic diagnostic = 6;
+    // TODO(schroederc): overrides
+  }
+}

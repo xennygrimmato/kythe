@@ -1,15 +1,10 @@
-load("//tools:build_rules/doc.bzl", "asciidoc")
+load(":asciidoc.bzl", "asciidoc")
 
 package(default_visibility = ["//kythe:default_visibility"])
 
 asciidoc(
     name = "kythe-compatible-compilers",
     src = "kythe-compatible-compilers.txt",
-)
-
-asciidoc(
-    name = "kythe-index-pack",
-    src = "kythe-index-pack.txt",
 )
 
 asciidoc(
@@ -30,4 +25,39 @@ asciidoc(
 asciidoc(
     name = "kythe-verifier",
     src = "kythe-verifier.txt",
+)
+
+asciidoc(
+    name = "kythe-compilation-database",
+    src = "kythe-compilation-database.txt",
+)
+
+asciidoc(
+    name = "exploring-kythe-sample-web-ui",
+    src = "exploring-kythe-sample-web-ui.txt",
+)
+
+asciidoc(
+    name = "kythes-command-line-tool",
+    src = "kythes-command-line-tool.txt",
+)
+
+asciidoc(
+    name = "modeling-libraries",
+    src = "modeling-libraries.txt",
+)
+
+asciidoc(
+    name = "kythe-configurable-extraction",
+    src = "kythe-configurable-extraction.txt",
+)
+
+asciidoc(
+    name = "kythe-kzip",
+    src = "kythe-kzip.txt",
+)
+
+asciidoc(
+    name = "schema-overview",
+    src = "schema-overview.txt",
 )

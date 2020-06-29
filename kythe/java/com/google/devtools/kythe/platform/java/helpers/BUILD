@@ -1,3 +1,5 @@
+load("@rules_java//java:defs.bzl", "java_library")
+
 package(default_visibility = ["//kythe:default_visibility"])
 
 java_library(
@@ -11,11 +13,11 @@ java_library(
         "SyntaxPreservingScanner.java",
     ],
     deps = [
-        "//external:guava",
-        "//external:proto/protobuf_java",
-        "//kythe/java/com/google/devtools/kythe/common",
-        "//kythe/java/com/google/devtools/kythe/util",
-        "//third_party/jsr305_annotations:jsr305",
-        "@bazel_tools//third_party/java/jdk/langtools:javac",
+        "//kythe/java/com/google/devtools/kythe/common:flogger",
+        "//kythe/java/com/google/devtools/kythe/util:span",
+        "//third_party/guava",
+        "//third_party/javac",
+        "@com_google_protobuf//:protobuf_java",
+        "@maven//:com_google_code_findbugs_jsr305",
     ],
 )
